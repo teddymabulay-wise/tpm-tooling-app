@@ -12,6 +12,8 @@ import AuditAddSupplier from "./pages/AuditAddSupplier";
 import BCIntegrationPage from "./pages/BCIntegrationPage";
 import APIContractPage from "./pages/APIContractPage";
 import SimulationPage from "./pages/SimulationPage";
+import FieldMappingPage from "./pages/FieldMappingPage";
+import GovernancePage from "./pages/GovernancePage";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -29,9 +31,11 @@ const App = () => (
             <Route path="/dashboard/suppliers" element={<SuppliersPage />} />
             <Route path="/dashboard/profiles" element={<ProfilesPage />} />
             <Route path="/dashboard/bank-details" element={<BankDetailsPage />} />
-            <Route path="/audit/add-supplier" element={<AuditAddSupplier />} />
+            <Route path="/governance/materiality" element={<GovernancePage />} />
+            <Route path="/governance/add-supplier" element={<AuditAddSupplier />} />
             <Route path="/integration/bc" element={<BCIntegrationPage />} />
             <Route path="/integration/bc/api-contract" element={<APIContractPage />} />
+            <Route path="/integration/bc/field-mapping" element={<FieldMappingPage />} />
             <Route path="/integration/bc/simulation" element={<SimulationPage />} />
           </Route>
           <Route path="*" element={<NotFound />} />

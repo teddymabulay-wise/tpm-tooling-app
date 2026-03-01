@@ -10,6 +10,9 @@ import {
   FileCode,
   TestTube,
   Layers,
+  ShieldCheck,
+  Map,
+  BookOpen,
 } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import { useLocation } from "react-router-dom";
@@ -33,13 +36,15 @@ const dashboardItems = [
   { title: "Bank Details", url: "/dashboard/bank-details", icon: CreditCard },
 ];
 
-const auditItems = [
-  { title: "Add Supplier", url: "/audit/add-supplier", icon: UserPlus },
+const governanceItems = [
+  { title: "Materiality Audit", url: "/governance/materiality", icon: ShieldCheck },
+  { title: "Add Supplier", url: "/governance/add-supplier", icon: UserPlus },
 ];
 
 const integrationItems = [
-  { title: "BC Integration", url: "/integration/bc", icon: Database },
+  { title: "BC Overview", url: "/integration/bc", icon: Database },
   { title: "API Contract", url: "/integration/bc/api-contract", icon: FileCode },
+  { title: "Field Mapping", url: "/integration/bc/field-mapping", icon: Map },
   { title: "Simulation", url: "/integration/bc/simulation", icon: TestTube },
 ];
 
@@ -50,6 +55,29 @@ export function AppSidebar() {
   const currentPath = location.pathname;
 
   const isActive = (path: string) => currentPath === path;
+
+  const renderGroup = (label: string, items: typeof dashboardItems, icon?: React.ReactNode) => (
+    <SidebarGroup>
+      <SidebarGroupLabel>
+        {icon}
+        {label}
+      </SidebarGroupLabel>
+      <SidebarGroupContent>
+        <SidebarMenu>
+          {items.map((item) => (
+            <SidebarMenuItem key={item.title}>
+              <SidebarMenuButton asChild isActive={isActive(item.url)}>
+                <NavLink to={item.url} end activeClassName="bg-sidebar-accent text-primary font-medium">
+                  <item.icon className="h-4 w-4" />
+                  {!collapsed && <span>{item.title}</span>}
+                </NavLink>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          ))}
+        </SidebarMenu>
+      </SidebarGroupContent>
+    </SidebarGroup>
+  );
 
   return (
     <Sidebar collapsible="icon">
@@ -68,68 +96,9 @@ export function AppSidebar() {
       </SidebarHeader>
 
       <SidebarContent>
-        {/* Dashboard */}
-        <SidebarGroup>
-          <SidebarGroupLabel>Dashboard</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {dashboardItems.map((item) => (
-                <SidebarMenuItem key={item.title}>
-                  <SidebarMenuButton asChild isActive={isActive(item.url)}>
-                    <NavLink to={item.url} end activeClassName="bg-sidebar-accent text-primary font-medium">
-                      <item.icon className="h-4 w-4" />
-                      {!collapsed && <span>{item.title}</span>}
-                    </NavLink>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-
-        {/* Audit */}
-        <SidebarGroup>
-          <SidebarGroupLabel>
-            <ClipboardCheck className="h-3.5 w-3.5 mr-1.5" />
-            Audit
-          </SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {auditItems.map((item) => (
-                <SidebarMenuItem key={item.title}>
-                  <SidebarMenuButton asChild isActive={isActive(item.url)}>
-                    <NavLink to={item.url} end activeClassName="bg-sidebar-accent text-primary font-medium">
-                      <item.icon className="h-4 w-4" />
-                      {!collapsed && <span>{item.title}</span>}
-                    </NavLink>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-
-        {/* Integration */}
-        <SidebarGroup>
-          <SidebarGroupLabel>
-            <Plug className="h-3.5 w-3.5 mr-1.5" />
-            Integration
-          </SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {integrationItems.map((item) => (
-                <SidebarMenuItem key={item.title}>
-                  <SidebarMenuButton asChild isActive={isActive(item.url)}>
-                    <NavLink to={item.url} end activeClassName="bg-sidebar-accent text-primary font-medium">
-                      <item.icon className="h-4 w-4" />
-                      {!collapsed && <span>{item.title}</span>}
-                    </NavLink>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
+        {renderGroup("Dashboard", dashboardItems)}
+        {renderGroup("Governance", governanceItems, <ClipboardCheck className="h-3.5 w-3.5 mr-1.5" />)}
+        {renderGroup("Integration", integrationItems, <Plug className="h-3.5 w-3.5 mr-1.5" />)}
       </SidebarContent>
     </Sidebar>
   );
