@@ -49,7 +49,7 @@ const AuditPage = () => {
     );
   }, [selectedTags, filteredSupplierNames]);
 
-  const stateVariant = (state: string) => {
+  const stateVariant = (state: string): "danger" | "default" | "info" | "success" | "warning" => {
     switch (state.toLowerCase()) {
       case "active":
       case "completed":
@@ -59,11 +59,11 @@ const AuditPage = () => {
       case "in progress":
         return "info";
       default:
-        return "neutral";
+        return "default";
     }
   };
 
-  const priorityVariant = (p: string) => {
+  const priorityVariant = (p: string): "danger" | "default" | "info" | "success" | "warning" => {
     switch (p.toLowerCase()) {
       case "critical":
         return "danger";
@@ -72,7 +72,7 @@ const AuditPage = () => {
       case "medium":
         return "info";
       default:
-        return "neutral";
+        return "default";
     }
   };
 
