@@ -1,14 +1,8 @@
 import {
   ClipboardCheck,
   Users,
-  Plug,
   ArrowRightLeft,
-  Send,
-  KeyRound,
-  Building2,
-  UserSearch,
-  Landmark,
-  Globe,
+  Plug,
 } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import { useLocation } from "react-router-dom";
@@ -30,16 +24,8 @@ const toolsItems = [
   { title: "BSP Internal Contact", url: "/tools/bsp-contact", icon: Users },
 ];
 
-const omneaApiItems = [
-  { title: "Authentication", url: "/omnea-api/auth", icon: KeyRound },
-  { title: "Get Suppliers", url: "/omnea-api/suppliers", icon: Building2 },
-  { title: "Get Supplier by ID", url: "/omnea-api/supplier-by-id", icon: UserSearch },
-  { title: "Get Supplier by Remote ID", url: "/omnea-api/supplier-by-remote-id", icon: Globe },
-  { title: "Get Profiles", url: "/omnea-api/profiles", icon: Users },
-  { title: "Get Profile by Subsidiary", url: "/omnea-api/profile-by-subsidiary", icon: UserSearch },
-  { title: "Bank Accounts", url: "/omnea-api/bank-accounts", icon: Landmark },
-  { title: "PATCH Profile", url: "/omnea-api/patch-profile", icon: Send },
-  { title: "PATCH Bank Account", url: "/omnea-api/patch-bank-account", icon: Send },
+const omneaItems = [
+  { title: "Omnea API", url: "/omnea-api", icon: Plug },
 ];
 
 export function AppSidebar() {
@@ -48,20 +34,17 @@ export function AppSidebar() {
   const location = useLocation();
   const currentPath = location.pathname;
 
-  const isActive = (path: string) => currentPath === path;
+  const isActive = (path: string) => currentPath === path || currentPath.startsWith(path + "/");
 
-  const renderGroup = (label: string, items: typeof toolsItems, icon?: React.ReactNode) => (
+  const renderGroup = (label: string, items: typeof toolsItems) => (
     <SidebarGroup>
-      <SidebarGroupLabel>
-        {icon}
-        {label}
-      </SidebarGroupLabel>
+      <SidebarGroupLabel>{label}</SidebarGroupLabel>
       <SidebarGroupContent>
         <SidebarMenu>
           {items.map((item) => (
             <SidebarMenuItem key={item.title}>
               <SidebarMenuButton asChild isActive={isActive(item.url)}>
-                <NavLink to={item.url} end activeClassName="bg-sidebar-accent text-primary font-medium">
+                <NavLink to={item.url} end={item.url !== "/omnea-api"} activeClassName="bg-sidebar-accent text-primary font-medium">
                   <item.icon className="h-4 w-4" />
                   {!collapsed && <span>{item.title}</span>}
                 </NavLink>
@@ -88,10 +71,9 @@ export function AppSidebar() {
           )}
         </div>
       </SidebarHeader>
-
       <SidebarContent>
-        {renderGroup("Tools", toolsItems, <ClipboardCheck className="h-3.5 w-3.5 mr-1.5" />)}
-        {renderGroup("Omnea API", omneaApiItems, <Plug className="h-3.5 w-3.5 mr-1.5" />)}
+        {renderGroup("Tools", toolsItems)}
+        {renderGroup("Integration", omneaItems)}
       </SidebarContent>
     </Sidebar>
   );
