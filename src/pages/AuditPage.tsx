@@ -170,7 +170,7 @@ const AuditPage = () => {
                         variant={
                           s.materialityLevel === "Material"
                             ? "warning"
-                            : "neutral"
+                            : "default"
                         }
                       />
                     </TableCell>
