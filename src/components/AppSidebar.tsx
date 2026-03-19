@@ -1,18 +1,14 @@
 import {
-  LayoutDashboard,
   ClipboardCheck,
-  Plug,
-  Database,
   Users,
-  CreditCard,
-  UserPlus,
+  Plug,
   ArrowRightLeft,
-  FileCode,
-  TestTube,
-  Layers,
-  ShieldCheck,
-  Map,
-  BookOpen,
+  Send,
+  KeyRound,
+  Building2,
+  UserSearch,
+  Landmark,
+  Globe,
 } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import { useLocation } from "react-router-dom";
@@ -29,23 +25,21 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 
-const dashboardItems = [
-  { title: "Overview", url: "/dashboard", icon: LayoutDashboard },
-  { title: "Suppliers", url: "/dashboard/suppliers", icon: Users },
-  { title: "Profiles", url: "/dashboard/profiles", icon: Layers },
-  { title: "Bank Details", url: "/dashboard/bank-details", icon: CreditCard },
+const toolsItems = [
+  { title: "Audit", url: "/tools/audit", icon: ClipboardCheck },
+  { title: "BSP Internal Contact", url: "/tools/bsp-contact", icon: Users },
 ];
 
-const governanceItems = [
-  { title: "Materiality Audit", url: "/governance/materiality", icon: ShieldCheck },
-  { title: "Add Supplier", url: "/governance/add-supplier", icon: UserPlus },
-];
-
-const integrationItems = [
-  { title: "BC Overview", url: "/integration/bc", icon: Database },
-  { title: "API Contract", url: "/integration/bc/api-contract", icon: FileCode },
-  { title: "Field Mapping", url: "/integration/bc/field-mapping", icon: Map },
-  { title: "Simulation", url: "/integration/bc/simulation", icon: TestTube },
+const omneaApiItems = [
+  { title: "Authentication", url: "/omnea-api/auth", icon: KeyRound },
+  { title: "Get Suppliers", url: "/omnea-api/suppliers", icon: Building2 },
+  { title: "Get Supplier by ID", url: "/omnea-api/supplier-by-id", icon: UserSearch },
+  { title: "Get Supplier by Remote ID", url: "/omnea-api/supplier-by-remote-id", icon: Globe },
+  { title: "Get Profiles", url: "/omnea-api/profiles", icon: Users },
+  { title: "Get Profile by Subsidiary", url: "/omnea-api/profile-by-subsidiary", icon: UserSearch },
+  { title: "Bank Accounts", url: "/omnea-api/bank-accounts", icon: Landmark },
+  { title: "PATCH Profile", url: "/omnea-api/patch-profile", icon: Send },
+  { title: "PATCH Bank Account", url: "/omnea-api/patch-bank-account", icon: Send },
 ];
 
 export function AppSidebar() {
@@ -56,7 +50,7 @@ export function AppSidebar() {
 
   const isActive = (path: string) => currentPath === path;
 
-  const renderGroup = (label: string, items: typeof dashboardItems, icon?: React.ReactNode) => (
+  const renderGroup = (label: string, items: typeof toolsItems, icon?: React.ReactNode) => (
     <SidebarGroup>
       <SidebarGroupLabel>
         {icon}
@@ -89,16 +83,15 @@ export function AppSidebar() {
           {!collapsed && (
             <div>
               <p className="text-sm font-semibold text-sidebar-foreground leading-none">TPM Tooling</p>
-              <p className="text-[10px] text-muted-foreground mt-0.5">BC Integration Simulator</p>
+              <p className="text-[10px] text-muted-foreground mt-0.5">Omnea Integration Hub</p>
             </div>
           )}
         </div>
       </SidebarHeader>
 
       <SidebarContent>
-        {renderGroup("Dashboard", dashboardItems)}
-        {renderGroup("Governance", governanceItems, <ClipboardCheck className="h-3.5 w-3.5 mr-1.5" />)}
-        {renderGroup("Integration", integrationItems, <Plug className="h-3.5 w-3.5 mr-1.5" />)}
+        {renderGroup("Tools", toolsItems, <ClipboardCheck className="h-3.5 w-3.5 mr-1.5" />)}
+        {renderGroup("Omnea API", omneaApiItems, <Plug className="h-3.5 w-3.5 mr-1.5" />)}
       </SidebarContent>
     </Sidebar>
   );
