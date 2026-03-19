@@ -6,7 +6,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AppLayout } from "@/components/AppLayout";
 import AuditPage from "./pages/AuditPage";
 import BSPContactPage from "./pages/BSPContactPage";
-import OmneaEndpointPage from "./pages/OmneaEndpointPage";
+import OmneaAPIPage from "./pages/OmneaAPIPage";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -22,7 +22,7 @@ const App = () => (
           <Route element={<AppLayout />}>
             <Route path="/tools/audit" element={<AuditPage />} />
             <Route path="/tools/bsp-contact" element={<BSPContactPage />} />
-            <Route path="/omnea-api/:slug" element={<OmneaEndpointPage />} />
+            <Route path="/omnea-api" element={<OmneaAPIPage />} />
           </Route>
           <Route path="*" element={<NotFound />} />
         </Routes>

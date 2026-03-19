@@ -1,27 +1,14 @@
 import { useState } from "react";
-import { useParams } from "react-router-dom";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { StatusPill } from "@/components/StatusPill";
-import { omneaEndpoints } from "@/lib/api-contract-data";
+import type { APIEndpoint } from "@/lib/api-contract-data";
 import { mockSuppliers, mockProfiles, mockBankDetails } from "@/lib/store";
 import { Play, Loader2, Copy, Check } from "lucide-react";
 import { toast } from "sonner";
-
-const endpointSlugMap: Record<string, string> = {
-  auth: "auth-token",
-  suppliers: "get-suppliers",
-  "supplier-by-id": "get-supplier-by-id",
-  "supplier-by-remote-id": "get-supplier-by-remote-id",
-  profiles: "get-profiles-by-supplier",
-  "profile-by-subsidiary": "get-profile-by-subsidiary",
-  "bank-accounts": "list-bank-accounts",
-  "patch-profile": "update-profile",
-  "patch-bank-account": "update-bank-account",
-};
 
 function generateMockResponse(endpointId: string, params: Record<string, string>): Record<string, unknown> {
   const s = mockSuppliers[0];
@@ -64,7 +51,8 @@ function generateMockResponse(endpointId: string, params: Record<string, string>
           remoteId: params.supplierRemoteId || s.remoteId || "V03624",
         },
       };
-    case "get-profiles-by-supplier": {
+    case "get-profiles-by-supplier":
+    case "get-profiles-by-remote-id": {
       const profiles = mockProfiles.filter((p) => p.vendorId === s.id).map((p) => ({
         id: p.id, state: p.status.toLowerCase(), remoteId: p.remoteId || null,
         subsidiary: { id: "sub-" + p.id, name: "Wise Payments Ltd", remoteId: null },
@@ -73,7 +61,8 @@ function generateMockResponse(endpointId: string, params: Record<string, string>
       }));
       return { data: profiles };
     }
-    case "get-profile-by-subsidiary": {
+    case "get-profile-by-subsidiary":
+    case "get-profile-by-subsidiary-remote": {
       const p = mockProfiles[0];
       return {
         data: {
@@ -117,11 +106,11 @@ function generateMockResponse(endpointId: string, params: Record<string, string>
   }
 }
 
-const OmneaEndpointPage = () => {
-  const { slug } = useParams<{ slug: string }>();
-  const endpointId = endpointSlugMap[slug || ""] || "";
-  const endpoint = omneaEndpoints.find((e) => e.id === endpointId);
+interface Props {
+  endpoint: APIEndpoint;
+}
 
+const OmneaEndpointDetail = ({ endpoint }: Props) => {
   const [params, setParams] = useState<Record<string, string>>({});
   const [bodyStr, setBodyStr] = useState("");
   const [response, setResponse] = useState<Record<string, unknown> | null>(null);
@@ -130,14 +119,6 @@ const OmneaEndpointPage = () => {
   const [duration, setDuration] = useState<number | null>(null);
   const [copied, setCopied] = useState(false);
 
-  if (!endpoint) {
-    return (
-      <div className="p-6">
-        <p className="text-muted-foreground">Endpoint not found.</p>
-      </div>
-    );
-  }
-
   const updateParam = (key: string, value: string) => setParams((p) => ({ ...p, [key]: value }));
 
   const run = async () => {
@@ -145,13 +126,11 @@ const OmneaEndpointPage = () => {
     setResponse(null);
     const start = performance.now();
     await new Promise((r) => setTimeout(r, 400 + Math.random() * 600));
-    
     let bodyParams: Record<string, string> = {};
     if (bodyStr) {
       try { bodyParams = JSON.parse(bodyStr); } catch { /* ignore */ }
     }
-    
-    const mockResp = generateMockResponse(endpointId, { ...params, ...bodyParams });
+    const mockResp = generateMockResponse(endpoint.id, { ...params, ...bodyParams });
     const dur = Math.floor(performance.now() - start);
     setResponse(mockResp);
     setStatusCode(200);
@@ -168,70 +147,42 @@ const OmneaEndpointPage = () => {
     }
   };
 
-  const resolvedPath = endpoint.path
-    .replace(/\{\{(\w+)\}\}/g, (_, key) => params[key] || `{{${key}}}`);
+  const resolvedPath = endpoint.path.replace(/\{\{(\w+)\}\}/g, (_, key) => params[key] || `{{${key}}}`);
 
   return (
-    <div className="p-6 space-y-4 animate-fade-in max-w-5xl">
-      {/* Header */}
+    <div className="px-6 pb-6 space-y-4 max-w-5xl">
       <div>
         <div className="flex items-center gap-2 mb-1">
-          <StatusPill
-            label={endpoint.method}
-            variant={endpoint.method === "GET" ? "info" : endpoint.method === "PATCH" ? "warning" : "success"}
-          />
+          <StatusPill label={endpoint.method} variant={endpoint.method === "GET" ? "info" : endpoint.method === "PATCH" ? "warning" : "success"} />
           <h2 className="text-lg font-semibold text-foreground">{endpoint.name}</h2>
         </div>
         <p className="text-sm text-muted-foreground">{endpoint.description}</p>
-        <p className="text-xs font-mono text-muted-foreground mt-1 bg-secondary/50 px-2 py-1 rounded inline-block">
-          {resolvedPath}
-        </p>
+        <p className="text-xs font-mono text-muted-foreground mt-1 bg-secondary/50 px-2 py-1 rounded inline-block">{resolvedPath}</p>
       </div>
 
-      {/* Auth info */}
       <Card className="p-3">
-        <p className="text-[11px] text-muted-foreground">
-          <span className="font-medium">Auth:</span>{" "}
-          <span className="font-mono">{endpoint.auth}</span>
-        </p>
-        {endpoint.collection && (
-          <p className="text-[11px] text-muted-foreground mt-0.5">
-            <span className="font-medium">Collection:</span> {endpoint.collection}
-          </p>
-        )}
+        <p className="text-[11px] text-muted-foreground"><span className="font-medium">Auth:</span> <span className="font-mono">{endpoint.auth}</span></p>
+        {endpoint.collection && <p className="text-[11px] text-muted-foreground mt-0.5"><span className="font-medium">Collection:</span> {endpoint.collection}</p>}
       </Card>
 
-      {/* Path params */}
       {endpoint.pathParams.length > 0 && (
         <Card className="p-4 space-y-3">
           <p className="text-xs font-semibold text-foreground">Path Parameters</p>
           {endpoint.pathParams.map((pp) => (
             <div key={pp.key}>
               <Label className="text-[10px] font-mono text-muted-foreground">{`{{${pp.key}}}`}</Label>
-              <Input
-                placeholder={pp.description}
-                value={params[pp.key] || ""}
-                onChange={(e) => updateParam(pp.key, e.target.value)}
-                className="mt-1 font-mono text-xs h-8"
-              />
+              <Input placeholder={pp.description} value={params[pp.key] || ""} onChange={(e) => updateParam(pp.key, e.target.value)} className="mt-1 font-mono text-xs h-8" />
             </div>
           ))}
         </Card>
       )}
 
-      {/* Body params */}
       {endpoint.bodyParams && endpoint.bodyParams.length > 0 && (
         <Card className="p-4 space-y-3">
           <p className="text-xs font-semibold text-foreground">Request Body (JSON)</p>
           <Textarea
-            placeholder={JSON.stringify(
-              Object.fromEntries(endpoint.bodyParams.map((bp) => [bp.key, `<${bp.type}>`])),
-              null,
-              2
-            )}
-            value={bodyStr}
-            onChange={(e) => setBodyStr(e.target.value)}
-            className="font-mono text-xs min-h-[100px]"
+            placeholder={JSON.stringify(Object.fromEntries(endpoint.bodyParams.map((bp) => [bp.key, `<${bp.type}>`])), null, 2)}
+            value={bodyStr} onChange={(e) => setBodyStr(e.target.value)} className="font-mono text-xs min-h-[100px]"
           />
           <div className="space-y-1">
             {endpoint.bodyParams.map((bp) => (
@@ -245,13 +196,11 @@ const OmneaEndpointPage = () => {
         </Card>
       )}
 
-      {/* Run button */}
       <Button onClick={run} disabled={loading} size="sm">
         {loading ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <Play className="h-3.5 w-3.5 mr-1.5" />}
         Send Request
       </Button>
 
-      {/* Response */}
       {response && (
         <Card className="overflow-hidden">
           <div className="px-4 py-2 flex items-center justify-between bg-secondary/30 border-b">
@@ -270,7 +219,6 @@ const OmneaEndpointPage = () => {
         </Card>
       )}
 
-      {/* Test script hint */}
       {endpoint.testScript && (
         <Card className="p-3 bg-secondary/20">
           <p className="text-[10px] font-medium text-muted-foreground mb-1">Postman Test Script Logic</p>
@@ -281,4 +229,4 @@ const OmneaEndpointPage = () => {
   );
 };
 
-export default OmneaEndpointPage;
+export default OmneaEndpointDetail;
