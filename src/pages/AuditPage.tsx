@@ -8,13 +8,13 @@ import {
   TableCell,
   TableHead,
   TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+  TableRow } from
+"@/components/ui/table";
 import {
   auditSuppliers,
   auditRequests,
-  materialityTagOptions,
-} from "@/lib/audit-data";
+  materialityTagOptions } from
+"@/lib/audit-data";
 import { Filter, X } from "lucide-react";
 
 const AuditPage = () => {
@@ -22,7 +22,7 @@ const AuditPage = () => {
 
   const toggleTag = (tag: string) => {
     setSelectedTags((prev) =>
-      prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag]
+    prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag]
     );
   };
 
@@ -31,7 +31,7 @@ const AuditPage = () => {
   const filteredSuppliers = useMemo(() => {
     if (selectedTags.length === 0) return auditSuppliers;
     return auditSuppliers.filter((s) =>
-      selectedTags.every((tag) => s.tags.includes(tag))
+    selectedTags.every((tag) => s.tags.includes(tag))
     );
   }, [selectedTags]);
 
@@ -44,8 +44,8 @@ const AuditPage = () => {
     if (selectedTags.length === 0) return auditRequests;
     return auditRequests.filter(
       (r) =>
-        filteredSupplierNames.has(r.supplier) &&
-        selectedTags.every((tag) => r.tags.includes(tag))
+      filteredSupplierNames.has(r.supplier) &&
+      selectedTags.every((tag) => r.tags.includes(tag))
     );
   }, [selectedTags, filteredSupplierNames]);
 
@@ -79,8 +79,8 @@ const AuditPage = () => {
   return (
     <div className="p-6 space-y-4 animate-fade-in">
       <div>
-        <h2 className="text-lg font-semibold text-foreground">
-          Supplier Materiality Audit
+        <h2 className="text-lg font-semibold text-foreground">Supplier Audit
+
         </h2>
         <p className="text-sm text-muted-foreground">
           Filter suppliers and requests by materiality tags. Select tags below to
@@ -95,15 +95,15 @@ const AuditPage = () => {
           <span className="text-xs font-semibold text-foreground">
             Materiality Filters
           </span>
-          {selectedTags.length > 0 && (
-            <button
-              onClick={clearFilters}
-              className="ml-auto text-xs text-muted-foreground hover:text-foreground flex items-center gap-1"
-            >
+          {selectedTags.length > 0 &&
+          <button
+            onClick={clearFilters}
+            className="ml-auto text-xs text-muted-foreground hover:text-foreground flex items-center gap-1">
+            
               <X className="h-3 w-3" />
               Clear all
             </button>
-          )}
+          }
         </div>
         <div className="flex flex-wrap gap-1.5">
           {materialityTagOptions.map((tag) => {
@@ -113,23 +113,23 @@ const AuditPage = () => {
                 key={tag}
                 variant={active ? "default" : "outline"}
                 className={`cursor-pointer text-[10px] transition-colors ${
-                  active
-                    ? "bg-primary text-primary-foreground hover:bg-primary/90"
-                    : "hover:bg-accent"
-                }`}
-                onClick={() => toggleTag(tag)}
-              >
+                active ?
+                "bg-primary text-primary-foreground hover:bg-primary/90" :
+                "hover:bg-accent"}`
+                }
+                onClick={() => toggleTag(tag)}>
+                
                 {tag}
-              </Badge>
-            );
+              </Badge>);
+
           })}
         </div>
-        {selectedTags.length > 0 && (
-          <p className="text-[10px] text-muted-foreground mt-2">
+        {selectedTags.length > 0 &&
+        <p className="text-[10px] text-muted-foreground mt-2">
             Showing {filteredSuppliers.length} supplier(s) and{" "}
             {filteredRequests.length} request(s) matching all selected tags
           </p>
-        )}
+        }
       </Card>
 
       {/* Side-by-side tables */}
@@ -155,8 +155,8 @@ const AuditPage = () => {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {filteredSuppliers.map((s) => (
-                  <TableRow key={s.id}>
+                {filteredSuppliers.map((s) =>
+                <TableRow key={s.id}>
                     <TableCell className="text-[10px] font-mono">
                       {s.publicId}
                     </TableCell>
@@ -166,19 +166,19 @@ const AuditPage = () => {
                     <TableCell className="text-[10px]">{s.entityType}</TableCell>
                     <TableCell>
                       <StatusPill
-                        label={s.materialityLevel}
-                        variant={
-                          s.materialityLevel === "Material"
-                            ? "warning"
-                            : "default"
-                        }
-                      />
+                      label={s.materialityLevel}
+                      variant={
+                      s.materialityLevel === "Material" ?
+                      "warning" :
+                      "default"
+                      } />
+                    
                     </TableCell>
                     <TableCell>
                       <StatusPill
-                        label={s.state}
-                        variant={stateVariant(s.state)}
-                      />
+                      label={s.state}
+                      variant={stateVariant(s.state)} />
+                    
                     </TableCell>
                     <TableCell className="text-[10px] text-center">
                       {s.infosecCriticalityTier}
@@ -187,17 +187,17 @@ const AuditPage = () => {
                       {s.infosecSensitivityTier}
                     </TableCell>
                   </TableRow>
-                ))}
-                {filteredSuppliers.length === 0 && (
-                  <TableRow>
+                )}
+                {filteredSuppliers.length === 0 &&
+                <TableRow>
                     <TableCell
-                      colSpan={7}
-                      className="text-center text-sm text-muted-foreground py-8"
-                    >
+                    colSpan={7}
+                    className="text-center text-sm text-muted-foreground py-8">
+                    
                       No suppliers match selected filters
                     </TableCell>
                   </TableRow>
-                )}
+                }
               </TableBody>
             </Table>
           </div>
@@ -224,8 +224,8 @@ const AuditPage = () => {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {filteredRequests.map((r) => (
-                  <TableRow key={r.requestUUID}>
+                {filteredRequests.map((r) =>
+                <TableRow key={r.requestUUID}>
                     <TableCell className="text-[10px] font-mono">
                       {r.requestId}
                     </TableCell>
@@ -236,38 +236,38 @@ const AuditPage = () => {
                     <TableCell className="text-[10px]">{r.workflow}</TableCell>
                     <TableCell>
                       <StatusPill
-                        label={r.state}
-                        variant={stateVariant(r.state)}
-                      />
+                      label={r.state}
+                      variant={stateVariant(r.state)} />
+                    
                     </TableCell>
                     <TableCell>
                       <StatusPill
-                        label={r.priority}
-                        variant={priorityVariant(r.priority)}
-                      />
+                      label={r.priority}
+                      variant={priorityVariant(r.priority)} />
+                    
                     </TableCell>
                     <TableCell className="text-[10px] font-mono">
                       {r.dueDate}
                     </TableCell>
                   </TableRow>
-                ))}
-                {filteredRequests.length === 0 && (
-                  <TableRow>
+                )}
+                {filteredRequests.length === 0 &&
+                <TableRow>
                     <TableCell
-                      colSpan={7}
-                      className="text-center text-sm text-muted-foreground py-8"
-                    >
+                    colSpan={7}
+                    className="text-center text-sm text-muted-foreground py-8">
+                    
                       No requests match selected filters
                     </TableCell>
                   </TableRow>
-                )}
+                }
               </TableBody>
             </Table>
           </div>
         </Card>
       </div>
-    </div>
-  );
+    </div>);
+
 };
 
 export default AuditPage;
