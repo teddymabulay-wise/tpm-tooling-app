@@ -21,6 +21,8 @@ import {
 } from "@/components/ui/table";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
   Sheet,
   SheetContent,
@@ -38,6 +40,16 @@ interface BSPUser {
   role: string;
   assignedSupplierIds: string[];
 }
+
+interface OmneaSupplierRecord {
+  id: string;
+  remoteId?: string;
+  name?: string;
+  taxNumber?: string;
+  status?: string;
+}
+
+type SupplierLoadScope = "non-bsp" | "bsp" | "all";
 
 const initialUsers: BSPUser[] = [
   {
@@ -110,7 +122,11 @@ const BSPContactPage = () => {
   const [internalContactsLoadingProgress, setInternalContactsLoadingProgress] = useState(0);
   const [internalContactsError, setInternalContactsError] = useState<string | null>(null);
   const [hasLoadedOmneaContacts, setHasLoadedOmneaContacts] = useState(false);
+  const [supplierLoadScope, setSupplierLoadScope] = useState<SupplierLoadScope>("all");
   const latestLoadRunIdRef = useRef(0);
+  const supplierListCacheRef = useRef(new Map<string, { expiresAt: number; suppliers: OmneaSupplierRecord[] }>());
+  const supplierContactsCacheRef = useRef(new Map<string, unknown[]>());
+  const supplierEntityTypeCacheRef = useRef(new Map<string, string | undefined>());
 
   const extractEntityType = (customFields?: Record<string, unknown>): string | undefined => {
     if (!customFields) return undefined;
@@ -146,6 +162,15 @@ const BSPContactPage = () => {
     if (!entityType) return false;
     const normalized = entityType.trim().toLowerCase();
     return normalized === "banking services" || normalized === "banking service";
+  };
+
+  const matchesSupplierLoadScope = (
+    supplier: { entityType?: string },
+    loadScope: SupplierLoadScope
+  ): boolean => {
+    if (loadScope === "all") return true;
+    const isBsp = isBspEntityType(supplier.entityType);
+    return loadScope === "bsp" ? isBsp : !isBsp;
   };
 
   const detailSupplier = mockSuppliers.find((s) => s.id === detailSupplierId);
@@ -223,6 +248,7 @@ const BSPContactPage = () => {
   const loadInternalContacts = async () => {
     const currentLoadRunId = ++latestLoadRunIdRef.current;
     const isCurrentLoad = () => latestLoadRunIdRef.current === currentLoadRunId;
+    const selectedLoadScope = supplierLoadScope;
 
     setInternalContactsError(null);
     setIsLoadingInternalContacts(true);
@@ -230,28 +256,33 @@ const BSPContactPage = () => {
     setHasLoadedOmneaContacts(false);
 
     try {
-      type OmneaSupplier = {
-        id: string;
-        remoteId?: string;
-        name?: string;
-        taxNumber?: string;
-        status?: string;
-      };
-
       // Step 1: fetch ALL Omnea suppliers (handles pagination)
       const config = getOmneaEnvironmentConfig();
+      const environmentCacheKey = config.environment;
       setInternalContactsLoadingProgress(1);
-      const omneaSupplierList = await fetchAllOmneaPages<OmneaSupplier>(
-        `${config.apiBaseUrl}/v1/suppliers`,
-        {
-          onProgress: ({ pageCount }) => {
-            if (!isCurrentLoad()) return;
-            setInternalContactsLoadingProgress((prev) =>
-              Math.max(prev, Math.min(35, 1 + pageCount * 2))
+      const cachedSupplierList = supplierListCacheRef.current.get(environmentCacheKey);
+      const omneaSupplierList =
+        cachedSupplierList && cachedSupplierList.expiresAt > Date.now()
+          ? cachedSupplierList.suppliers
+          : await fetchAllOmneaPages<OmneaSupplierRecord>(
+              `${config.apiBaseUrl}/v1/suppliers`,
+              {
+                onProgress: ({ pageCount }) => {
+                  if (!isCurrentLoad()) return;
+                  setInternalContactsLoadingProgress((prev) =>
+                    Math.max(prev, Math.min(35, 1 + pageCount * 2))
+                  );
+                },
+              }
             );
-          },
-        }
-      );
+      if (!cachedSupplierList || cachedSupplierList.expiresAt <= Date.now()) {
+        supplierListCacheRef.current.set(environmentCacheKey, {
+          expiresAt: Date.now() + 10 * 60 * 1000,
+          suppliers: omneaSupplierList,
+        });
+      } else {
+        setInternalContactsLoadingProgress((prev) => Math.max(prev, 35));
+      }
       if (!isCurrentLoad()) return;
       setInternalContactsLoadingProgress((prev) => Math.max(prev, 40));
 
@@ -260,20 +291,22 @@ const BSPContactPage = () => {
       }
 
       setAllSuppliers(
-        omneaSupplierList.map((supplier) => ({
-          id: supplier.id,
-          name: supplier.name,
-          taxNumber: supplier.taxNumber,
-          status: supplier.status,
-        }))
+        selectedLoadScope === "all"
+          ? omneaSupplierList.map((supplier) => ({
+              id: supplier.id,
+              name: supplier.name,
+              taxNumber: supplier.taxNumber,
+              status: supplier.status,
+            }))
+          : []
       );
 
       const contactRows: OmneaContact[] = [];
       const supplierEntityTypeMap = new Map<string, string | undefined>();
       const supplierEntityTypePromiseMap = new Map<string, Promise<string | undefined>>();
-      const CONCURRENCY = 20;
-      const DETAIL_CONCURRENCY = 40;
-      const totalSuppliers = omneaSupplierList.length;
+      const CONCURRENCY = 80;
+      const DETAIL_CONCURRENCY = 80;
+      let totalSuppliers = omneaSupplierList.length;
       let processedSuppliers = 0;
       let lastReportedProgress = 40;
 
@@ -290,7 +323,14 @@ const BSPContactPage = () => {
         }
       };
 
-      const fetchSupplierEntityType = (supplier: OmneaSupplier) => {
+      const fetchSupplierEntityType = (supplier: OmneaSupplierRecord) => {
+        const supplierCacheKey = `${config.environment}:${supplier.id}`;
+        if (supplierEntityTypeCacheRef.current.has(supplierCacheKey)) {
+          const cachedValue = supplierEntityTypeCacheRef.current.get(supplierCacheKey);
+          supplierEntityTypeMap.set(supplier.id, cachedValue);
+          return Promise.resolve(cachedValue);
+        }
+
         const existingPromise = supplierEntityTypePromiseMap.get(supplier.id);
         if (existingPromise) {
           return existingPromise;
@@ -308,6 +348,7 @@ const BSPContactPage = () => {
           const customFields = supplierDetail?.customFields as Record<string, unknown> | undefined;
           const supplierEntityType = extractEntityType(customFields);
           supplierEntityTypeMap.set(supplier.id, supplierEntityType);
+          supplierEntityTypeCacheRef.current.set(supplierCacheKey, supplierEntityType);
           return supplierEntityType;
         });
 
@@ -315,24 +356,60 @@ const BSPContactPage = () => {
         return promise;
       };
 
-      void (async () => {
+      const buildScopedSupplierList = () =>
+        omneaSupplierList
+          .map((supplier) => ({
+            id: supplier.id,
+            name: supplier.name,
+            entityType: supplierEntityTypeMap.get(supplier.id),
+            taxNumber: supplier.taxNumber,
+            status: supplier.status,
+          }))
+          .filter((supplier) => matchesSupplierLoadScope(supplier, selectedLoadScope));
+
+      const enrichAllSupplierEntityTypes = async () => {
         for (let start = 0; start < omneaSupplierList.length; start += DETAIL_CONCURRENCY) {
           const batch = omneaSupplierList.slice(start, start + DETAIL_CONCURRENCY);
-          await Promise.all(batch.map((supplier) => fetchSupplierEntityType(supplier)));
+          await Promise.allSettled(batch.map((supplier) => fetchSupplierEntityType(supplier)));
 
           if (!isCurrentLoad()) return;
 
-          setAllSuppliers(
-            omneaSupplierList.map((supplier) => ({
+          setAllSuppliers(buildScopedSupplierList());
+        }
+      };
+
+      if (selectedLoadScope === "all") {
+        void enrichAllSupplierEntityTypes();
+      } else {
+        await enrichAllSupplierEntityTypes();
+        if (!isCurrentLoad()) return;
+      }
+
+      const suppliersToProcess =
+        selectedLoadScope === "all"
+          ? omneaSupplierList
+          : omneaSupplierList.filter((supplier) =>
+              matchesSupplierLoadScope(
+                { entityType: supplierEntityTypeMap.get(supplier.id) },
+                selectedLoadScope
+              )
+            );
+
+      totalSuppliers = Math.max(suppliersToProcess.length, 1);
+      processedSuppliers = 0;
+      lastReportedProgress = selectedLoadScope === "all" ? 40 : 55;
+      setAllSuppliers(
+        selectedLoadScope === "all"
+          ? buildScopedSupplierList()
+          : suppliersToProcess.map((supplier) => ({
               id: supplier.id,
               name: supplier.name,
               entityType: supplierEntityTypeMap.get(supplier.id),
               taxNumber: supplier.taxNumber,
               status: supplier.status,
             }))
-          );
-        }
-      })();
+      );
+      setInternalContactsLoadingProgress((prev) => Math.max(prev, selectedLoadScope === "all" ? 40 : 60));
 
       const extractListItems = (raw: unknown): unknown[] => {
         if (Array.isArray(raw)) return raw;
@@ -370,25 +447,32 @@ const BSPContactPage = () => {
         return false;
       };
 
-      for (let start = 0; start < omneaSupplierList.length; start += CONCURRENCY) {
-        const batch = omneaSupplierList.slice(start, start + CONCURRENCY);
+      for (let start = 0; start < suppliersToProcess.length; start += CONCURRENCY) {
+        const batch = suppliersToProcess.slice(start, start + CONCURRENCY);
 
-        await Promise.all(
+        await Promise.allSettled(
           batch.map(async (supplier) => {
             if (!supplier?.id) return;
 
             try {
-              const internalContactsPath = `${config.apiBaseUrl}/v1/suppliers/${supplier.id}/internal-contacts?limit=100`;
-              const internalContactsResponse = await makeOmneaRequest<unknown>(
-                internalContactsPath,
-                { method: "GET" }
-              );
+              const supplierCacheKey = `${config.environment}:${supplier.id}`;
+              let internalContactItems = supplierContactsCacheRef.current.get(supplierCacheKey);
 
-              let internalContactItems = extractListItems(internalContactsResponse.data);
-              if (hasNextPage(internalContactsResponse.data)) {
-                internalContactItems = await fetchAllOmneaPages<unknown>(
-                  `${config.apiBaseUrl}/v1/suppliers/${supplier.id}/internal-contacts`
+              if (!internalContactItems) {
+                const internalContactsPath = `${config.apiBaseUrl}/v1/suppliers/${supplier.id}/internal-contacts?limit=100`;
+                const internalContactsResponse = await makeOmneaRequest<unknown>(
+                  internalContactsPath,
+                  { method: "GET" }
                 );
+
+                internalContactItems = extractListItems(internalContactsResponse.data);
+                if (hasNextPage(internalContactsResponse.data)) {
+                  internalContactItems = await fetchAllOmneaPages<unknown>(
+                    `${config.apiBaseUrl}/v1/suppliers/${supplier.id}/internal-contacts`
+                  );
+                }
+
+                supplierContactsCacheRef.current.set(supplierCacheKey, internalContactItems);
               }
 
               if (!internalContactItems.length) {
@@ -576,7 +660,7 @@ const BSPContactPage = () => {
   return (
     <div className="p-6 space-y-4 animate-fade-in w-full max-w-none">
       <div>
-        <h2 className="text-lg font-semibold text-foreground">BSP Internal Contacts</h2>
+        <h2 className="text-lg font-semibold text-foreground">Internal Contacts</h2>
         <p className="text-sm text-muted-foreground">
           Map Omnea users to their BSP supplier responsibilities.
         </p>
@@ -596,6 +680,25 @@ const BSPContactPage = () => {
               "Load Omnea internal contacts"
             )}
           </Button>
+            <RadioGroup
+              value={supplierLoadScope}
+              onValueChange={(value) => setSupplierLoadScope(value as SupplierLoadScope)}
+              className="flex items-center gap-3"
+              disabled={isLoadingInternalContacts}
+            >
+              <div className="flex items-center gap-2">
+                <RadioGroupItem value="non-bsp" id="load-scope-non-bsp" />
+                <Label htmlFor="load-scope-non-bsp" className="text-xs">Non-BSP</Label>
+              </div>
+              <div className="flex items-center gap-2">
+                <RadioGroupItem value="bsp" id="load-scope-bsp" />
+                <Label htmlFor="load-scope-bsp" className="text-xs">BSP</Label>
+              </div>
+              <div className="flex items-center gap-2">
+                <RadioGroupItem value="all" id="load-scope-all" />
+                <Label htmlFor="load-scope-all" className="text-xs">All</Label>
+              </div>
+            </RadioGroup>
           {internalContactsError && (
             <span className="text-xs text-destructive">{internalContactsError}</span>
           )}

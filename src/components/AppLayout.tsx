@@ -56,7 +56,7 @@ export const AppLayout = () => {
               <div className="flex items-center min-w-0">
                 <SidebarTrigger className="mr-3" />
                 <span className="text-xs text-muted-foreground truncate">
-                  TPM Tooling — BC Integration Simulator
+                  TPM Tooling — Omnea API
                 </span>
               </div>
 
