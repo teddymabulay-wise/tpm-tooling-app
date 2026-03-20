@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -20,13 +20,16 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
 import {
   Sheet,
   SheetContent,
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
-import { Plus, X, Building2, Mail, ChevronRight } from "lucide-react";
+import { makeOmneaRequest, fetchAllOmneaPages } from "@/lib/omnea-api-utils";
+import { getOmneaEnvironmentConfig } from "@/lib/omnea-environment";
+import { Plus, X, Building2, Mail, ChevronRight, Loader2 } from "lucide-react";
 
 interface BSPUser {
   id: string;
@@ -72,14 +75,86 @@ const BSPContactPage = () => {
   const [addModalOpen, setAddModalOpen] = useState(false);
   const [addModalUserId, setAddModalUserId] = useState<string | null>(null);
   const [selectedNewSuppliers, setSelectedNewSuppliers] = useState<string[]>([]);
+  const [supplierSearch, setSupplierSearch] = useState("");
   const [detailSupplierId, setDetailSupplierId] = useState<string | null>(null);
+  type OmneaContact = {
+    supplierId: string;
+    supplierName: string;
+    supplierEntityType?: string;
+    userId: string;
+    name: string;
+    email?: string;
+    role?: string;
+  };
+
+  type OmneaUserAssignment = {
+    userId: string;
+    name: string;
+    email?: string;
+    role?: string;
+    bspSuppliers: string[];
+    nonBspSuppliers: string[];
+    assignedSupplierIds: string[];
+  };
+
+  const [internalContacts, setInternalContacts] = useState<OmneaContact[]>([]);
+  const [omneaAssignments, setOmneaAssignments] = useState<OmneaUserAssignment[]>([]);
+  const [allSuppliers, setAllSuppliers] = useState<{
+    id: string;
+    name?: string;
+    entityType?: string;
+    taxNumber?: string;
+    status?: string;
+  }[]>([]);
+  const [isLoadingInternalContacts, setIsLoadingInternalContacts] = useState(false);
+  const [internalContactsLoadingProgress, setInternalContactsLoadingProgress] = useState(0);
+  const [internalContactsError, setInternalContactsError] = useState<string | null>(null);
+  const [hasLoadedOmneaContacts, setHasLoadedOmneaContacts] = useState(false);
+  const latestLoadRunIdRef = useRef(0);
+
+  const extractEntityType = (customFields?: Record<string, unknown>): string | undefined => {
+    if (!customFields) return undefined;
+
+    const direct = customFields["entity-type"] as Record<string, unknown> | undefined;
+    if (direct) {
+      const value = direct.value;
+      if (typeof value === "string" && value.trim()) return value.trim();
+      if (value && typeof value === "object") {
+        const name = (value as Record<string, unknown>).name;
+        if (typeof name === "string" && name.trim()) return name.trim();
+      }
+    }
+
+    for (const field of Object.values(customFields)) {
+      if (!field || typeof field !== "object") continue;
+      const fieldObj = field as Record<string, unknown>;
+      const fieldName = typeof fieldObj.name === "string" ? fieldObj.name : "";
+      if (fieldName.trim().toLowerCase() !== "entity type") continue;
+
+      const value = fieldObj.value;
+      if (typeof value === "string" && value.trim()) return value.trim();
+      if (value && typeof value === "object") {
+        const name = (value as Record<string, unknown>).name;
+        if (typeof name === "string" && name.trim()) return name.trim();
+      }
+    }
+
+    return undefined;
+  };
+
+  const isBspEntityType = (entityType?: string): boolean => {
+    if (!entityType) return false;
+    const normalized = entityType.trim().toLowerCase();
+    return normalized === "banking services" || normalized === "banking service";
+  };
+
   const detailSupplier = mockSuppliers.find((s) => s.id === detailSupplierId);
 
   const openAddModal = (userId: string) => {
     setAddModalUserId(userId);
-    const user = users.find((u) => u.id === userId);
     // Pre-clear selection
     setSelectedNewSuppliers([]);
+    setSupplierSearch("");
     setAddModalOpen(true);
   };
 
@@ -93,21 +168,40 @@ const BSPContactPage = () => {
 
   const confirmAddSuppliers = () => {
     if (!addModalUserId) return;
-    setUsers((prev) =>
-      prev.map((u) =>
-        u.id === addModalUserId
-          ? {
-              ...u,
-              assignedSupplierIds: [
-                ...new Set([...u.assignedSupplierIds, ...selectedNewSuppliers]),
-              ],
-            }
-          : u
-      )
+    setOmneaAssignments((prev) =>
+      prev.map((u) => {
+        if (u.userId !== addModalUserId) return u;
+        const updatedBsp = [...u.bspSuppliers];
+        const updatedNonBsp = [...u.nonBspSuppliers];
+        const updatedAssignedIds = new Set(u.assignedSupplierIds);
+
+        selectedNewSuppliers.forEach((supplierId) => {
+          if (updatedAssignedIds.has(supplierId)) return;
+          const supplier = allSuppliers.find((s) => s.id === supplierId);
+          if (!supplier || !supplier.name) return;
+          const isBsp =
+            supplier.entityType &&
+            String(supplier.entityType).toLowerCase() === "banking services";
+          if (isBsp) {
+            updatedBsp.push(supplier.name);
+          } else {
+            updatedNonBsp.push(supplier.name);
+          }
+          updatedAssignedIds.add(supplierId);
+        });
+
+        return {
+          ...u,
+          bspSuppliers: updatedBsp,
+          nonBspSuppliers: updatedNonBsp,
+          assignedSupplierIds: Array.from(updatedAssignedIds),
+        };
+      })
     );
     setAddModalOpen(false);
     setAddModalUserId(null);
     setSelectedNewSuppliers([]);
+    setSupplierSearch("");
   };
 
   const removeSupplier = (userId: string, supplierId: string) => {
@@ -124,84 +218,515 @@ const BSPContactPage = () => {
     mockSuppliers.find((s) => s.id === id)?.legalName || id;
 
   const currentUser = users.find((u) => u.id === addModalUserId);
-  const availableSuppliers = mockSuppliers.filter(
-    (s) => !currentUser?.assignedSupplierIds.includes(s.id)
-  );
+  const currentOmneaUser = omneaAssignments.find((u) => u.userId === addModalUserId);
 
+  const loadInternalContacts = async () => {
+    const currentLoadRunId = ++latestLoadRunIdRef.current;
+    const isCurrentLoad = () => latestLoadRunIdRef.current === currentLoadRunId;
+
+    setInternalContactsError(null);
+    setIsLoadingInternalContacts(true);
+    setInternalContactsLoadingProgress(0);
+    setHasLoadedOmneaContacts(false);
+
+    try {
+      type OmneaSupplier = {
+        id: string;
+        remoteId?: string;
+        name?: string;
+        taxNumber?: string;
+        status?: string;
+      };
+
+      // Step 1: fetch ALL Omnea suppliers (handles pagination)
+      const config = getOmneaEnvironmentConfig();
+      setInternalContactsLoadingProgress(1);
+      const omneaSupplierList = await fetchAllOmneaPages<OmneaSupplier>(
+        `${config.apiBaseUrl}/v1/suppliers`,
+        {
+          onProgress: ({ pageCount }) => {
+            if (!isCurrentLoad()) return;
+            setInternalContactsLoadingProgress((prev) =>
+              Math.max(prev, Math.min(35, 1 + pageCount * 2))
+            );
+          },
+        }
+      );
+      if (!isCurrentLoad()) return;
+      setInternalContactsLoadingProgress((prev) => Math.max(prev, 40));
+
+      if (!omneaSupplierList.length) {
+        throw new Error("No suppliers returned from Omnea");
+      }
+
+      setAllSuppliers(
+        omneaSupplierList.map((supplier) => ({
+          id: supplier.id,
+          name: supplier.name,
+          taxNumber: supplier.taxNumber,
+          status: supplier.status,
+        }))
+      );
+
+      const contactRows: OmneaContact[] = [];
+      const supplierEntityTypeMap = new Map<string, string | undefined>();
+      const supplierEntityTypePromiseMap = new Map<string, Promise<string | undefined>>();
+      const CONCURRENCY = 20;
+      const DETAIL_CONCURRENCY = 40;
+      const totalSuppliers = omneaSupplierList.length;
+      let processedSuppliers = 0;
+      let lastReportedProgress = 40;
+
+      const reportProgress = () => {
+        const nextProgress = Math.min(
+          95,
+          40 + Math.floor((processedSuppliers / totalSuppliers) * 55)
+        );
+        if (nextProgress > lastReportedProgress) {
+          lastReportedProgress = nextProgress;
+          if (isCurrentLoad()) {
+            setInternalContactsLoadingProgress(nextProgress);
+          }
+        }
+      };
+
+      const fetchSupplierEntityType = (supplier: OmneaSupplier) => {
+        const existingPromise = supplierEntityTypePromiseMap.get(supplier.id);
+        if (existingPromise) {
+          return existingPromise;
+        }
+
+        const promise = makeOmneaRequest<Record<string, unknown>>(
+          `${config.apiBaseUrl}/v1/suppliers/${supplier.id}`,
+          { method: "GET" }
+        ).then((detailResponse) => {
+          const supplierDetail = (
+            (detailResponse.data as Record<string, unknown> | undefined)?.data ??
+            detailResponse.data
+          ) as Record<string, unknown> | undefined;
+
+          const customFields = supplierDetail?.customFields as Record<string, unknown> | undefined;
+          const supplierEntityType = extractEntityType(customFields);
+          supplierEntityTypeMap.set(supplier.id, supplierEntityType);
+          return supplierEntityType;
+        });
+
+        supplierEntityTypePromiseMap.set(supplier.id, promise);
+        return promise;
+      };
+
+      void (async () => {
+        for (let start = 0; start < omneaSupplierList.length; start += DETAIL_CONCURRENCY) {
+          const batch = omneaSupplierList.slice(start, start + DETAIL_CONCURRENCY);
+          await Promise.all(batch.map((supplier) => fetchSupplierEntityType(supplier)));
+
+          if (!isCurrentLoad()) return;
+
+          setAllSuppliers(
+            omneaSupplierList.map((supplier) => ({
+              id: supplier.id,
+              name: supplier.name,
+              entityType: supplierEntityTypeMap.get(supplier.id),
+              taxNumber: supplier.taxNumber,
+              status: supplier.status,
+            }))
+          );
+        }
+      })();
+
+      const extractListItems = (raw: unknown): unknown[] => {
+        if (Array.isArray(raw)) return raw;
+        if (raw && typeof raw === "object") {
+          const obj = raw as Record<string, unknown>;
+          if (Array.isArray(obj.data)) return obj.data;
+        }
+        return [];
+      };
+
+      const hasNextPage = (raw: unknown): boolean => {
+        if (!raw || typeof raw !== "object") return false;
+        const obj = raw as Record<string, unknown>;
+        const rootNext = obj.nextCursor ?? obj.next_cursor;
+        if (typeof rootNext === "string" && rootNext) return true;
+
+        const meta = obj.meta as Record<string, unknown> | undefined;
+        if (meta) {
+          const metaNext =
+            meta.nextCursor ??
+            meta.next_cursor ??
+            meta.cursor ??
+            meta.pageToken ??
+            meta.page_token ??
+            meta.continuationToken;
+          if (typeof metaNext === "string" && metaNext) return true;
+        }
+
+        const pagination = obj.pagination as Record<string, unknown> | undefined;
+        if (pagination) {
+          const paginationNext = pagination.nextCursor ?? pagination.next_cursor ?? pagination.cursor;
+          if (typeof paginationNext === "string" && paginationNext) return true;
+        }
+
+        return false;
+      };
+
+      for (let start = 0; start < omneaSupplierList.length; start += CONCURRENCY) {
+        const batch = omneaSupplierList.slice(start, start + CONCURRENCY);
+
+        await Promise.all(
+          batch.map(async (supplier) => {
+            if (!supplier?.id) return;
+
+            try {
+              const internalContactsPath = `${config.apiBaseUrl}/v1/suppliers/${supplier.id}/internal-contacts?limit=100`;
+              const internalContactsResponse = await makeOmneaRequest<unknown>(
+                internalContactsPath,
+                { method: "GET" }
+              );
+
+              let internalContactItems = extractListItems(internalContactsResponse.data);
+              if (hasNextPage(internalContactsResponse.data)) {
+                internalContactItems = await fetchAllOmneaPages<unknown>(
+                  `${config.apiBaseUrl}/v1/suppliers/${supplier.id}/internal-contacts`
+                );
+              }
+
+              if (!internalContactItems.length) {
+                return;
+              }
+
+              const supplierEntityType = await fetchSupplierEntityType(supplier);
+
+              const items: unknown[] = internalContactItems;
+
+              items.forEach((c) => {
+                if (!c || typeof c !== "object") return;
+                const item = c as Record<string, unknown>;
+                const user = item.user as Record<string, unknown> | undefined;
+                const userId =
+                  String(item.userId || (user && user.id) || item.id || "");
+
+                let name = "Unknown";
+                if (user) {
+                  if (user.firstName && user.lastName) {
+                    name = `${user.firstName} ${user.lastName}`;
+                  } else if (user.firstName) {
+                    name = String(user.firstName);
+                  } else if (user.lastName) {
+                    name = String(user.lastName);
+                  }
+                } else if (item.name || item.username) {
+                  name = String(item.name || item.username);
+                }
+
+                const email =
+                  user && user.email
+                    ? String(user.email)
+                    : item.email
+                    ? String(item.email)
+                    : undefined;
+                const role =
+                  String(item.role || (user && user.role) || "");
+
+                if (!userId || !name) return;
+
+                contactRows.push({
+                  supplierId: supplier.id,
+                  supplierName: supplier.name || "Unknown",
+                  supplierEntityType,
+                  userId,
+                  name,
+                  email,
+                  role,
+                });
+              });
+            } finally {
+              processedSuppliers += 1;
+              reportProgress();
+            }
+          })
+        );
+      }
+
+      if (!contactRows.length) {
+        setInternalContactsError(
+          "No internal contacts were found for suppliers from Omnea."
+        );
+        setInternalContacts([]);
+        setOmneaAssignments([]);
+        setHasLoadedOmneaContacts(true);
+        return;
+      }
+
+      setInternalContacts(contactRows);
+
+      const userMap = new Map<
+        string,
+        {
+          name: string;
+          email?: string;
+          role?: string;
+          bspSuppliers: string[];
+          nonBspSuppliers: string[];
+          assignedSupplierIds: Set<string>;
+        }
+      >();
+
+      contactRows.forEach((contact) => {
+        const existing = userMap.get(contact.userId);
+        const hasEntityType = Boolean(contact.supplierEntityType);
+        const isBsp = isBspEntityType(contact.supplierEntityType);
+        const supplierName = contact.supplierName || "Unknown";
+        const supplierId = contact.supplierId;
+
+        if (existing) {
+          if (isBsp) {
+            existing.bspSuppliers.push(supplierName);
+          } else if (hasEntityType) {
+            existing.nonBspSuppliers.push(supplierName);
+          }
+          existing.assignedSupplierIds.add(supplierId);
+          if (!existing.role && contact.role) existing.role = contact.role;
+          if (!existing.email && contact.email) existing.email = contact.email;
+        } else {
+          userMap.set(contact.userId, {
+            name: contact.name,
+            email: contact.email,
+            role: contact.role,
+            bspSuppliers: isBsp ? [supplierName] : [],
+            nonBspSuppliers: !isBsp && hasEntityType ? [supplierName] : [],
+            assignedSupplierIds: new Set([supplierId]),
+          });
+        }
+      });
+
+      const combined = Array.from(userMap.entries()).map(([userId, user]) => ({
+        userId,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        bspSuppliers: user.bspSuppliers,
+        nonBspSuppliers: user.nonBspSuppliers,
+        assignedSupplierIds: Array.from(user.assignedSupplierIds),
+      }));
+
+      setOmneaAssignments(combined);
+
+      // When we have cleaned Omnea data we can surface it in the BSP assignment table.
+      // internalContacts is also preserved for the raw detail view below.
+      setInternalContacts(contactRows);
+      setInternalContactsLoadingProgress(100);
+      setHasLoadedOmneaContacts(true);
+    } catch (err) {
+      if (isCurrentLoad()) {
+        setInternalContactsError(err instanceof Error ? err.message : "Failed to load internal contacts.");
+        setHasLoadedOmneaContacts(false);
+      }
+    } finally {
+      if (isCurrentLoad()) {
+        setIsLoadingInternalContacts(false);
+      }
+    }
+  };
+
+  const currentAssignment = currentOmneaUser
+    ? currentOmneaUser
+    : currentUser
+    ? {
+        ...currentUser,
+        bspSuppliers: currentUser.assignedSupplierIds,
+        nonBspSuppliers: [] as string[],
+        assignedSupplierIds: currentUser.assignedSupplierIds,
+      }
+    : undefined;
+
+  const currentInternalContactSupplierIds = currentOmneaUser
+    ? internalContacts
+        .filter((contact) => contact.userId === currentOmneaUser.userId)
+        .map((contact) => contact.supplierId)
+    : [];
+
+  const assignedSupplierIds = new Set<string>([
+    ...(currentAssignment?.assignedSupplierIds ?? []),
+    ...currentInternalContactSupplierIds,
+  ]);
+
+  const availableSuppliers =
+    allSuppliers.length > 0
+      ? allSuppliers.filter((s) => !assignedSupplierIds.has(s.id))
+      : mockSuppliers.filter((s) => !assignedSupplierIds.has(s.id));
+
+  const filteredAvailableSuppliers = availableSuppliers.filter((supplier) => {
+    const query = supplierSearch.trim().toLowerCase();
+    if (!query) return true;
+
+    const supplierName = ("name" in supplier ? supplier.name : supplier.legalName) || "";
+    const supplierTaxNumber = supplier.taxNumber || "";
+    const supplierStatus = supplier.status || "";
+
+    return [supplierName, supplierTaxNumber, supplierStatus]
+      .join(" ")
+      .toLowerCase()
+      .includes(query);
+  });
+
+  const bspAssignments = omneaAssignments.filter((u) => u.bspSuppliers.length > 0);
+  const nonBspAssignments = omneaAssignments.filter((u) => u.nonBspSuppliers.length > 0);
+  
   return (
-    <div className="p-6 space-y-4 animate-fade-in max-w-6xl">
+    <div className="p-6 space-y-4 animate-fade-in w-full max-w-none">
       <div>
         <h2 className="text-lg font-semibold text-foreground">BSP Internal Contacts</h2>
         <p className="text-sm text-muted-foreground">
           Map Omnea users to their BSP supplier responsibilities.
         </p>
+        <div className="flex items-center gap-2 mt-2">
+          <Button
+            onClick={loadInternalContacts}
+            disabled={isLoadingInternalContacts}
+            size="sm"
+            className="h-7"
+          >
+            {isLoadingInternalContacts ? (
+              <>
+                <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
+                Loading Omnea internal contacts... {internalContactsLoadingProgress}%
+              </>
+            ) : (
+              "Load Omnea internal contacts"
+            )}
+          </Button>
+          {internalContactsError && (
+            <span className="text-xs text-destructive">{internalContactsError}</span>
+          )}
+          {hasLoadedOmneaContacts && !isLoadingInternalContacts && (
+            <span className="text-xs text-muted-foreground">
+              Loaded: {allSuppliers.length} suppliers, {omneaAssignments.length} users with {bspAssignments.length} BSP, {nonBspAssignments.length} Non-BSP
+            </span>
+          )}
+        </div>
       </div>
 
-      {/* Main table */}
-      <Card>
+      <Card className="w-full overflow-x-auto">
         <Table>
           <TableHeader>
             <TableRow>
               <TableHead className="w-[200px]">Omnea User</TableHead>
               <TableHead className="w-[150px]">Role</TableHead>
               <TableHead>BSP Suppliers</TableHead>
+              <TableHead className="w-[100px]">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {users.map((user) => (
-              <TableRow key={user.id}>
-                <TableCell>
-                  <div>
-                    <p className="text-sm font-medium text-foreground">{user.name}</p>
-                    <p className="text-[11px] text-muted-foreground flex items-center gap-1">
-                      <Mail className="h-3 w-3" />
-                      {user.email}
-                    </p>
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <StatusPill label={user.role} variant="info" />
-                </TableCell>
-                <TableCell>
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    {user.assignedSupplierIds.map((sId) => (
-                      <Badge
-                        key={sId}
-                        variant="secondary"
-                        className="cursor-pointer hover:bg-accent transition-colors pr-1 gap-1"
-                      >
-                        <span
-                          onClick={() => setDetailSupplierId(sId)}
-                          className="flex items-center gap-1"
-                        >
-                          <Building2 className="h-3 w-3" />
-                          {getSupplierName(sId)}
-                          <ChevronRight className="h-3 w-3 text-muted-foreground" />
-                        </span>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            removeSupplier(user.id, sId);
-                          }}
-                          className="ml-0.5 rounded-full hover:bg-destructive/20 p-0.5"
-                        >
-                          <X className="h-3 w-3 text-muted-foreground hover:text-destructive" />
-                        </button>
-                      </Badge>
-                    ))}
+            {bspAssignments.length > 0 ? (
+              bspAssignments.map((u) => (
+                <TableRow key={`${u.userId}-${u.name}`}>
+                  <TableCell>
+                    <div>
+                      <p className="text-sm font-medium text-foreground">{u.name}</p>
+                      <p className="text-[11px] text-muted-foreground flex items-center gap-1">
+                        <Mail className="h-3 w-3" />
+                        {u.email || "—"}
+                      </p>
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <StatusPill label={u.role || "Unknown"} variant="info" />
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {u.bspSuppliers.map((supplierName, index) => (
+                        <Badge key={`${u.userId}-${supplierName}-${index}`} variant="secondary" className="px-2 py-1">
+                          {supplierName}
+                        </Badge>
+                      ))}
+                    </div>
+                  </TableCell>
+                  <TableCell>
                     <Button
                       variant="outline"
                       size="sm"
                       className="h-6 text-[11px] px-2"
-                      onClick={() => openAddModal(user.id)}
+                      onClick={() => openAddModal(u.userId)}
                     >
                       <Plus className="h-3 w-3 mr-1" />
                       Add
                     </Button>
-                  </div>
+                  </TableCell>
+                </TableRow>
+              ))
+            ) : hasLoadedOmneaContacts ? (
+              <TableRow>
+                <TableCell colSpan={4}>
+                  <p className="text-sm text-muted-foreground">Data loaded, but no BSP assignments were found for users with internal contacts.</p>
                 </TableCell>
               </TableRow>
-            ))}
+            ) : (
+              <TableRow>
+                  <TableCell colSpan={4}>
+                  <p className="text-sm text-muted-foreground">No data loaded. Click "Load Omnea internal contacts" to fetch user assignments.</p>
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </Card>
+
+      <Card className="w-full overflow-x-auto">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-[200px]">Omnea User</TableHead>
+              <TableHead className="w-[150px]">Role</TableHead>
+              <TableHead>Non-BSP Suppliers</TableHead>
+              <TableHead className="w-[100px]">Actions</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {nonBspAssignments.length > 0 ? (
+              nonBspAssignments.map((u) => (
+                <TableRow key={`non-bsp-${u.userId}-${u.name}`}>
+                  <TableCell>
+                    <div>
+                      <p className="text-sm font-medium text-foreground">{u.name}</p>
+                      <p className="text-[11px] text-muted-foreground flex items-center gap-1">
+                        <Mail className="h-3 w-3" />
+                        {u.email || "—"}
+                      </p>
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <StatusPill label={u.role || "Unknown"} variant="info" />
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {u.nonBspSuppliers.map((supplierName, index) => (
+                        <Badge key={`non-${u.userId}-${supplierName}-${index}`} variant="secondary" className="px-2 py-1">
+                          {supplierName}
+                        </Badge>
+                      ))}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-6 text-[11px] px-2"
+                      onClick={() => openAddModal(u.userId)}
+                    >
+                      <Plus className="h-3 w-3 mr-1" />
+                      Add
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              ))
+            ) : (
+              <TableRow>
+                <TableCell colSpan={4}>
+                  <p className="text-sm text-muted-foreground">No non-BSP supplier assignments found.</p>
+                </TableCell>
+              </TableRow>
+            )}
           </TableBody>
         </Table>
       </Card>
@@ -211,16 +736,23 @@ const BSPContactPage = () => {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>
-              Assign Suppliers to {currentUser?.name}
+              Assign Suppliers to {currentAssignment?.name || "User"}
             </DialogTitle>
           </DialogHeader>
+          <div className="space-y-2">
+            <Input
+              value={supplierSearch}
+              onChange={(e) => setSupplierSearch(e.target.value)}
+              placeholder="Search suppliers"
+            />
+          </div>
           <div className="space-y-1 max-h-[300px] overflow-auto">
-            {availableSuppliers.length === 0 ? (
+            {filteredAvailableSuppliers.length === 0 ? (
               <p className="text-sm text-muted-foreground py-4 text-center">
-                All suppliers are already assigned.
+                No suppliers match your search.
               </p>
             ) : (
-              availableSuppliers.map((s) => (
+              filteredAvailableSuppliers.map((s) => (
                 <label
                   key={s.id}
                   className="flex items-center gap-3 p-2 rounded-md hover:bg-accent/50 cursor-pointer"
@@ -230,7 +762,7 @@ const BSPContactPage = () => {
                     onCheckedChange={() => toggleSupplierSelection(s.id)}
                   />
                   <div className="min-w-0">
-                    <p className="text-sm font-medium text-foreground">{s.legalName}</p>
+                    <p className="text-sm font-medium text-foreground">{("name" in s ? s.name : s.legalName) || "Unnamed supplier"}</p>
                     <p className="text-[11px] text-muted-foreground">
                       {s.taxNumber} · {s.status}
                     </p>

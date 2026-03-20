@@ -5,7 +5,7 @@ import { omneaEndpoints, type APIEndpoint } from "@/lib/api-contract-data";
 import { ChevronRight, Plug } from "lucide-react";
 import OmneaEndpointDetail from "@/components/OmneaEndpointDetail";
 
-const collections = ["Authentication", "Suppliers", "Supplier Profile", "Bank Account"];
+const collections = ["Authentication", "Suppliers", "Supplier Maintenance", "Supplier Profile", "Bank Account"];
 
 const OmneaAPIPage = () => {
   const [selectedEndpoint, setSelectedEndpoint] = useState<APIEndpoint | null>(null);
