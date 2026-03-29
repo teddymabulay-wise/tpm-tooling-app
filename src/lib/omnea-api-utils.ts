@@ -248,6 +248,10 @@ export async function fetchAllOmneaPages<T>(
     if (raw && typeof raw === "object") {
       const obj = raw as Record<string, unknown>;
       if (Array.isArray(obj.data)) return obj.data as T[];
+      if (obj.data && typeof obj.data === "object") {
+        const nested = obj.data as Record<string, unknown>;
+        if (Array.isArray(nested.data)) return nested.data as T[];
+      }
     }
     return [];
   };
@@ -261,61 +265,70 @@ export async function fetchAllOmneaPages<T>(
   const extractNext = (raw: unknown): { type: "cursor" | "url"; value: string } | null => {
     if (!raw || typeof raw !== "object") return null;
     const obj = raw as Record<string, unknown>;
+    const nestedData = obj.data && typeof obj.data === "object"
+      ? (obj.data as Record<string, unknown>)
+      : undefined;
 
-    // Check root-level nextCursor field first
-    for (const fieldName of ["nextCursor", "next_cursor"]) {
-      const cursor = obj[fieldName];
-      if (typeof cursor === "string" && cursor) {
-        return { type: "cursor", value: cursor };
-      }
-    }
+    const containers = [obj, nestedData].filter(
+      (value): value is Record<string, unknown> => Boolean(value)
+    );
 
-    // Check links.next first (full URL)
-    const linksNext = (obj.links as Record<string, unknown> | undefined)?.next;
-    if (typeof linksNext === "string" && linksNext) {
-      return { type: "url", value: linksNext };
-    }
-    if (linksNext && typeof linksNext === "object") {
-      const href = (linksNext as Record<string, unknown>).href;
-      if (typeof href === "string" && href) {
-        return { type: "url", value: href };
-      }
-    }
-
-    // Check various cursor field names in meta
-    const meta = obj.meta as Record<string, unknown> | undefined;
-    if (meta) {
-      // Try common cursor field names
-      for (const fieldName of ["nextCursor", "next_cursor", "cursor", "pageToken", "page_token", "continuationToken"]) {
-        const cursor = meta[fieldName];
+    for (const container of containers) {
+      // Check root-level nextCursor field first
+      for (const fieldName of ["nextCursor", "next_cursor"]) {
+        const cursor = container[fieldName];
         if (typeof cursor === "string" && cursor) {
           return { type: "cursor", value: cursor };
         }
       }
 
-      // Check if links exists inside meta
-      const metaLinks = meta.links as Record<string, unknown> | undefined;
-      if (metaLinks) {
-        const metaNext = metaLinks.next;
-        if (typeof metaNext === "string" && metaNext) {
-          return { type: "url", value: metaNext };
+      // Check links.next first (full URL)
+      const linksNext = (container.links as Record<string, unknown> | undefined)?.next;
+      if (typeof linksNext === "string" && linksNext) {
+        return { type: "url", value: linksNext };
+      }
+      if (linksNext && typeof linksNext === "object") {
+        const href = (linksNext as Record<string, unknown>).href;
+        if (typeof href === "string" && href) {
+          return { type: "url", value: href };
         }
-        if (metaNext && typeof metaNext === "object") {
-          const href = (metaNext as Record<string, unknown>).href;
-          if (typeof href === "string" && href) {
-            return { type: "url", value: href };
+      }
+
+      // Check various cursor field names in meta
+      const meta = container.meta as Record<string, unknown> | undefined;
+      if (meta) {
+        // Try common cursor field names
+        for (const fieldName of ["nextCursor", "next_cursor", "cursor", "pageToken", "page_token", "continuationToken"]) {
+          const cursor = meta[fieldName];
+          if (typeof cursor === "string" && cursor) {
+            return { type: "cursor", value: cursor };
+          }
+        }
+
+        // Check if links exists inside meta
+        const metaLinks = meta.links as Record<string, unknown> | undefined;
+        if (metaLinks) {
+          const metaNext = metaLinks.next;
+          if (typeof metaNext === "string" && metaNext) {
+            return { type: "url", value: metaNext };
+          }
+          if (metaNext && typeof metaNext === "object") {
+            const href = (metaNext as Record<string, unknown>).href;
+            if (typeof href === "string" && href) {
+              return { type: "url", value: href };
+            }
           }
         }
       }
-    }
 
-    // Check root-level pagination
-    const pagination = obj.pagination as Record<string, unknown> | undefined;
-    if (pagination) {
-      for (const fieldName of ["nextCursor", "next_cursor", "cursor"]) {
-        const cursor = pagination[fieldName];
-        if (typeof cursor === "string" && cursor) {
-          return { type: "cursor", value: cursor };
+      // Check root-level pagination
+      const pagination = container.pagination as Record<string, unknown> | undefined;
+      if (pagination) {
+        for (const fieldName of ["nextCursor", "next_cursor", "cursor"]) {
+          const cursor = pagination[fieldName];
+          if (typeof cursor === "string" && cursor) {
+            return { type: "cursor", value: cursor };
+          }
         }
       }
     }

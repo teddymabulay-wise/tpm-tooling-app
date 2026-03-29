@@ -1,0 +1,21 @@
+{
+  "projectName": "TPM Tooling App",
+  "audience": "Internal TPM users",
+  "outputPath": "docs/user-guide.md",
+  "contextPath": "claude-docs/context.json",
+  "model": "claude-3-7-sonnet-latest",
+  "maxTokens": 4096,
+  "temperature": 0.2,
+  "includeGlobs": [
+    "src/App.tsx",
+    "src/components/AppSidebar.tsx",
+    "src/pages/**/*.tsx",
+    "src/components/**/*.tsx",
+    "src/lib/**/*.ts"
+  ],
+  "excludeGlobs": [
+    "src/components/ui/**",
+    "src/**/test/**",
+    "src/**/*.test.*"
+  ]
+}

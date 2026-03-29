@@ -10,7 +10,12 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "claude:context": "node scripts/claude-docs/build-context.mjs",
+    "claude:docs": "node scripts/claude-docs/generate-user-docs.mjs",
+    "claude:docs:dry": "node scripts/claude-docs/generate-user-docs.mjs --dry-run",
+    "release": "bash scripts/release.sh",
+    "release:auto": "bash scripts/release.sh"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",

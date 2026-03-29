@@ -16,7 +16,7 @@ import {
 } from "@/components/ui/table";
 import type { APIEndpoint } from "@/lib/api-contract-data";
 import { getOmneaEnvironmentConfig } from "@/lib/omnea-environment";
-import { Play, Loader2, Copy, Check, AlertCircle, Code2, Grid3x3, ChevronDown, ChevronRight } from "lucide-react";
+import { Play, Loader2, Copy, Check, AlertCircle, Code2, Grid3x3, ChevronDown, ChevronRight, ArrowUp, ArrowDown } from "lucide-react";
 import { toast } from "sonner";
 import { makeOmneaRequest, resolvePathTemplate, fetchAllOmneaPages } from "@/lib/omnea-api-utils";
 
@@ -77,6 +77,25 @@ const OmneaEndpointDetail = ({ endpoint }: Props) => {
   const [error, setError] = useState<string | null>(null);
   const [displayMode, setDisplayMode] = useState<"json" | "table">("json");
   const [expandedRows, setExpandedRows] = useState<Record<string, boolean>>({});
+  const [sortColumn, setSortColumn] = useState<string | null>(null);
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
+  const [columnWidths, setColumnWidths] = useState<Record<string, number>>({});
+
+  const startResize = (header: string, startX: number, startWidth: number) => {
+    const onMove = (e: PointerEvent) => {
+      const delta = e.clientX - startX;
+      setColumnWidths((prev) => ({
+        ...prev,
+        [header]: Math.max(60, startWidth + delta),
+      }));
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
 
   const updateParam = (key: string, value: string) => setParams((p) => ({ ...p, [key]: value }));
 
@@ -258,9 +277,16 @@ const OmneaEndpointDetail = ({ endpoint }: Props) => {
       }
 
       // Make the API request
-      // For GET requests to list endpoints, fetch all pages automatically
+      // For GET requests to known list endpoints, fetch all pages automatically
       let result;
-      if (endpoint.method === "GET" && /\/(suppliers|internal-contacts|users|contacts)(\?|$)/.test(endpoint.path)) {
+      const autoPaginatedEndpointIds = new Set([
+        "get-suppliers",
+        "list-departments",
+        "list-custom-data",
+        "list-custom-data-records",
+      ]);
+
+      if (endpoint.method === "GET" && autoPaginatedEndpointIds.has(endpoint.id)) {
         const config = getOmneaEnvironmentConfig();
         const resolvedPath = endpoint.path
           .replace(/\{\{baseUrl\}\}/g, config.apiBaseUrl)
@@ -364,7 +390,49 @@ const OmneaEndpointDetail = ({ endpoint }: Props) => {
       return a.localeCompare(b);
     });
 
-    return { headers, rows: dataArray };
+    // Apply sorting if sortColumn is set
+    let sortedRows = [...dataArray];
+    if (sortColumn && headers.includes(sortColumn)) {
+      sortedRows.sort((a, b) => {
+        const aVal = a[sortColumn];
+        const bVal = b[sortColumn];
+
+        // Handle null/undefined
+        if (aVal == null && bVal == null) return 0;
+        if (aVal == null) return sortDirection === "asc" ? 1 : -1;
+        if (bVal == null) return sortDirection === "asc" ? -1 : 1;
+
+        // Compare strings
+        if (typeof aVal === "string" && typeof bVal === "string") {
+          const cmp = aVal.localeCompare(bVal);
+          return sortDirection === "asc" ? cmp : -cmp;
+        }
+
+        // Compare numbers
+        if (typeof aVal === "number" && typeof bVal === "number") {
+          return sortDirection === "asc" ? aVal - bVal : bVal - aVal;
+        }
+
+        // Fallback: convert to string for comparison
+        const aStr = String(aVal);
+        const bStr = String(bVal);
+        const cmp = aStr.localeCompare(bStr);
+        return sortDirection === "asc" ? cmp : -cmp;
+      });
+    }
+
+    return { headers, rows: sortedRows };
+  };
+
+  const handleSort = (column: string) => {
+    if (sortColumn === column) {
+      // Toggle direction if clicking same column
+      setSortDirection(sortDirection === "asc" ? "desc" : "asc");
+    } else {
+      // New column, start with ascending
+      setSortColumn(column);
+      setSortDirection("asc");
+    }
   };
 
   const isComplexValue = (value: unknown): boolean => {
@@ -833,11 +901,40 @@ const OmneaEndpointDetail = ({ endpoint }: Props) => {
                           <TableHead className="text-xs px-2 py-1 w-8 text-center bg-secondary/50">
                             {" "}
                           </TableHead>
-                          {headers.map((header) => (
-                            <TableHead key={header} className="text-xs px-2 py-1 bg-secondary/50 whitespace-nowrap">
-                              {header}
-                            </TableHead>
-                          ))}
+                          {headers.map((header) => {
+                            const DEFAULT_DESCRIPTION_WIDTH = 200;
+                            const colWidth = columnWidths[header] ?? (header.toLowerCase() === "description" ? DEFAULT_DESCRIPTION_WIDTH : undefined);
+                            return (
+                              <TableHead
+                                key={header}
+                                style={colWidth ? { width: colWidth, minWidth: colWidth, maxWidth: colWidth } : undefined}
+                                className="relative text-xs px-2 py-1 bg-secondary/50 cursor-pointer hover:bg-secondary/70 transition-colors whitespace-normal break-words"
+                                onClick={() => handleSort(header)}
+                              >
+                                <div className="flex items-center gap-1 pr-2">
+                                  <span className="break-words">{header}</span>
+                                  {sortColumn === header && (
+                                    sortDirection === "asc" ? (
+                                      <ArrowUp className="h-3 w-3 shrink-0 text-primary" />
+                                    ) : (
+                                      <ArrowDown className="h-3 w-3 shrink-0 text-primary" />
+                                    )
+                                  )}
+                                </div>
+                                {/* Resize handle */}
+                                <div
+                                  className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-primary/40 active:bg-primary/60"
+                                  onPointerDown={(e) => {
+                                    e.stopPropagation();
+                                    e.preventDefault();
+                                    const th = e.currentTarget.parentElement as HTMLElement;
+                                    startResize(header, e.clientX, th.offsetWidth);
+                                  }}
+                                  onClick={(e) => e.stopPropagation()}
+                                />
+                              </TableHead>
+                            );
+                          })}
                         </TableRow>
                       </TableHeader>
                       <TableBody>
@@ -877,7 +974,12 @@ const OmneaEndpointDetail = ({ endpoint }: Props) => {
                                   return (
                                     <TableCell
                                       key={`${idx}-${header}`}
-                                      className={`text-xs px-2 py-1 ${isComplex ? "bg-secondary/10" : ""}`}
+                                      style={(() => {
+                                        const DEFAULT_DESCRIPTION_WIDTH = 200;
+                                        const w = columnWidths[header] ?? (header.toLowerCase() === "description" ? DEFAULT_DESCRIPTION_WIDTH : undefined);
+                                        return w ? { width: w, minWidth: w, maxWidth: w } : undefined;
+                                      })()}
+                                      className={`text-xs px-2 py-1 whitespace-normal break-words ${isComplex ? "bg-secondary/10" : ""}`}
                                     >
                                       {isComplex ? (
                                         <code className="text-[10px] text-muted-foreground cursor-pointer hover:text-foreground">

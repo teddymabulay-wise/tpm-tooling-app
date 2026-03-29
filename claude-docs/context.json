@@ -1,0 +1,353 @@
+{
+  "generatedAt": "2026-03-29T18:47:20.620Z",
+  "project": {
+    "name": "TPM Tooling App",
+    "audience": "Internal TPM users"
+  },
+  "routes": [
+    {
+      "path": "/",
+      "component": "Navigate to=\"/tools/audit\" replace /"
+    },
+    {
+      "path": "/tools/audit",
+      "component": "AuditPage /"
+    },
+    {
+      "path": "/tools/audit/supplier-record",
+      "component": "SupplierRecordAuditPage /"
+    },
+    {
+      "path": "/tools/audit/materiality",
+      "component": "MaterialityAuditPage /"
+    },
+    {
+      "path": "/tools/bsp-contact",
+      "component": "BSPContactPage /"
+    },
+    {
+      "path": "/flows-metadata/configuration",
+      "component": "FlowsMetadataConfigPage /"
+    },
+    {
+      "path": "/flows-metadata/view",
+      "component": "FlowsMetadataViewPage /"
+    },
+    {
+      "path": "/omnea-api",
+      "component": "OmneaAPIPage /"
+    },
+    {
+      "path": "*",
+      "component": "NotFound /"
+    }
+  ],
+  "sidebarSnippet": "import {\n  ClipboardCheck,\n  ClipboardList,\n  Users,\n  ArrowRightLeft,\n  Plug,\n  Database,\n  Settings,\n  BarChart3,\n  ChevronRight,\n  ShieldAlert,\n  BarChart2,\n} from \"lucide-react\";\nimport { NavLink } from \"@/components/NavLink\";\nimport { useLocation } from \"react-router-dom\";\nimport { useState } from \"react\";\nimport {\n  Sidebar,\n  SidebarContent,\n  SidebarGroup,\n  SidebarGroupContent,\n  SidebarGroupLabel,\n  SidebarMenu,\n  SidebarMenuButton,\n  SidebarMenuItem,\n  SidebarHeader,\n  useSidebar,\n} from \"@/components/ui/sidebar\";\nimport { Collapsible, CollapsibleContent, CollapsibleTrigger } from \"@/components/ui/collapsible\";\n\nconst toolsItems = [\n  { title: \"BSP Internal Contact\", url: \"/tools/bsp-contact\", icon: Users },\n];\n\nconst auditItems = [\n  { title: \"Risk Audit\", url: \"/tools/audit\", icon: ShieldAlert },\n  { title: \"Supplier Record Audit\", url: \"/tools/audit/supplier-record\", icon: ClipboardList },\n  { title: \"Materiality Audit\", url: \"/tools/audit/materiality\", icon: BarChart2 },\n];\n\nconst omneaItems = [\n  { title: \"Omnea API\", url: \"/omnea-api\", icon: Plug },\n];\n\nconst flowsMetadataItems = [\n  { title: \"Configuration\", url: \"/flows-metadata/configuration\", icon: Settings },\n  { title: \"View\", url: \"/flows-metadata/view\", icon: BarChart3 },\n];\n\nexport function AppSidebar() {\n  const { state } = useSidebar();\n  const collapsed = state === \"collapsed\";\n  const location = useLocation();\n  const currentPath = location.pathname;\n  const [flowsOpen, setFlowsOpen] = useState(false);\n  const [auditOpen, setAuditOpen] = useState(false);\n\n  const isActive = (path: string) => currentPath === path || currentPath.startsWith(path + \"/\");\n\n  const renderGroup = (label: string, items: typeof toolsItems) => (\n    <SidebarGroup>\n      <SidebarGroupLabel>{label}</SidebarGroupLabel>\n      <SidebarGroupContent>\n        <SidebarMenu>\n          {items.map((item) => (\n            <SidebarMenuItem key={item.title}>\n              <SidebarMenuButton asChild isActive={isActive(item.url)}>\n                <NavLink to={item.url} end={item.url !== \"/omnea-api\"} activeClassName=\"bg-sidebar-accent text-primary font-medium\">\n                  <item.icon className=\"h-4 w-4\" />\n                  {!collapsed && <span>{item.title}</span>}\n                </NavLink>\n              </SidebarMenuButton>\n            </SidebarMenuItem>\n          ))}\n        </SidebarMenu>\n      </SidebarGroupContent>\n    </SidebarGroup>\n  );\n\n  const renderNestedGroup = (label: string, icon: React.ReactNode, items: typeof flowsMetadataItems, isOpen: boolean, onOpenChange: (open: boolean) => void, activePrefix: string) => (\n    <SidebarGroup>\n      <Collapsible defaultOpen={isActive(activePrefix)} onOpenChange={onOpenChange}>\n        <CollapsibleTrigger asChild>\n          <SidebarMenuButton className=\"cursor-pointer hover:bg-sidebar-accent\">\n            {typeof icon === \"object\" && icon}\n            {!collapsed && <span className=\"flex-1 text-left\">{label}</span>}\n            {!collapsed && <ChevronRight className={`h-4 w-4 transition-transform ${isOpen ? \"rotate-90\" : \"\"}`} />}\n          </SidebarMenuButton>\n        </CollapsibleTrigger>\n        <CollapsibleContent>\n          <SidebarGroupContent>\n            <SidebarMenu className=\"ml-4 border-l border-sidebar-border\">\n              {items.map((item) => (\n                <SidebarMenuItem key={item.title}>\n                  <SidebarMenuButton asChild isActive={isActive(item.url)} className=\"pl-4\">\n                    <NavLink to={item.url} activeClassName=\"bg-sidebar-accent text-primary font-medium\">\n                      <item.icon className=\"h-4 w-4\" />\n                      {!collapsed && <span>{item.title}</span>}\n                    </NavLink>\n                  </SidebarMenuButton>\n                </SidebarMenuItem>\n              ))}\n            </SidebarMenu>\n          </SidebarGroupContent>\n        </CollapsibleContent>\n      </Collapsible>\n    </SidebarGroup>\n  );\n\n  return (\n    <Sidebar collapsible=\"icon\">\n      <SidebarHeader className=\"border-b border-sidebar-border px-4 py-3\">\n        <div className=\"flex items-center gap-2.5\">\n          <div className=\"h-7 w-7 rounded-md bg-primary flex items-center justify-center shrink-0\">\n            <ArrowRightLeft className=\"h-3.5 w-3.5 text-primary-foreground\" />\n          </div>\n          {!collapsed && (\n            <div>\n              <p className=\"text-sm font-semibold text-sidebar-foreground leading-none\">TPM Tooling</p>\n              <p className=\"text-[10px] text-muted-foreground mt-0.5\">Omnea Integration Hub</p>\n            </div>\n          )}\n        </div>\n      </SidebarHeader>\n      <SidebarContent>\n        {renderNestedGroup(\"Audit\", <ClipboardCheck className=\"h-4 w-4\" />, auditItems, auditOpen, setAuditOpen, \"/tools/audit\")}\n        {renderGroup(\"Tools\", toolsItems)}\n        {renderNestedGroup(\"Omnea Flows Metadata\", <Database className=\"h-4 w-4\" />, flowsMetadataItems, flowsOpen, setFlowsOpen, \"/flows-metadata\")}\n        {renderGroup(\"Integration\", omneaItems)}\n      </SidebarContent>\n    </Sidebar>\n  );\n}\n",
+  "files": [
+    {
+      "path": "src/App.tsx",
+      "size": 2098,
+      "exports": []
+    },
+    {
+      "path": "src/components/APIHandshake.tsx",
+      "size": 3753,
+      "exports": [
+        "export const APIHandshake = ({ remoteId, remoteLink, onSync }: APIHandshakeProps) => {"
+      ]
+    },
+    {
+      "path": "src/components/AddressSplitter.tsx",
+      "size": 2036,
+      "exports": [
+        "export const AddressSplitter = ({ rawAddress }: AddressSplitterProps) => {"
+      ]
+    },
+    {
+      "path": "src/components/AppLayout.tsx",
+      "size": 4506,
+      "exports": [
+        "export const AppLayout = () => {"
+      ]
+    },
+    {
+      "path": "src/components/AppSidebar.tsx",
+      "size": 5065,
+      "exports": [
+        "export function AppSidebar() {"
+      ]
+    },
+    {
+      "path": "src/components/BCIntegration.tsx",
+      "size": 2227,
+      "exports": [
+        "export const BCIntegration = () => ("
+      ]
+    },
+    {
+      "path": "src/components/BCStateManager.tsx",
+      "size": 2970,
+      "exports": [
+        "export const BCStateManager = ({ currentState, onStateChange }: BCStateManagerProps) => {"
+      ]
+    },
+    {
+      "path": "src/components/CSVUploader.tsx",
+      "size": 5394,
+      "exports": [
+        "export const CSVUploader = () => {"
+      ]
+    },
+    {
+      "path": "src/components/CollapsibleSection.tsx",
+      "size": 1231,
+      "exports": [
+        "export const CollapsibleSection = ({"
+      ]
+    },
+    {
+      "path": "src/components/FieldMapTable.tsx",
+      "size": 1500,
+      "exports": [
+        "export const FieldMapTable = () => {"
+      ]
+    },
+    {
+      "path": "src/components/FieldRow.tsx",
+      "size": 743,
+      "exports": [
+        "export const FieldRow = ({"
+      ]
+    },
+    {
+      "path": "src/components/MaterialityChecklist.tsx",
+      "size": 1902,
+      "exports": [
+        "export const MaterialityChecklist = ({ cs, kyc, sca }: MaterialityChecklistProps) => {"
+      ]
+    },
+    {
+      "path": "src/components/NavLink.tsx",
+      "size": 751,
+      "exports": []
+    },
+    {
+      "path": "src/components/OmneaEndpointDetail.tsx",
+      "size": 47184,
+      "exports": []
+    },
+    {
+      "path": "src/components/OmneaEnvironmentProvider.tsx",
+      "size": 1451,
+      "exports": [
+        "export function OmneaEnvironmentProvider({ children }: { children: ReactNode }) {"
+      ]
+    },
+    {
+      "path": "src/components/StatusPill.tsx",
+      "size": 908,
+      "exports": [
+        "export const StatusPill = ({ label, variant, className }: StatusPillProps) => ("
+      ]
+    },
+    {
+      "path": "src/lib/address-utils.ts",
+      "size": 1542,
+      "exports": [
+        "export function parseAddress(raw: string): ParsedAddress {"
+      ]
+    },
+    {
+      "path": "src/lib/api-contract-data.ts",
+      "size": 26656,
+      "exports": [
+        "export const omneaEndpoints: APIEndpoint[] = [",
+        "export const fieldMappings: FieldMapping[] = [",
+        "export const simulationSteps: SimulationStep[] = ["
+      ]
+    },
+    {
+      "path": "src/lib/audit-data.ts",
+      "size": 18142,
+      "exports": [
+        "export const materialityTagOptions: string[] = [",
+        "export const auditSuppliers: AuditSupplier[] = [",
+        "export const auditRequests: AuditRequest[] = [",
+        "export const questionLabels: Record<string, string> = {"
+      ]
+    },
+    {
+      "path": "src/lib/flows-metadata-types.ts",
+      "size": 1830,
+      "exports": []
+    },
+    {
+      "path": "src/lib/flows-metadata-utils.ts",
+      "size": 25632,
+      "exports": [
+        "export function parseFlowsMetadataCSV(csvContent: string): FlowMetadata[] {",
+        "export function parseFlowTagsCSV(csvContent: string): FlowTag[] {",
+        "export function parseFlowLogicConditionsCSV(csvContent: string): FlowLogicCondition[] {",
+        "export function parseLogicConditionJSON(jsonString: string): ParsedLogicConditionDetails | null {",
+        "export function extractTagsFromFlowsCSV(csvContent: string): FlowTag[] {",
+        "export function extractLogicConditionsFromMetadata(data: FlowMetadata[]): FlowLogicCondition[] {",
+        "export function calculateMetrics(data: FlowMetadata[]): MetadataMetrics {",
+        "export function generateMetadataSummary(data: FlowMetadata[]) {",
+        "export function filterMetadata(",
+        "export function groupMetadataBy<K extends keyof FlowMetadata>("
+      ]
+    },
+    {
+      "path": "src/lib/materiality-rules.ts",
+      "size": 15294,
+      "exports": [
+        "export function parseMaterialityLogicCsv(csvText: string): ParsedMaterialityLogic {",
+        "export function explainMaterialityClassification(",
+        "export function classifySupplier(",
+        "export function hasMaterialityMismatch(",
+        "export const materialityLevels: MaterialityClassification[] = ["
+      ]
+    },
+    {
+      "path": "src/lib/mock-data.ts",
+      "size": 2030,
+      "exports": [
+        "export const mockVendor: VendorProfile = {",
+        "export const fieldMap = ["
+      ]
+    },
+    {
+      "path": "src/lib/omnea-api-utils.ts",
+      "size": 11214,
+      "exports": [
+        "export function resolvePathTemplate(path: string, params: Record<string, string>): string {"
+      ]
+    },
+    {
+      "path": "src/lib/omnea-environment.ts",
+      "size": 2297,
+      "exports": [
+        "export function getOmneaEnvironment(): OmneaEnvironment {",
+        "export function setOmneaEnvironment(environment: OmneaEnvironment) {",
+        "export function getOmneaEnvironmentConfig("
+      ]
+    },
+    {
+      "path": "src/lib/store.ts",
+      "size": 5279,
+      "exports": [
+        "export const mockSuppliers: VendorProfile[] = [",
+        "export const mockProfiles: SupplierProfile[] = [",
+        "export const mockBankDetails: BankDetail[] = ["
+      ]
+    },
+    {
+      "path": "src/lib/utils.ts",
+      "size": 169,
+      "exports": [
+        "export function cn(...inputs: ClassValue[]) {"
+      ]
+    },
+    {
+      "path": "src/pages/APIContractPage.tsx",
+      "size": 8941,
+      "exports": []
+    },
+    {
+      "path": "src/pages/AuditAddSupplier.tsx",
+      "size": 11163,
+      "exports": []
+    },
+    {
+      "path": "src/pages/AuditPage.tsx",
+      "size": 65586,
+      "exports": []
+    },
+    {
+      "path": "src/pages/BCIntegrationPage.tsx",
+      "size": 1370,
+      "exports": []
+    },
+    {
+      "path": "src/pages/BSPContactPage.tsx",
+      "size": 97731,
+      "exports": []
+    },
+    {
+      "path": "src/pages/BankDetailsPage.tsx",
+      "size": 2734,
+      "exports": []
+    },
+    {
+      "path": "src/pages/DashboardOverview.tsx",
+      "size": 4755,
+      "exports": []
+    },
+    {
+      "path": "src/pages/FieldMappingPage.tsx",
+      "size": 7190,
+      "exports": []
+    },
+    {
+      "path": "src/pages/FlowsMetadataConfigPage.tsx",
+      "size": 113264,
+      "exports": [
+        "export function FlowsMetadataConfigPage() {"
+      ]
+    },
+    {
+      "path": "src/pages/FlowsMetadataViewPage.tsx",
+      "size": 39929,
+      "exports": []
+    },
+    {
+      "path": "src/pages/GovernancePage.tsx",
+      "size": 13273,
+      "exports": []
+    },
+    {
+      "path": "src/pages/Index.tsx",
+      "size": 7465,
+      "exports": []
+    },
+    {
+      "path": "src/pages/MaterialityAuditPage.tsx",
+      "size": 67031,
+      "exports": [
+        "export default function MaterialityAuditPage() {"
+      ]
+    },
+    {
+      "path": "src/pages/NotFound.tsx",
+      "size": 727,
+      "exports": []
+    },
+    {
+      "path": "src/pages/OmneaAPIPage.tsx",
+      "size": 3215,
+      "exports": []
+    },
+    {
+      "path": "src/pages/ProfilesPage.tsx",
+      "size": 3133,
+      "exports": []
+    },
+    {
+      "path": "src/pages/SimulationPage.tsx",
+      "size": 12958,
+      "exports": []
+    },
+    {
+      "path": "src/pages/SupplierRecordAuditPage.tsx",
+      "size": 71832,
+      "exports": [
+        "export default function SupplierRecordAuditPage() {"
+      ]
+    },
+    {
+      "path": "src/pages/SuppliersPage.tsx",
+      "size": 4560,
+      "exports": []
+    }
+  ]
+}

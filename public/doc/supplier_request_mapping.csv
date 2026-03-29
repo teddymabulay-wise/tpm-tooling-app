@@ -1,0 +1,8 @@
+supplier_field,supplier_label,request_field
+description,Description,Request: Please provide a description of the product(s) and/or service(s) that are being (or will be) provided to Wise with a breakdown of their use cases. (baselineServiceSpecifictext1)
+website,Website,Website
+entityType,Entity Type,Entity type
+subsidiaries,Subsidiaries,Subsidiaries
+lastAssessmentDate,Last Assessment Date,Last assessment date
+department,Department,Department
+address,Address,Address

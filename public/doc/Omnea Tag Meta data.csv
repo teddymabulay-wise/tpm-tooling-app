@@ -1,0 +1,2 @@
+Workflow Name,Tag Name,Tag Conditions
+New Service or Third Party Onboarding,Tier D (TP),"newPurchaseRequestV02-Legal, Security & Technology information-question-6 NOT_EQUAL 91140b22-a9ac-4098-86a7-3c07c6250721 AND newPurchaseRequestV02-Legal, Security & Technology information-question-6 NOT_EQUAL 91140b22-a9ac-4098-86a7-3c07c6250721 AND derivedFields.risk.aggregate EQUAL 0"

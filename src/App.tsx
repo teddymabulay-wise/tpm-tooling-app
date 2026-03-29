@@ -6,8 +6,12 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AppLayout } from "@/components/AppLayout";
 import { OmneaEnvironmentProvider } from "@/components/OmneaEnvironmentProvider";
 import AuditPage from "./pages/AuditPage";
+import SupplierRecordAuditPage from "./pages/SupplierRecordAuditPage";
+import MaterialityAuditPage from "./pages/MaterialityAuditPage";
 import BSPContactPage from "./pages/BSPContactPage";
 import OmneaAPIPage from "./pages/OmneaAPIPage";
+import FlowsMetadataConfigPage from "./pages/FlowsMetadataConfigPage";
+import FlowsMetadataViewPage from "./pages/FlowsMetadataViewPage";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -23,7 +27,11 @@ const App = () => (
             <Route path="/" element={<Navigate to="/tools/audit" replace />} />
             <Route element={<AppLayout />}>
               <Route path="/tools/audit" element={<AuditPage />} />
+              <Route path="/tools/audit/supplier-record" element={<SupplierRecordAuditPage />} />
+              <Route path="/tools/audit/materiality" element={<MaterialityAuditPage />} />
               <Route path="/tools/bsp-contact" element={<BSPContactPage />} />
+              <Route path="/flows-metadata/configuration" element={<FlowsMetadataConfigPage />} />
+              <Route path="/flows-metadata/view" element={<FlowsMetadataViewPage />} />
               <Route path="/omnea-api" element={<OmneaAPIPage />} />
             </Route>
             <Route path="*" element={<NotFound />} />

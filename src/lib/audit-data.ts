@@ -8,7 +8,18 @@ export interface AuditSupplier {
   state: string;
   entityType: string;
   materialityLevel: string;
+  materialityImpact?: string;
   materialitySubstitutability: string;
+  cif?: boolean;
+  thirdPartySupplier?: boolean;
+  supportive?: boolean;
+  bankingSupplier?: boolean;
+  bspMarketTier?: string;
+  outsourcing?: string;
+  customerPiiProcessed?: boolean;
+  mainAssessmentBankingQuestion7?: string;
+  contractingParty?: string;
+  lightTouchSupplier?: boolean;
   infosecCriticalityTier: string;
   infosecSensitivityTier: string;
   servicingEntities: string[];
