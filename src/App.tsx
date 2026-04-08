@@ -12,6 +12,7 @@ import BSPContactPage from "./pages/BSPContactPage";
 import OmneaAPIPage from "./pages/OmneaAPIPage";
 import FlowsMetadataConfigPage from "./pages/FlowsMetadataConfigPage";
 import FlowsMetadataViewPage from "./pages/FlowsMetadataViewPage";
+import SimulatorPage from "./pages/SimulatorPage";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -33,6 +34,7 @@ const App = () => (
               <Route path="/flows-metadata/configuration" element={<FlowsMetadataConfigPage />} />
               <Route path="/flows-metadata/view" element={<FlowsMetadataViewPage />} />
               <Route path="/omnea-api" element={<OmneaAPIPage />} />
+              <Route path="/simulator" element={<SimulatorPage />} />
             </Route>
             <Route path="*" element={<NotFound />} />
           </Routes>

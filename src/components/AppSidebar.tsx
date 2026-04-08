@@ -10,6 +10,7 @@ import {
   ChevronRight,
   ShieldAlert,
   BarChart2,
+  FlaskConical,
 } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import { useLocation } from "react-router-dom";
@@ -40,6 +41,10 @@ const auditItems = [
 
 const omneaItems = [
   { title: "Omnea API", url: "/omnea-api", icon: Plug },
+];
+
+const simulatorItems = [
+  { title: "BC Vendor Simulator", url: "/simulator", icon: FlaskConical },
 ];
 
 const flowsMetadataItems = [
@@ -127,6 +132,7 @@ export function AppSidebar() {
         {renderGroup("Tools", toolsItems)}
         {renderNestedGroup("Omnea Flows Metadata", <Database className="h-4 w-4" />, flowsMetadataItems, flowsOpen, setFlowsOpen, "/flows-metadata")}
         {renderGroup("Integration", omneaItems)}
+        {renderGroup("Simulator", simulatorItems)}
       </SidebarContent>
     </Sidebar>
   );
