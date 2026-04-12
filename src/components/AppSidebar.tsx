@@ -31,6 +31,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 
 const toolsItems = [
   { title: "BSP Internal Contact", url: "/tools/bsp-contact", icon: Users },
+  { title: "Prod→QA Supplier Clone", url: "/tools/prod-to-qa-clone", icon: ArrowRightLeft },
 ];
 
 const auditItems = [

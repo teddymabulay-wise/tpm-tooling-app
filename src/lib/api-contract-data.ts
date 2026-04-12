@@ -1,4 +1,5 @@
 // Omnea API Contract derived from Postman Collections
+// Omnea API Contract derived from Postman Collections
 
 export interface APIEndpoint {
   id: string;
@@ -14,6 +15,43 @@ export interface APIEndpoint {
 }
 
 export const omneaEndpoints: APIEndpoint[] = [
+    // Internal Contacts
+    {
+      id: "list-internal-contacts",
+      name: "List internal contacts",
+      method: "GET",
+      path: "{{baseUrl}}/v1/suppliers/{{supplierId}}/internal-contacts",
+      description: "Get a paginated list of internal contacts for a supplier.",
+      collection: "Internal Contacts",
+      auth: "Bearer {{accessToken}}",
+      pathParams: [
+        { key: "supplierId", description: "Omnea supplier UUID" },
+        { key: "limit", description: "Query param: 1-100 (default: 100)" },
+        { key: "cursor", description: "Query param: pagination cursor" },
+        { key: "sort", description: "Query param: createdAt|-createdAt (default: -createdAt)" },
+        { key: "filter", description: "Query param: OData filter (URL encoded)" },
+      ],
+      testScript: `Logs: id, role, title, user (id, email, firstName, lastName), createdAt, updatedAt. Supports pagination.`,
+    },
+    {
+      id: "create-internal-contacts-batch",
+      name: "Create internal contacts (batch)",
+      method: "POST",
+      path: "{{baseUrl}}/v1/suppliers/{{supplierId}}/internal-contacts/batch",
+      description: "Create new internal contacts for a supplier in a single batch request (1-100 items).",
+      collection: "Internal Contacts",
+      auth: "Bearer {{accessToken}}",
+      pathParams: [
+        { key: "supplierId", description: "Omnea supplier UUID" },
+      ],
+      bodyParams: [
+        { key: "internalContacts", type: "array<object>", description: "Array of internal contacts to create (required, length 1-100)", required: true },
+        { key: "internalContacts[].role", type: "string", description: "Contact role (required)", required: true },
+        { key: "internalContacts[].title", type: "string|null", description: "Contact title (required)", required: true },
+        { key: "internalContacts[].user", type: "object", description: "User object (required)", required: true },
+      ],
+      testScript: `Expects 200 with data[] of created contacts (id, role, title, user, createdAt, updatedAt).`,
+    },
   // Authentication
   {
     id: "auth-token",

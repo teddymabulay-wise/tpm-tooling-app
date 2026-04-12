@@ -13,6 +13,7 @@ import OmneaAPIPage from "./pages/OmneaAPIPage";
 import FlowsMetadataConfigPage from "./pages/FlowsMetadataConfigPage";
 import FlowsMetadataViewPage from "./pages/FlowsMetadataViewPage";
 import SimulatorPage from "./pages/SimulatorPage";
+import ProdToQAClonePage from "./pages/ProdToQAClonePage";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -31,6 +32,7 @@ const App = () => (
               <Route path="/tools/audit/supplier-record" element={<SupplierRecordAuditPage />} />
               <Route path="/tools/audit/materiality" element={<MaterialityAuditPage />} />
               <Route path="/tools/bsp-contact" element={<BSPContactPage />} />
+              <Route path="/tools/prod-to-qa-clone" element={<ProdToQAClonePage />} />
               <Route path="/flows-metadata/configuration" element={<FlowsMetadataConfigPage />} />
               <Route path="/flows-metadata/view" element={<FlowsMetadataViewPage />} />
               <Route path="/omnea-api" element={<OmneaAPIPage />} />
