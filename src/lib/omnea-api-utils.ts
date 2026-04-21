@@ -174,6 +174,7 @@ export async function makeOmneaRequest<T = unknown>(
         headers,
         body: requestBody,
         signal: controller.signal,
+        cache: 'no-store',
       });
     } finally {
       clearTimeout(timeoutId);

@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useState, useRef } from "react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Badge } from "@/components/ui/badge";
 import { StatusPill } from "@/components/StatusPill";
 import {
   Table,
@@ -16,13 +17,97 @@ import {
 } from "@/components/ui/table";
 import type { APIEndpoint } from "@/lib/api-contract-data";
 import { getOmneaEnvironmentConfig } from "@/lib/omnea-environment";
-import { Play, Loader2, Copy, Check, AlertCircle, Code2, Grid3x3, ChevronDown, ChevronRight, ArrowUp, ArrowDown } from "lucide-react";
+import { Play, Loader2, Copy, Check, AlertCircle, Code2, Grid3x3, ChevronDown, ChevronRight, ArrowUp, ArrowDown, Upload, CheckCircle2, XCircle, Download } from "lucide-react";
 import { toast } from "sonner";
 import { makeOmneaRequest, resolvePathTemplate, fetchAllOmneaPages } from "@/lib/omnea-api-utils";
 
+// ─── Fuzzy matching ───────────────────────────────────────────────────────────
+
+function normalize(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function levenshtein(a: string, b: string): number {
+  const m = a.length, n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, (_, i) =>
+    Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0))
+  );
+  for (let i = 1; i <= m; i++)
+    for (let j = 1; j <= n; j++)
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1]);
+  return dp[m][n];
+}
+
+function fuzzyScore(query: string, candidate: string): number {
+  const q = normalize(query);
+  const c = normalize(candidate);
+  if (q === c) return 1;
+  if (c.includes(q) || q.includes(c)) return 0.92;
+  const maxLen = Math.max(q.length, c.length);
+  if (maxLen === 0) return 1;
+  const dist = levenshtein(q, c);
+  return Math.max(0, 1 - dist / maxLen);
+}
+
+// Default noise words — too generic to be useful as standalone search terms
+export const DEFAULT_NOISE_WORDS = [
+  'sa', 'sl', 'bv', 'nv', 'ag', 'ab', 'as', 'plc', 'llc', 'llp', 'lp',
+  'ltd', 'ltda', 'srl', 'pty', 'inc', 'corp', 'gmbh', 'spa', 'aps',
+  'limited', 'incorporated', 'corporation', 'company', 'group', 'holdings',
+  'international', 'the', 'and', 'of', 'for', 'co', 'services', 'solutions',
+];
+
+function getMeaningfulWords(name: string, noiseSet: Set<string>): string[] {
+  return normalize(name)
+    .split(' ')
+    .filter(w => w.length >= 4 && !noiseSet.has(w));
+}
+
+// F1-based word match: harmonic mean of recall (matched/query words) and
+// precision (matched/candidate words). Avoids the artificial floor that made
+// 2 generic words ("clearing", "house") score 89% against an unrelated name.
+function wordMatchScore(query: string, candidate: string, noiseSet: Set<string>): number {
+  const qWords = getMeaningfulWords(query, noiseSet);
+  const cWords = getMeaningfulWords(candidate, noiseSet);
+  if (qWords.length < 2 || cWords.length === 0) return 0;
+  const matched = qWords.filter(w => cWords.includes(w)).length;
+  if (matched < 2) return 0;
+  const recall = matched / qWords.length;
+  const precision = matched / cWords.length;
+  const f1 = (2 * recall * precision) / (recall + precision);
+  return f1 * 0.95; // cap below 1.0 so an exact fuzzy match always wins
+}
+
+function combinedScore(query: string, candidate: string, noiseSet: Set<string>): number {
+  return Math.max(fuzzyScore(query, candidate), wordMatchScore(query, candidate, noiseSet));
+}
+
+interface OmneaMatch {
+  name: string;
+  id: string;
+  score: number;
+}
+
+interface CsvMatchResult {
+  csvName: string;
+  matches: OmneaMatch[]; // empty array = not found
+}
+
+const FUZZY_THRESHOLD = 0.72;
+
 interface Props {
   endpoint: APIEndpoint;
+  onResponse?: (response: any, statusCode: number | null, duration: number | null) => void;
 }
+
+type SubsidiaryDraft = {
+  name: string;
+  remoteId: string;
+};
+
+const defaultSubsidiary: SubsidiaryDraft = { name: "", remoteId: "" };
 
 type SupplierDraft = {
   name: string;
@@ -63,10 +148,22 @@ const defaultSupplier: SupplierDraft = {
   },
 };
 
-const OmneaEndpointDetail = ({ endpoint }: Props) => {
+const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
   const [params, setParams] = useState<Record<string, string>>({});
   const [bodyStr, setBodyStr] = useState("");
   const [suppliers, setSuppliers] = useState<Array<SupplierDraft>>([defaultSupplier]);
+  const [subsidiaries, setSubsidiaries] = useState<Array<SubsidiaryDraft>>([defaultSubsidiary]);
+
+  // CSV supplier lookup state
+  const csvInputRef = useRef<HTMLInputElement>(null);
+  const [csvNames, setCsvNames] = useState<string[]>([]);
+  const [csvFileName, setCsvFileName] = useState<string>('');
+  const [csvResults, setCsvResults] = useState<CsvMatchResult[] | null>(null);
+  const [csvRunning, setCsvRunning] = useState(false);
+  const [csvProgress, setCsvProgress] = useState<{ phase: 'fetching'; fetched: number } | { phase: 'matching'; matched: number; total: number } | null>(null);
+  const [noiseWordsInput, setNoiseWordsInput] = useState(DEFAULT_NOISE_WORDS.join(', '));
+  const [noiseSettingsOpen, setNoiseSettingsOpen] = useState(false);
+  const [csvTableOpen, setCsvTableOpen] = useState<{ perfect: boolean; partial: boolean; notFound: boolean }>({ perfect: true, partial: true, notFound: true });
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({});
   const [response, setResponse] = useState<Record<string, unknown> | null>(null);
   const [loading, setLoading] = useState(false);
@@ -129,12 +226,105 @@ const OmneaEndpointDetail = ({ endpoint }: Props) => {
     setSuppliers((prev) => prev.filter((_, i) => i !== idx));
   };
 
+  const updateSubsidiary = (idx: number, field: keyof SubsidiaryDraft, value: string) => {
+    setSubsidiaries((prev) => prev.map((s, i) => i === idx ? { ...s, [field]: value } : s));
+  };
+
+  const addSubsidiary = () => setSubsidiaries((prev) => [...prev, defaultSubsidiary]);
+  const removeSubsidiary = (idx: number) => setSubsidiaries((prev) => prev.filter((_, i) => i !== idx));
+
   const allowedCustomEntityTypeChoices = [
     "Third Party",
     "Banking Services",
     "Wise Platform",
     "Legal",
   ];
+
+  const parseCsvFile = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = (e.target?.result as string) ?? '';
+      const names = text.split(/\r?\n/)
+        .map(l => l.replace(/^"|"$/g, '').trim())
+        .filter(Boolean)
+        .filter((_, i) => i > 0 || !/^name$/i.test(_.toLowerCase())); // skip header if "name"
+      setCsvNames(names);
+      setCsvResults(null);
+    };
+    reader.readAsText(file);
+  };
+
+  const runCsvLookup = async () => {
+    if (csvNames.length === 0) {
+      toast.error('Upload a CSV with supplier names first');
+      return;
+    }
+    setCsvRunning(true);
+    setCsvResults(null);
+    setCsvProgress({ phase: 'fetching', fetched: 0 });
+    try {
+      const noiseSet = new Set(
+        noiseWordsInput.split(',').map(w => normalize(w)).filter(Boolean)
+      );
+      const config = getOmneaEnvironmentConfig();
+      const allSuppliers = await fetchAllOmneaPages<Record<string, unknown>>(
+        `${config.apiBaseUrl}/v1/suppliers`,
+        { onProgress: ({ totalItems }) => setCsvProgress({ phase: 'fetching', fetched: totalItems }) },
+      );
+
+      const results: CsvMatchResult[] = [];
+      for (let i = 0; i < csvNames.length; i++) {
+        const csvName = csvNames[i];
+        const matches: OmneaMatch[] = [];
+        for (const s of allSuppliers) {
+          const name = typeof s.name === 'string' ? s.name : '';
+          const id = typeof s.id === 'string' ? s.id : '';
+          const score = combinedScore(csvName, name, noiseSet);
+          if (score >= FUZZY_THRESHOLD) matches.push({ name, id, score });
+        }
+        matches.sort((a, b) => b.score - a.score);
+        results.push({ csvName, matches });
+
+        // Yield to React every 5 names so the progress state renders
+        if (i % 5 === 0 || i === csvNames.length - 1) {
+          setCsvProgress({ phase: 'matching', matched: i + 1, total: csvNames.length });
+          await new Promise(r => setTimeout(r, 0));
+        }
+      }
+
+      setCsvResults(results);
+      const found = results.filter(r => r.matches.length > 0).length;
+      toast.success(`Matched ${found} of ${csvNames.length} suppliers`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Lookup failed');
+    } finally {
+      setCsvRunning(false);
+      setCsvProgress(null);
+    }
+  };
+
+  const exportCsvResults = () => {
+    if (!csvResults) return;
+    const header = 'csv_name,status,omnea_name,omnea_id,match_score';
+    const rows = csvResults.flatMap(r =>
+      r.matches.length > 0
+        ? r.matches.map(m => [
+            `"${r.csvName.replace(/"/g, '""')}"`,
+            'found',
+            `"${m.name.replace(/"/g, '""')}"`,
+            m.id,
+            m.score.toFixed(2),
+          ].join(','))
+        : [[`"${r.csvName.replace(/"/g, '""')}"`, 'not_found', '', '', ''].join(',')]
+    );
+    const blob = new Blob([`${header}\n${rows.join('\n')}`], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'supplier-csv-lookup-results.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   const run = async () => {
     setLoading(true);
@@ -263,6 +453,15 @@ const OmneaEndpointDetail = ({ endpoint }: Props) => {
               };
             }),
         };
+      } else if (endpoint.id === "create-subsidiaries-batch") {
+        body = {
+          subsidiaries: subsidiaries
+            .filter((s) => s.name.trim() !== "")
+            .map((s) => ({
+              name: s.name.trim(),
+              remoteId: s.remoteId.trim(),
+            })),
+        };
       } else {
         // For other endpoints, parse JSON body if provided
         if (bodyStr) {
@@ -309,6 +508,11 @@ const OmneaEndpointDetail = ({ endpoint }: Props) => {
       setResponse(result.data as Record<string, unknown> || { error: result.error });
       setStatusCode(result.statusCode);
       setDuration(result.duration);
+
+      // Call onResponse callback if provided
+      if (onResponse) {
+        onResponse(result.data, result.statusCode, result.duration);
+      }
 
       if (result.error) {
         let serverErrors: Record<number, Record<string, string>> = {};
@@ -582,7 +786,7 @@ const OmneaEndpointDetail = ({ endpoint }: Props) => {
         </Card>
       )}
 
-      {endpoint.bodyParams && endpoint.bodyParams.length > 0 && endpoint.id !== "create-suppliers-batch" && (
+      {endpoint.bodyParams && endpoint.bodyParams.length > 0 && endpoint.id !== "create-suppliers-batch" && endpoint.id !== "create-subsidiaries-batch" && (
         <Card className="p-4 space-y-3">
           <p className="text-xs font-semibold text-foreground">Request Body (JSON)</p>
           <Textarea
@@ -817,10 +1021,288 @@ const OmneaEndpointDetail = ({ endpoint }: Props) => {
         </div>
       )}
 
-      <Button onClick={run} disabled={loading} size="sm">
-        {loading ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <Play className="h-3.5 w-3.5 mr-1.5" />}
-        Send Request
-      </Button>
+      {endpoint.id === "create-subsidiaries-batch" && (
+        <div className="space-y-2">
+          {subsidiaries.map((sub, idx) => (
+            <Card key={idx} className="p-3 space-y-2">
+              <div className="flex items-center justify-between mb-1">
+                <p className="text-xs font-semibold text-foreground">Subsidiary {idx + 1}</p>
+                {subsidiaries.length > 1 && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => removeSubsidiary(idx)}
+                    className="h-6 px-2 text-xs text-destructive hover:text-destructive hover:bg-destructive/10"
+                  >
+                    Remove
+                  </Button>
+                )}
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <Label className="text-[10px] font-medium">Name *</Label>
+                  <Input
+                    placeholder="Subsidiary name"
+                    value={sub.name}
+                    onChange={(e) => updateSubsidiary(idx, "name", e.target.value)}
+                    className="mt-0.5 text-xs h-7"
+                  />
+                </div>
+                <div>
+                  <Label className="text-[10px] font-medium">Remote ID *</Label>
+                  <Input
+                    placeholder="External system identifier"
+                    value={sub.remoteId}
+                    onChange={(e) => updateSubsidiary(idx, "remoteId", e.target.value)}
+                    className="mt-0.5 text-xs h-7"
+                  />
+                </div>
+              </div>
+            </Card>
+          ))}
+          <Button variant="outline" onClick={addSubsidiary} size="sm" className="w-full">
+            + Add Another Subsidiary
+          </Button>
+        </div>
+      )}
+
+      {endpoint.id === "get-suppliers-by-csv" ? (
+        <div className="space-y-4">
+          {/* Upload zone */}
+          <Card className="p-4 space-y-3">
+            <p className="text-xs font-semibold text-foreground">Upload supplier name CSV</p>
+            <p className="text-[11px] text-muted-foreground">
+              Single-column CSV — one supplier name per row. A header row named "name" is automatically skipped.
+            </p>
+            <div
+              role="button"
+              tabIndex={0}
+              onClick={() => csvInputRef.current?.click()}
+              onKeyDown={e => e.key === 'Enter' && csvInputRef.current?.click()}
+              onDragOver={e => e.preventDefault()}
+              onDrop={e => {
+                e.preventDefault();
+                const file = e.dataTransfer.files[0];
+                if (file) { setCsvFileName(file.name); parseCsvFile(file); }
+              }}
+              className="border-2 border-dashed rounded-lg p-6 text-center cursor-pointer hover:border-primary/50 hover:bg-muted/30 transition-colors"
+            >
+              <Upload className="h-5 w-5 mx-auto mb-2 text-muted-foreground" />
+              {csvNames.length > 0 ? (
+                <p className="text-sm font-medium text-foreground">
+                  {csvFileName} — <span className="text-primary">{csvNames.length} names loaded</span>
+                </p>
+              ) : (
+                <p className="text-sm text-muted-foreground">Drop CSV here or click to browse</p>
+              )}
+              <input ref={csvInputRef} type="file" accept=".csv" className="hidden"
+                onChange={e => {
+                  const file = e.target.files?.[0];
+                  if (file) { setCsvFileName(file.name); parseCsvFile(file); }
+                }}
+              />
+            </div>
+            {csvNames.length > 0 && (
+              <div className="flex flex-wrap gap-1 max-h-24 overflow-y-auto">
+                {csvNames.map((n, i) => (
+                  <span key={i} className="text-[10px] bg-muted px-1.5 py-0.5 rounded font-mono">{n}</span>
+                ))}
+              </div>
+            )}
+            {/* Noise words settings */}
+            <div className="border-t pt-3 space-y-2">
+              <button
+                type="button"
+                onClick={() => setNoiseSettingsOpen(o => !o)}
+                className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground transition-colors"
+              >
+                {noiseSettingsOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                Word match settings
+              </button>
+              {noiseSettingsOpen && (
+                <div className="space-y-1.5">
+                  <p className="text-[11px] text-muted-foreground">
+                    <span className="font-medium">Noise words</span> — comma-separated. These are stripped before word-level matching.
+                    Word matching requires <span className="font-medium">at least 2</span> meaningful words to match; single-word hits are never used.
+                  </p>
+                  <Textarea
+                    value={noiseWordsInput}
+                    onChange={e => setNoiseWordsInput(e.target.value)}
+                    className="font-mono text-[11px] min-h-[72px]"
+                    placeholder="sa, ltd, inc, corp, …"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setNoiseWordsInput(DEFAULT_NOISE_WORDS.join(', '))}
+                    className="text-[11px] text-primary hover:underline"
+                  >
+                    Reset to defaults
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <Button onClick={runCsvLookup} disabled={csvRunning || csvNames.length === 0} size="sm" className="gap-1.5 min-w-[160px]">
+              <Loader2 className={`h-3.5 w-3.5 ${csvRunning ? 'animate-spin' : 'hidden'}`} />
+              {!csvRunning && <Play className="h-3.5 w-3.5" />}
+              {!csvRunning && 'Run lookup'}
+              {csvRunning && csvProgress?.phase === 'fetching' && `Fetching… ${csvProgress.fetched > 0 ? `${csvProgress.fetched} loaded` : ''}`}
+              {csvRunning && csvProgress?.phase === 'matching' && `${Math.round((csvProgress.matched / csvProgress.total) * 100)}% · ${csvProgress.matched}/${csvProgress.total}`}
+            </Button>
+          </Card>
+
+          {/* Results */}
+          {csvResults && (() => {
+            const perfectResults = csvResults.filter(r => r.matches.length > 0 && r.matches[0].score >= 0.99);
+            const partialResults = csvResults.filter(r => r.matches.length > 0 && r.matches[0].score < 0.99);
+            const notFoundResults = csvResults.filter(r => r.matches.length === 0);
+
+            const matchTable = (
+              rows: CsvMatchResult[],
+              headerColor: string,
+              headerText: string,
+              textColor: string,
+              openKey: keyof typeof csvTableOpen,
+            ) => {
+              const isOpen = csvTableOpen[openKey];
+              return (
+                <Card className="overflow-hidden">
+                  <button
+                    onClick={() => setCsvTableOpen(prev => ({ ...prev, [openKey]: !prev[openKey] }))}
+                    className={`w-full flex items-center justify-between px-3 py-2 border-b ${headerColor} hover:brightness-95 transition-all`}
+                  >
+                    <p className={`text-xs font-semibold ${textColor}`}>{headerText} — {rows.length} supplier{rows.length !== 1 ? 's' : ''}</p>
+                    {isOpen ? <ChevronDown className={`h-3.5 w-3.5 ${textColor}`} /> : <ChevronRight className={`h-3.5 w-3.5 ${textColor}`} />}
+                  </button>
+                  {isOpen && (
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead className="text-xs">CSV Name</TableHead>
+                          <TableHead className="text-xs">Omnea Name</TableHead>
+                          <TableHead className="text-xs">Omnea ID</TableHead>
+                          <TableHead className="text-xs w-20">Score</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {rows.flatMap((r) =>
+                          r.matches.map((m, mi) => (
+                            <TableRow key={`${r.csvName}-${mi}`} className={mi > 0 ? 'bg-amber-50/40 dark:bg-amber-950/10' : ''}>
+                              <TableCell className="text-xs font-mono align-top">
+                                {mi === 0 ? (
+                                  <span className="flex items-center gap-1.5">
+                                    {r.csvName}
+                                    {r.matches.length > 1 && (
+                                      <span className="text-[10px] bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 px-1.5 py-0.5 rounded font-semibold shrink-0">
+                                        {r.matches.length} matches
+                                      </span>
+                                    )}
+                                  </span>
+                                ) : (
+                                  <span className="text-muted-foreground/40 text-[10px]">↳</span>
+                                )}
+                              </TableCell>
+                              <TableCell className="text-xs">{m.name}</TableCell>
+                              <TableCell className="text-[11px] font-mono text-muted-foreground">{m.id}</TableCell>
+                              <TableCell className="text-xs">
+                                <span className={`font-mono font-semibold ${m.score >= 0.99 ? 'text-green-600' : m.score >= 0.8 ? 'text-amber-600' : 'text-orange-600'}`}>
+                                  {(m.score * 100).toFixed(0)}%
+                                </span>
+                              </TableCell>
+                            </TableRow>
+                          ))
+                        )}
+                      </TableBody>
+                    </Table>
+                  )}
+                </Card>
+              );
+            };
+
+            return (
+              <div className="space-y-3">
+                {/* Summary */}
+                <div className="flex items-center gap-3 flex-wrap">
+                  {perfectResults.length > 0 && (
+                    <Badge className="bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 gap-1">
+                      <CheckCircle2 className="h-3 w-3" />
+                      {perfectResults.length} found 100%
+                    </Badge>
+                  )}
+                  {partialResults.length > 0 && (
+                    <Badge className="bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 gap-1">
+                      <CheckCircle2 className="h-3 w-3" />
+                      {partialResults.length} found partial
+                    </Badge>
+                  )}
+                  <Badge className="bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400 gap-1">
+                    <XCircle className="h-3 w-3" />
+                    {notFoundResults.length} not found
+                  </Badge>
+                  <Button variant="outline" size="sm" onClick={exportCsvResults} className="gap-1.5 ml-auto">
+                    <Download className="h-3.5 w-3.5" /> Export results
+                  </Button>
+                </div>
+
+                {/* Found 100% */}
+                {perfectResults.length > 0 && matchTable(
+                  perfectResults,
+                  'bg-green-50 dark:bg-green-950/20 border-green-200 dark:border-green-800',
+                  'Found — 100% match',
+                  'text-green-700 dark:text-green-400',
+                  'perfect',
+                )}
+
+                {/* Found partial */}
+                {partialResults.length > 0 && matchTable(
+                  partialResults,
+                  'bg-amber-50 dark:bg-amber-950/20 border-amber-200 dark:border-amber-800',
+                  'Found — partial match',
+                  'text-amber-700 dark:text-amber-400',
+                  'partial',
+                )}
+
+                {/* Not found */}
+                {notFoundResults.length > 0 && (() => {
+                  const isOpen = csvTableOpen.notFound;
+                  return (
+                    <Card className="overflow-hidden">
+                      <button
+                        onClick={() => setCsvTableOpen(prev => ({ ...prev, notFound: !prev.notFound }))}
+                        className="w-full flex items-center justify-between px-3 py-2 border-b bg-red-50 dark:bg-red-950/20 border-red-200 dark:border-red-800 hover:brightness-95 transition-all"
+                      >
+                        <p className="text-xs font-semibold text-red-700 dark:text-red-400">Not found in Omnea — {notFoundResults.length} supplier{notFoundResults.length !== 1 ? 's' : ''}</p>
+                        {isOpen ? <ChevronDown className="h-3.5 w-3.5 text-red-700 dark:text-red-400" /> : <ChevronRight className="h-3.5 w-3.5 text-red-700 dark:text-red-400" />}
+                      </button>
+                      {isOpen && (
+                        <Table>
+                          <TableHeader>
+                            <TableRow>
+                              <TableHead className="text-xs">CSV Name</TableHead>
+                            </TableRow>
+                          </TableHeader>
+                          <TableBody>
+                            {notFoundResults.map((r, i) => (
+                              <TableRow key={i}>
+                                <TableCell className="text-xs font-mono text-muted-foreground">{r.csvName}</TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      )}
+                    </Card>
+                  );
+                })()}
+              </div>
+            );
+          })()}
+        </div>
+      ) : (
+        <Button onClick={run} disabled={loading} size="sm">
+          {loading ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <Play className="h-3.5 w-3.5 mr-1.5" />}
+          Send Request
+        </Button>
+      )}
 
       {error && (
         <Card className="p-3 bg-destructive/10 border-destructive/30">
@@ -833,207 +1315,6 @@ const OmneaEndpointDetail = ({ endpoint }: Props) => {
           </div>
         </Card>
       )}
-
-      {response && (
-        <Card className="overflow-hidden w-full">
-          <div className="px-4 py-2 flex items-center justify-between bg-secondary/30 border-b">
-            <div className="flex items-center gap-3">
-              <StatusPill label={`${statusCode}`} variant="success" />
-              <span className="text-[10px] font-mono text-muted-foreground">{duration}ms</span>
-              {(() => {
-                // Calculate item count for display
-                let itemCount = 0;
-                if (Array.isArray(response)) {
-                  itemCount = response.length;
-                } else if (response && typeof response === "object") {
-                  const respObj = response as Record<string, unknown>;
-                  if (Array.isArray(respObj.data)) {
-                    itemCount = (respObj.data as unknown[]).length;
-                  }
-                }
-                return itemCount > 0 ? (
-                  <span className="text-[10px] font-semibold text-muted-foreground">
-                    {itemCount} items
-                  </span>
-                ) : null;
-              })()}
-            </div>
-            <div className="flex items-center gap-2">
-              <div className="flex gap-1 bg-secondary rounded p-1">
-                <Button
-                  variant={displayMode === "json" ? "default" : "ghost"}
-                  size="sm"
-                  onClick={() => setDisplayMode("json")}
-                  className="h-7 text-xs"
-                  title="View as JSON"
-                >
-                  <Code2 className="h-3.5 w-3.5" />
-                </Button>
-                <Button
-                  variant={displayMode === "table" ? "default" : "ghost"}
-                  size="sm"
-                  onClick={() => setDisplayMode("table")}
-                  className="h-7 text-xs"
-                  title="View as table"
-                >
-                  <Grid3x3 className="h-3.5 w-3.5" />
-                </Button>
-              </div>
-              <Button variant="ghost" size="sm" onClick={copyResponse} className="h-7 text-xs">
-                {copied ? <Check className="h-3 w-3 mr-1" /> : <Copy className="h-3 w-3 mr-1" />}
-                {copied ? "Copied" : "Copy"}
-              </Button>
-            </div>
-          </div>
-          {displayMode === "json" ? (
-            <pre className="p-4 text-[11px] font-mono overflow-auto max-h-[400px] text-foreground">
-              {JSON.stringify(response, null, 2)}
-            </pre>
-          ) : (
-            (() => {
-              const { headers, rows } = getTableData();
-              return headers.length > 0 ? (
-                <div className="space-y-4 w-full">
-                  <div className="overflow-x-auto border rounded-lg">
-                    <Table className="border-collapse w-full min-w-max">
-                      <TableHeader className="sticky top-0">
-                        <TableRow>
-                          <TableHead className="text-xs px-2 py-1 w-8 text-center bg-secondary/50">
-                            {" "}
-                          </TableHead>
-                          {headers.map((header) => {
-                            const DEFAULT_DESCRIPTION_WIDTH = 200;
-                            const colWidth = columnWidths[header] ?? (header.toLowerCase() === "description" ? DEFAULT_DESCRIPTION_WIDTH : undefined);
-                            return (
-                              <TableHead
-                                key={header}
-                                style={colWidth ? { width: colWidth, minWidth: colWidth, maxWidth: colWidth } : undefined}
-                                className="relative text-xs px-2 py-1 bg-secondary/50 cursor-pointer hover:bg-secondary/70 transition-colors whitespace-normal break-words"
-                                onClick={() => handleSort(header)}
-                              >
-                                <div className="flex items-center gap-1 pr-2">
-                                  <span className="break-words">{header}</span>
-                                  {sortColumn === header && (
-                                    sortDirection === "asc" ? (
-                                      <ArrowUp className="h-3 w-3 shrink-0 text-primary" />
-                                    ) : (
-                                      <ArrowDown className="h-3 w-3 shrink-0 text-primary" />
-                                    )
-                                  )}
-                                </div>
-                                {/* Resize handle */}
-                                <div
-                                  className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-primary/40 active:bg-primary/60"
-                                  onPointerDown={(e) => {
-                                    e.stopPropagation();
-                                    e.preventDefault();
-                                    const th = e.currentTarget.parentElement as HTMLElement;
-                                    startResize(header, e.clientX, th.offsetWidth);
-                                  }}
-                                  onClick={(e) => e.stopPropagation()}
-                                />
-                              </TableHead>
-                            );
-                          })}
-                        </TableRow>
-                      </TableHeader>
-                      <TableBody>
-                        {rows.map((row, idx) => {
-                          const rowKey = `row-${idx}`;
-                          const isExpanded = expandedRows[rowKey] ?? false;
-                          const hasComplexData = headers.some((h) => isComplexValue(row[h]));
-                          const complexFields = headers.filter((h) => isComplexValue(row[h]));
-
-                          return (
-                            <>
-                              <TableRow key={`${idx}-main`} className={isExpanded ? "bg-secondary/20" : ""}>
-                                <TableCell className="text-xs px-2 py-1 text-center w-8">
-                                  {hasComplexData && (
-                                    <button
-                                      type="button"
-                                      onClick={(e) => {
-                                        e.preventDefault();
-                                        e.stopPropagation();
-                                        toggleRowExpansion(idx);
-                                      }}
-                                      className="hover:bg-secondary rounded p-0.5 cursor-pointer transition-colors active:scale-95"
-                                      title={isExpanded ? "Collapse" : "Expand"}
-                                    >
-                                      {isExpanded ? (
-                                        <ChevronDown className="h-3.5 w-3.5" />
-                                      ) : (
-                                        <ChevronRight className="h-3.5 w-3.5" />
-                                      )}
-                                    </button>
-                                  )}
-                                </TableCell>
-                                {headers.map((header) => {
-                                  const value = row[header];
-                                  const isComplex = isComplexValue(value);
-
-                                  return (
-                                    <TableCell
-                                      key={`${idx}-${header}`}
-                                      style={(() => {
-                                        const DEFAULT_DESCRIPTION_WIDTH = 200;
-                                        const w = columnWidths[header] ?? (header.toLowerCase() === "description" ? DEFAULT_DESCRIPTION_WIDTH : undefined);
-                                        return w ? { width: w, minWidth: w, maxWidth: w } : undefined;
-                                      })()}
-                                      className={`text-xs px-2 py-1 whitespace-normal break-words ${isComplex ? "bg-secondary/10" : ""}`}
-                                    >
-                                      {isComplex ? (
-                                        <code className="text-[10px] text-muted-foreground cursor-pointer hover:text-foreground">
-                                          {Array.isArray(value) ? `${header} (${(value as []).length})` : header}
-                                        </code>
-                                      ) : (
-                                        <span>{String(value ?? "—")}</span>
-                                      )}
-                                    </TableCell>
-                                  );
-                                })}
-                              </TableRow>
-
-                              {/* Expanded row details - show in corresponding columns */}
-                              {isExpanded && complexFields.length > 0 && (
-                                <TableRow key={`${idx}-expanded`} className="bg-secondary/10 border-b-2">
-                                  <TableCell className="text-xs px-2 py-2 text-center w-8"></TableCell>
-                                  {headers.map((header) => {
-                                    const value = row[header];
-                                    const isComplex = isComplexValue(value);
-
-                                    return (
-                                      <TableCell
-                                        key={`${idx}-exp-${header}`}
-                                        className="text-xs px-2 py-3 align-top bg-white min-w-fit"
-                                      >
-                                        {isComplex ? (
-                                          <div className="border rounded bg-secondary/30 p-2 max-h-96 overflow-y-auto">
-                                            <p className="text-[10px] font-medium text-primary mb-1 sticky top-0 bg-secondary/40 px-1 py-0.5 rounded">{header}</p>
-                                            <div className="text-[11px] text-foreground">
-                                              {renderNestedValue(value, 3)}
-                                            </div>
-                                          </div>
-                                        ) : null}
-                                      </TableCell>
-                                    );
-                                  })}
-                                </TableRow>
-                              )}
-                            </>
-                          );
-                        })}
-                      </TableBody>
-                    </Table>
-                  </div>
-                </div>
-              ) : (
-                <div className="p-4 text-xs text-muted-foreground">No tabular data to display</div>
-              );
-            })()
-          )}
-        </Card>
-      )}
-
 
     </div>
   );
