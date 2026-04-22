@@ -202,10 +202,32 @@ export async function executeRow(
         suppliers: [
           {
             name: supplier.legalName,
-            legalName: supplier.legalName,
-            state: 'active',
-            entityType: 'company',
-            ...(supplier.brn ? { taxNumber: supplier.brn } : {}),
+            ...(supplier.legalNameRegistered && { legalName: supplier.legalNameRegistered }),
+            ...(supplier.taxNumber && { taxNumber: supplier.taxNumber }),
+            ...(supplier.entityType && { entityType: supplier.entityType }),
+            ...(supplier.description && { description: supplier.description }),
+            ...(supplier.website && { website: supplier.website }),
+            isPreferred: supplier.isPreferred ?? false,
+            isReseller: supplier.isReseller ?? false,
+            ...((supplier.addressStreet1 || supplier.city || supplier.countryIso2) && {
+              address: {
+                ...(supplier.addressStreet1 && { street1: supplier.addressStreet1 }),
+                ...(supplier.addressStreet2 && { street2: supplier.addressStreet2 }),
+                ...(supplier.city && { city: supplier.city }),
+                ...(supplier.stateProvince && { state: supplier.stateProvince }),
+                ...(supplier.postCode && { zipCode: supplier.postCode }),
+                country: supplier.countryIso2,
+              },
+            }),
+            customFields: {
+              ...(supplier.brn && { 'corporate-registration-number': supplier.brn }),
+              ...(supplier.materialityLevel && { 'materiality-level': supplier.materialityLevel }),
+              ...(supplier.infosecCriticalityTier && { 'infosec-criticality-tier': supplier.infosecCriticalityTier }),
+              ...(supplier.infosecSensitivityTier && { 'infosec-sensitivity-tier': supplier.infosecSensitivityTier }),
+              ...(supplier.entityTypeCf && { 'entity-type': supplier.entityTypeCf }),
+              ...(supplier.supportsCif && { 'supports-cif-1': supplier.supportsCif }),
+              ...(supplier.nameOfParentEntity && { 'name-of-parent-entity': supplier.nameOfParentEntity }),
+            },
           },
         ],
       },
@@ -302,11 +324,11 @@ export async function executeRow(
     method: 'POST',
     body: {
       bankName: bank.bankName,
-      accountNumber: bank.bankAccountNo,
+      accountNumber: bank.accountNumber,
       ...(bank.iban      ? { iban: bank.iban }           : {}),
       ...(bank.swiftCode ? { swiftCode: bank.swiftCode } : {}),
-      ...(bank.bankCode  ? { sortCode: bank.bankCode }   : {}),
-      address: { country: bank.bankCountryIso2 },
+      ...(bank.sortCode  ? { sortCode: bank.sortCode }   : {}),
+      address: { country: bank.addressCountry },
     },
   });
 

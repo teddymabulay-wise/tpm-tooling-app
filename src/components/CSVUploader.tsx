@@ -4,6 +4,13 @@ import { Upload, FileText, Check, AlertCircle } from "lucide-react";
 import { Button } from "./ui/button";
 import { cn } from "@/lib/utils";
 
+interface CSVUploaderProps {
+  title?: string;
+  description?: string;
+  defaultOpen?: boolean;
+  onFileLoaded?: (text: string, fileName: string) => void;
+}
+
 interface MappedRow {
   legalName: string;
   taxNumber: string;
@@ -11,7 +18,12 @@ interface MappedRow {
   [key: string]: string;
 }
 
-export const CSVUploader = () => {
+export const CSVUploader = ({
+  title = "One-Off Integration (CSV Bridge)",
+  description = "or click to browse — maps legalName, taxNumber, address automatically",
+  defaultOpen = false,
+  onFileLoaded,
+}: CSVUploaderProps) => {
   const [dragOver, setDragOver] = useState(false);
   const [rows, setRows] = useState<MappedRow[]>([]);
   const [fileName, setFileName] = useState("");
@@ -35,8 +47,9 @@ export const CSVUploader = () => {
       return row;
     });
     setRows(data);
+    onFileLoaded?.(text, name);
     setTimeout(() => setMappingComplete(true), 800);
-  }, []);
+  }, [onFileLoaded]);
 
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
@@ -59,7 +72,7 @@ export const CSVUploader = () => {
   );
 
   return (
-    <CollapsibleSection title="One-Off Integration (CSV Bridge)" defaultOpen={false}>
+    <CollapsibleSection title={title} defaultOpen={defaultOpen}>
       {rows.length === 0 ? (
         <div
           onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
@@ -75,7 +88,7 @@ export const CSVUploader = () => {
             Drop CSV file here
           </p>
           <p className="text-xs text-muted-foreground mb-3">
-            or click to browse — maps legalName, taxNumber, address automatically
+            {description}
           </p>
           <label>
             <input type="file" accept=".csv" className="hidden" onChange={handleFileInput} />

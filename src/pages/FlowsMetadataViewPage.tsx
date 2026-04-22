@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Check, Copy, TrendingUp, X } from "lucide-react";
+import { Check, Copy, TrendingUp, X, Search, Settings } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -7,6 +8,8 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { CollapsibleSection } from "@/components/CollapsibleSection";
 import type { FlowMetadata, FlowTag } from "@/lib/flows-metadata-types";
 import { parseFlowTagsCSV, parseFlowsMetadataCSV } from "@/lib/flows-metadata-utils";
 
@@ -31,7 +34,7 @@ type FilterField =
   | "questionLogicCondition"
   | "coreDataSource";
 
-type ToolbarField = "workflow" | "blockType" | "formName" | "questionType" | "blockLogicName";
+type ToolbarField = "workflow" | "blockType" | "formName" | "assignees";
 
 type TableColumn = {
   field: FilterField;
@@ -79,8 +82,7 @@ const TOOLBAR_FIELDS: Array<{ field: ToolbarField; label: string }> = [
   { field: "workflow", label: "Workflow" },
   { field: "blockType", label: "Block" },
   { field: "formName", label: "Form" },
-  { field: "questionType", label: "Question Type" },
-  { field: "blockLogicName", label: "Block Logic" },
+  { field: "assignees", label: "Assignees" },
 ];
 
 const FIELD_LABELS: Record<FilterField, string> = {
@@ -106,16 +108,24 @@ const FIELD_LABELS: Record<FilterField, string> = {
 };
 
 const TABLE_COLUMNS: TableColumn[] = [
-  { field: "workflow", label: "Workflow", width: "w-[200px]", multiline: true, group: "workflow" },
+  { field: "workflow", label: "Workflow Name", width: "w-[200px]", multiline: true, group: "workflow" },
   { field: "blockType", label: "Block Type", width: "w-[112px]", headerLines: 2, group: "block" },
   { field: "blockName", label: "Block Name", width: "w-[156px]", multiline: true, headerLines: 2, group: "block" },
-  { field: "blockDuration", label: "Duration", width: "w-[96px]", group: "block" },
-  { field: "assignees", label: "Assignees", width: "w-[136px]", multiline: true, group: "block" },
-  { field: "formName", label: "Form", width: "w-[176px]", multiline: true, group: "form" },
+  { field: "blockDuration", label: "Block Duration", width: "w-[96px]", group: "block" },
+  { field: "assignees", label: "Block Assignees", width: "w-[136px]", multiline: true, group: "block" },
+  { field: "blockLogicName", label: "Block Logic Name", width: "w-[140px]", multiline: true, headerLines: 2, group: "block", emphasis: true },
+  { field: "blockLogicCondition", label: "Block Logic Condition", width: "w-[160px]", multiline: true, headerLines: 2, group: "block", emphasis: true },
+  { field: "formName", label: "Form Name", width: "w-[176px]", multiline: true, group: "form" },
   { field: "formSection", label: "Form Section", width: "w-[164px]", multiline: true, headerLines: 2, group: "form" },
+  { field: "formSectionLogicName", label: "Form Section Logic Name", width: "w-[160px]", multiline: true, headerLines: 2, group: "form", emphasis: true },
+  { field: "formSectionLogicCondition", label: "Form Section Logic Condition", width: "w-[180px]", multiline: true, headerLines: 2, group: "form", emphasis: true },
+  { field: "questionType", label: "Question Type", width: "w-[120px]", multiline: true, group: "question" },
   { field: "questionId", label: "Question ID", width: "w-[192px]", multiline: true, headerLines: 2, group: "question" },
-  { field: "description", label: "Description", width: "w-[360px]", multiline: true, group: "question" },
-  { field: "coreDataSource", label: "Core Data", width: "w-[176px]", multiline: true, headerLines: 2, group: "coreData" },
+  { field: "questionTitle", label: "Question Title", width: "w-[360px]", multiline: true, group: "question" },
+  { field: "description", label: "Question Description", width: "w-[360px]", multiline: true, group: "question" },
+  { field: "questionLogicName", label: "Question Logic Name", width: "w-[150px]", multiline: true, headerLines: 2, group: "question", emphasis: true },
+  { field: "questionLogicCondition", label: "Question Logic Condition", width: "w-[170px]", multiline: true, headerLines: 2, group: "question", emphasis: true },
+  { field: "coreDataSource", label: "Question Core Data", width: "w-[176px]", multiline: true, headerLines: 2, group: "coreData" },
 ];
 
 const TABLE_COLUMN_GROUPS: TableColumnGroup[] = [
@@ -127,13 +137,14 @@ const TABLE_COLUMN_GROUPS: TableColumnGroup[] = [
 ];
 
 function FlowsMetadataViewPage() {
+  const navigate = useNavigate();
   const [data, setData] = useState<FlowMetadata[]>([]);
   const [tagData, setTagData] = useState<FlowTag[]>([]);
   const [loading, setLoading] = useState(true);
   const [filters, setFilters] = useState<Partial<Record<FilterField, string>>>({});
   const [searchText, setSearchText] = useState("");
   const [copied, setCopied] = useState(false);
-  const [activeTab, setActiveTab] = useState("overview");
+  const [searchOpen, setSearchOpen] = useState(false);
 
   useEffect(() => {
     const load = async () => {
@@ -220,8 +231,7 @@ function FlowsMetadataViewPage() {
       workflow: buildOptions("workflow"),
       blockType: buildOptions("blockType"),
       formName: buildOptions("formName"),
-      questionType: buildOptions("questionType"),
-      blockLogicName: buildOptions("blockLogicName"),
+      assignees: buildOptions("assignees"),
     } satisfies Record<ToolbarField, string[]>;
   }, [data, filters]);
 
@@ -399,10 +409,125 @@ function FlowsMetadataViewPage() {
     }
   };
 
+  const buildFormOptionsWithContext = () => {
+    const seen = new Set<string>();
+    const options: Array<{ formName: string; blockType: string; workflow: string }> = [];
+
+    const scoped = data.filter((record) => {
+      for (const [activeField, value] of Object.entries(filters) as Array<[FilterField, string]>) {
+        if (activeField === "formName") {
+          continue;
+        }
+        if (!matchesField(record, activeField, value)) {
+          return false;
+        }
+      }
+      return true;
+    });
+
+    scoped.forEach((record) => {
+      const formName = normalizeValue(record.formName);
+      if (formName && formName !== EMPTY_VALUE) {
+        const blockType = normalizeValue(record.blockType);
+        const workflow = normalizeValue(record.workflow);
+        const key = `${formName}||${blockType}||${workflow}`;
+
+        if (!seen.has(key)) {
+          seen.add(key);
+          options.push({
+            formName,
+            blockType: blockType !== EMPTY_VALUE ? blockType : "—",
+            workflow: workflow !== EMPTY_VALUE ? workflow : "—",
+          });
+        }
+      }
+    });
+
+    return options.sort((a, b) => a.formName.localeCompare(b.formName));
+  };
+
+  const extractLogicDetails = (logicJson: string | undefined) => {
+    if (!logicJson || logicJson.toLowerCase() === "na") {
+      return { questions: [], values: [] };
+    }
+
+    try {
+      const parsed = JSON.parse(logicJson);
+      const questions = new Set<string>();
+      const values = new Set<string>();
+
+      const traverse = (node: any) => {
+        if (!node || typeof node !== "object") return;
+
+        if (node.primaryField) {
+          const primaryValue = node.primaryField.value;
+          if (primaryValue) questions.add(primaryValue);
+        }
+
+        if (node.secondaryField) {
+          const secondaryValue = node.secondaryField.value;
+          if (secondaryValue) values.add(String(secondaryValue));
+        }
+
+        if (Array.isArray(node.items)) {
+          node.items.forEach(traverse);
+        }
+
+        if (Array.isArray(node.comparisons)) {
+          node.comparisons.forEach(traverse);
+        }
+      };
+
+      traverse(parsed);
+      return {
+        questions: Array.from(questions),
+        values: Array.from(values),
+      };
+    } catch {
+      return { questions: [], values: [] };
+    }
+  };
+
+  const extractLogicPairs = (logicJson: string | undefined): string[] => {
+    if (!logicJson || logicJson.toLowerCase() === "na") {
+      return [];
+    }
+
+    try {
+      const parsed = JSON.parse(logicJson);
+      const pairs: string[] = [];
+
+      const traverse = (node: any) => {
+        if (!node || typeof node !== "object") return;
+
+        const primaryValue = node.primaryField?.value;
+        const secondaryValue = node.secondaryField?.value;
+
+        if (primaryValue && secondaryValue) {
+          pairs.push(`${primaryValue} = ${secondaryValue}`);
+        }
+
+        if (Array.isArray(node.items)) {
+          node.items.forEach(traverse);
+        }
+
+        if (Array.isArray(node.comparisons)) {
+          node.comparisons.forEach(traverse);
+        }
+      };
+
+      traverse(parsed);
+      return pairs;
+    } catch {
+      return [];
+    }
+  };
+
   return (
     <div className="overflow-y-auto h-full bg-[linear-gradient(180deg,#f8fafc_0%,#eef2f7_100%)] px-4 py-4 md:px-5">
-      <div className="mx-auto flex max-w-[1760px] flex-col gap-3 pb-6">
-        <div className="flex flex-wrap items-start justify-between gap-3 rounded-xl border border-slate-200 bg-white/90 px-4 py-3 shadow-sm backdrop-blur">
+      <div className="mx-auto flex max-w-[1760px] flex-col gap-4 pb-6">
+        {/* Header with title and Configuration icon */}
+        <div className="flex items-start justify-between gap-3 rounded-xl border border-slate-200 bg-white/90 px-4 py-3 shadow-sm backdrop-blur">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <div className="rounded-lg bg-slate-900 p-1.5 text-white">
@@ -410,156 +535,925 @@ function FlowsMetadataViewPage() {
               </div>
               <h1 className="text-base font-semibold tracking-tight text-slate-900">Omnea Workflow Metadata</h1>
             </div>
-            <p className="mt-1 text-xs text-slate-500">Click card cells or table cells to filter. Empty values are shown as —.</p>
+            <p className="mt-1 text-xs text-slate-500">Filter and explore workflow structure. Click card cells or table cells to filter.</p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-500">
-            <MiniStat label="Rows" value={filteredData.length} />
-            <MiniStat label="Blocks" value={blockCount} />
-            <MiniStat label="Forms" value={formCount} />
-            <MiniStat label="Questions" value={questionCount} />
-            <MiniStat label="Logic" value={logicCount} />
-            {activeFilterCount > 0 ? (
-              <Button className="h-8 text-[11px]" size="sm" variant="outline" onClick={clearFilters}>
-                <X className="mr-1 h-3 w-3" />
-                Reset View
-              </Button>
-            ) : null}
+          <Button
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            onClick={() => navigate("/flows-metadata/configuration")}
+          >
+            <Settings className="h-4 w-4" />
+          </Button>
+        </div>
+
+        {/* Tabs section - moved to top */}
+
+        {/* Filter toolbar and cards content */}
+        <div className="w-full">
+          <Card className="border-slate-200 bg-white shadow-sm mt-4">
+            <CardContent className="space-y-3 p-3 md:p-4">
+              <div className="flex items-end gap-3">
+                {/* Search icon on the left */}
+                <Popover open={searchOpen} onOpenChange={setSearchOpen}>
+                  <PopoverTrigger asChild>
+                    <Button variant="outline" size="sm" className="h-9 w-9 p-0 shrink-0">
+                      <Search className="h-4 w-4" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-64" align="start">
+                    <div className="space-y-2">
+                      <FilterLabel label="Search" />
+                      <Input
+                        className="h-8 border-slate-200 text-xs placeholder:text-slate-400"
+                        placeholder="Search metadata text..."
+                        value={searchText}
+                        onChange={(event) => setSearchText(event.target.value)}
+                        autoFocus
+                      />
+                    </div>
+                  </PopoverContent>
+                </Popover>
+
+                {/* Grid of equal-width filters */}
+                <div className="flex-1 grid grid-cols-4 gap-3">
+                  {/* Workflow */}
+                  <div className="space-y-1 min-w-0">
+                    <FilterLabel label="Workflow" />
+                    <Select value={filters.workflow ?? ALL_VALUE} onValueChange={(value) => setFilterValue("workflow", value)}>
+                      <SelectTrigger className="h-9 border-slate-200 px-2 text-xs">
+                        <SelectValue placeholder="All Workflows" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value={ALL_VALUE}>All Workflows</SelectItem>
+                        {(toolbarOptions.workflow ?? []).map((value) => (
+                          <SelectItem key={value} value={value}>
+                            {value}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  {/* Block */}
+                  <div className="space-y-1 min-w-0">
+                    <FilterLabel label="Block" />
+                    <Select value={filters.blockType ?? ALL_VALUE} onValueChange={(value) => setFilterValue("blockType", value)}>
+                      <SelectTrigger className="h-9 border-slate-200 px-2 text-xs">
+                        <SelectValue placeholder="All Blocks" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value={ALL_VALUE}>All Blocks</SelectItem>
+                        {(toolbarOptions.blockType ?? []).map((value) => (
+                          <SelectItem key={value} value={value}>
+                            {value}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  {/* Form with Block and Workflow info */}
+                  <div className="space-y-1 min-w-0">
+                    <FilterLabel label="Form" />
+                    <Select value={filters.formName ?? ALL_VALUE} onValueChange={(value) => setFilterValue("formName", value)}>
+                      <SelectTrigger className="h-9 border-slate-200 px-2 text-xs">
+                        <SelectValue placeholder="All Forms" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value={ALL_VALUE}>All Forms</SelectItem>
+                        {buildFormOptionsWithContext().map((option) => (
+                          <SelectItem key={option.formName} value={option.formName}>
+                            <div className="flex flex-col">
+                              <span>{option.formName}</span>
+                              <span className="text-[11px] text-slate-500">
+                                {option.blockType} / {option.workflow}
+                              </span>
+                            </div>
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  {/* Assignees */}
+                  <div className="space-y-1 min-w-0">
+                    <FilterLabel label="Assignees" />
+                    <Select value={filters.assignees ?? ALL_VALUE} onValueChange={(value) => setFilterValue("assignees", value)}>
+                      <SelectTrigger className="h-9 border-slate-200 px-2 text-xs">
+                        <SelectValue placeholder="All Assignees" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value={ALL_VALUE}>All Assignees</SelectItem>
+                        {(toolbarOptions.assignees ?? []).map((value) => (
+                          <SelectItem key={value} value={value}>
+                            {value}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+
+                {/* Reset button */}
+                {activeFilterCount > 0 ? (
+                  <Button className="h-9 text-xs shrink-0" size="sm" variant="outline" onClick={clearFilters}>
+                    <X className="mr-1 h-3 w-3" />
+                    Reset
+                  </Button>
+                ) : null}
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* Active filters */}
+          {(activeFilterCount > 0 || loading) && (
+            <div className="flex min-h-8 flex-wrap items-center gap-1.5 px-1 text-[11px] text-slate-500 mt-3">
+              {loading ? <span>Loading metadata...</span> : null}
+              {Object.entries(filters).map(([field, value]) => (
+                <Badge
+                  key={`${field}-${value}`}
+                  className="h-6 cursor-pointer rounded-md bg-slate-100 px-2 text-[11px] font-medium text-slate-700 hover:bg-slate-200"
+                  variant="secondary"
+                  onClick={() => setFilterValue(field as FilterField, ALL_VALUE)}
+                >
+                  {FIELD_LABELS[field as FilterField]}: {value}
+                  <X className="ml-1 h-3 w-3" />
+                </Badge>
+              ))}
+              {searchText ? (
+                <Badge
+                  className="h-6 cursor-pointer rounded-md bg-blue-50 px-2 text-[11px] font-medium text-blue-700 hover:bg-blue-100"
+                  variant="secondary"
+                  onClick={() => setSearchText("")}
+                >
+                  Search: {searchText}
+                  <X className="ml-1 h-3 w-3" />
+                </Badge>
+              ) : null}
+            </div>
+          )}
+
+
+          {/* Logic tab content - now shown directly */}
+          <div className="space-y-3 mt-4">
+              {/* Block Structure Section */}
+              <div className="space-y-2">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-700 px-1">Block Structure</h3>
+                <div className="grid grid-cols-1 gap-2 md:grid-cols-5">
+                  {/* Block Type */}
+                  <Card className={`border-slate-200 bg-white shadow-sm ${filters.blockType && filters.blockType !== ALL_VALUE ? "ring-2 ring-blue-200" : ""}`}>
+                    <CardContent className="flex flex-col p-0">
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-center justify-between">
+                        <h4 className="text-xs font-semibold text-slate-900">Block Type</h4>
+                        {filters.blockType && filters.blockType !== ALL_VALUE && (
+                          <button
+                            onClick={() => setFilterValue("blockType", ALL_VALUE)}
+                            className="p-0.5 hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors"
+                            title="Reset filter"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
+                      <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
+                        <div className="flex flex-wrap gap-2">
+                          {(() => {
+                            const seen = new Set<string>();
+                            const rows: string[] = [];
+                            filteredData.forEach(record => {
+                              const value = normalizeValue(record.blockType);
+                              if (!seen.has(value) && value !== EMPTY_VALUE) {
+                                seen.add(value);
+                                rows.push(value);
+                              }
+                            });
+                            return rows.length === 0 ? (
+                              <p className="text-[10px] text-slate-400">—</p>
+                            ) : (
+                              rows.sort().map((value, idx) => (
+                                <button
+                                  key={`bt-${idx}`}
+                                  onClick={() => toggleFieldValue("blockType", value)}
+                                  className="block w-full text-left text-[11px] px-3 py-2 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
+                                  title={value}
+                                >
+                                  {value}
+                                </button>
+                              ))
+                            );
+                          })()}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  {/* Block Name */}
+                  <Card className={`border-slate-200 bg-white shadow-sm ${filters.blockName && filters.blockName !== ALL_VALUE ? "ring-2 ring-blue-200" : ""}`}>
+                    <CardContent className="flex flex-col p-0">
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-start justify-between gap-2">
+                        <div>
+                          <h4 className="text-xs font-semibold text-slate-900">Block Name</h4>
+                          <p className="text-[9px] text-slate-500">grouped by Block Type</p>
+                        </div>
+                        {filters.blockName && filters.blockName !== ALL_VALUE && (
+                          <button
+                            onClick={() => setFilterValue("blockName", ALL_VALUE)}
+                            className="p-0.5 hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors shrink-0"
+                            title="Reset filter"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
+                      <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
+                        <div className="space-y-2">
+                          {(() => {
+                            const grouped = new Map<string, Set<string>>();
+                            filteredData.forEach(record => {
+                              const blockType = normalizeValue(record.blockType) || "—";
+                              const blockName = normalizeValue(record.blockName);
+                              if (blockName !== EMPTY_VALUE) {
+                                if (!grouped.has(blockType)) {
+                                  grouped.set(blockType, new Set());
+                                }
+                                grouped.get(blockType)!.add(blockName);
+                              }
+                            });
+
+                            if (grouped.size === 0) {
+                              return <p className="text-[10px] text-slate-400">—</p>;
+                            }
+
+                            return Array.from(grouped.entries())
+                              .sort((a, b) => a[0].localeCompare(b[0]))
+                              .map(([blockType, blockNames]) => (
+                                <div key={`group-${blockType}`} className="border-l-2 border-slate-200 pl-2">
+                                  <p className="text-[10px] font-semibold text-slate-600 mb-1">{blockType}</p>
+                                  <div className="flex flex-wrap gap-1">
+                                    {Array.from(blockNames).sort().map((blockName) => (
+                                      <button
+                                        key={`bn-${blockName}`}
+                                        onClick={() => toggleFieldValue("blockName", blockName)}
+                                        className="block text-left text-[10px] px-2 py-1 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
+                                        title={blockName}
+                                      >
+                                        {blockName}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              ));
+                          })()}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  {/* Duration */}
+                  <Card className={`border-slate-200 bg-white shadow-sm ${filters.blockDuration && filters.blockDuration !== ALL_VALUE ? "ring-2 ring-blue-200" : ""}`}>
+                    <CardContent className="flex flex-col p-0">
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-center justify-between">
+                        <h4 className="text-xs font-semibold text-slate-900">Duration</h4>
+                        {filters.blockDuration && filters.blockDuration !== ALL_VALUE && (
+                          <button
+                            onClick={() => setFilterValue("blockDuration", ALL_VALUE)}
+                            className="p-0.5 hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors"
+                            title="Reset filter"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
+                      <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
+                        <div className="flex flex-wrap gap-2">
+                          {(() => {
+                            const seen = new Set<string>();
+                            const rows: string[] = [];
+                            filteredData.forEach(record => {
+                              const value = normalizeValue(record.blockDuration);
+                              if (!seen.has(value) && value !== EMPTY_VALUE) {
+                                seen.add(value);
+                                rows.push(value);
+                              }
+                            });
+                            return rows.length === 0 ? (
+                              <p className="text-[10px] text-slate-400">—</p>
+                            ) : (
+                              rows.sort().map((value, idx) => (
+                                <button
+                                  key={`bd-${idx}`}
+                                  onClick={() => toggleFieldValue("blockDuration", value)}
+                                  className="block w-full text-left text-[11px] px-3 py-2 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
+                                  title={value}
+                                >
+                                  {value}
+                                </button>
+                              ))
+                            );
+                          })()}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  {/* Assignees */}
+                  <Card className={`border-slate-200 bg-white shadow-sm ${filters.assignees && filters.assignees !== ALL_VALUE ? "ring-2 ring-blue-200" : ""}`}>
+                    <CardContent className="flex flex-col p-0">
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-center justify-between">
+                        <h4 className="text-xs font-semibold text-slate-900">Assignees</h4>
+                        {filters.assignees && filters.assignees !== ALL_VALUE && (
+                          <button
+                            onClick={() => setFilterValue("assignees", ALL_VALUE)}
+                            className="p-0.5 hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors"
+                            title="Reset filter"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
+                      <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
+                        <div className="flex flex-wrap gap-2">
+                          {(() => {
+                            const seen = new Set<string>();
+                            const rows: string[] = [];
+                            filteredData.forEach(record => {
+                              const value = normalizeValue(record.assignees);
+                              if (!seen.has(value) && value !== EMPTY_VALUE) {
+                                seen.add(value);
+                                rows.push(value);
+                              }
+                            });
+                            return rows.length === 0 ? (
+                              <p className="text-[10px] text-slate-400">—</p>
+                            ) : (
+                              rows.sort().map((value, idx) => (
+                                <button
+                                  key={`as-${idx}`}
+                                  onClick={() => toggleFieldValue("assignees", value)}
+                                  className="block w-full text-left text-[11px] px-3 py-2 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
+                                  title={value}
+                                >
+                                  {value}
+                                </button>
+                              ))
+                            );
+                          })()}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  {/* Block Logic Condition */}
+                  <Card className={`border-slate-200 bg-white shadow-sm ${filters.blockLogicCondition && filters.blockLogicCondition !== ALL_VALUE ? "ring-2 ring-blue-200" : ""}`}>
+                    <CardContent className="flex flex-col p-0">
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-center justify-between">
+                        <h4 className="text-xs font-semibold text-slate-900">Block Logic Condition</h4>
+                        {filters.blockLogicCondition && filters.blockLogicCondition !== ALL_VALUE && (
+                          <button
+                            onClick={() => setFilterValue("blockLogicCondition", ALL_VALUE)}
+                            className="p-0.5 hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors"
+                            title="Reset filter"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
+                      <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
+                        <div className="flex flex-wrap gap-2">
+                          {(() => {
+                            const seen = new Set<string>();
+                            const rows: string[] = [];
+                            filteredData.forEach(record => {
+                              const pairs = extractLogicPairs(record.blockLogicCondition);
+                              pairs.forEach(pair => {
+                                if (!seen.has(pair) && pair !== EMPTY_VALUE) {
+                                  seen.add(pair);
+                                  rows.push(pair);
+                                }
+                              });
+                            });
+                            return rows.length === 0 ? (
+                              <p className="text-[10px] text-slate-400">—</p>
+                            ) : (
+                              rows.sort().map((value, idx) => {
+                                const questionId = value.split(" = ")[0];
+                                return (
+                                  <button
+                                    key={`blc-${idx}`}
+                                    onClick={() => toggleFieldValue("questionId", questionId)}
+                                    className="block w-full text-left text-[11px] px-3 py-2 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
+                                    title={value}
+                                  >
+                                    {value}
+                                  </button>
+                                );
+                              })
+                            );
+                          })()}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                </div>
+              </div>
+
+              {/* Form Structure Section */}
+              <div className="space-y-2">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-700 px-1">Form Structure</h3>
+                <div className="grid grid-cols-1 gap-2 md:grid-cols-5">
+                  {/* Form Name */}
+                  <Card className={`border-slate-200 bg-white shadow-sm ${filters.formName && filters.formName !== ALL_VALUE ? "ring-2 ring-blue-200" : ""}`}>
+                    <CardContent className="flex flex-col p-0">
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-start justify-between gap-2">
+                        <div>
+                          <h4 className="text-xs font-semibold text-slate-900">Form Name</h4>
+                          <p className="text-[9px] text-slate-500">grouped by Block Type</p>
+                        </div>
+                        {filters.formName && filters.formName !== ALL_VALUE && (
+                          <button
+                            onClick={() => setFilterValue("formName", ALL_VALUE)}
+                            className="p-0.5 hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors shrink-0"
+                            title="Reset filter"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
+                      <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
+                        <div className="space-y-2">
+                          {(() => {
+                            const grouped = new Map<string, Set<string>>();
+                            filteredData.forEach(record => {
+                              const blockType = normalizeValue(record.blockType) || "—";
+                              const formName = normalizeValue(record.formName);
+                              if (formName !== EMPTY_VALUE) {
+                                if (!grouped.has(blockType)) {
+                                  grouped.set(blockType, new Set());
+                                }
+                                grouped.get(blockType)!.add(formName);
+                              }
+                            });
+
+                            if (grouped.size === 0) {
+                              return <p className="text-[10px] text-slate-400">—</p>;
+                            }
+
+                            return Array.from(grouped.entries())
+                              .sort((a, b) => a[0].localeCompare(b[0]))
+                              .map(([blockType, formNames]) => (
+                                <div key={`group-${blockType}`} className="border-l-2 border-slate-200 pl-2">
+                                  <p className="text-[10px] font-semibold text-slate-600 mb-1">{blockType}</p>
+                                  <div className="flex flex-wrap gap-1">
+                                    {Array.from(formNames).sort().map((formName) => (
+                                      <button
+                                        key={`fm-${formName}`}
+                                        onClick={() => toggleFieldValue("formName", formName)}
+                                        className="block text-left text-[10px] px-2 py-1 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
+                                        title={formName}
+                                      >
+                                        {formName}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              ));
+                          })()}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  {/* Form Section */}
+                  <Card className={`border-slate-200 bg-white shadow-sm ${filters.formSection && filters.formSection !== ALL_VALUE ? "ring-2 ring-blue-200" : ""}`}>
+                    <CardContent className="flex flex-col p-0">
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-start justify-between gap-2">
+                        <div>
+                          <h4 className="text-xs font-semibold text-slate-900">Form Section</h4>
+                          <p className="text-[9px] text-slate-500">grouped by Block Name</p>
+                        </div>
+                        {filters.formSection && filters.formSection !== ALL_VALUE && (
+                          <button
+                            onClick={() => setFilterValue("formSection", ALL_VALUE)}
+                            className="p-0.5 hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors shrink-0"
+                            title="Reset filter"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
+                      <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
+                        <div className="space-y-2">
+                          {(() => {
+                            const grouped = new Map<string, Set<string>>();
+                            filteredData.forEach(record => {
+                              const blockName = normalizeValue(record.blockName) || "—";
+                              const formSection = normalizeValue(record.formSection);
+                              if (formSection !== EMPTY_VALUE) {
+                                if (!grouped.has(blockName)) {
+                                  grouped.set(blockName, new Set());
+                                }
+                                grouped.get(blockName)!.add(formSection);
+                              }
+                            });
+
+                            if (grouped.size === 0) {
+                              return <p className="text-[10px] text-slate-400">—</p>;
+                            }
+
+                            return Array.from(grouped.entries())
+                              .sort((a, b) => a[0].localeCompare(b[0]))
+                              .map(([blockName, formSections]) => (
+                                <div key={`group-${blockName}`} className="border-l-2 border-slate-200 pl-2">
+                                  <p className="text-[10px] font-semibold text-slate-600 mb-1">{blockName}</p>
+                                  <div className="flex flex-wrap gap-1">
+                                    {Array.from(formSections).sort().map((formSection) => (
+                                      <button
+                                        key={`fs-${formSection}`}
+                                        onClick={() => toggleFieldValue("formSection", formSection)}
+                                        className="block text-left text-[10px] px-2 py-1 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
+                                        title={formSection}
+                                      >
+                                        {formSection}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              ));
+                          })()}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                </div>
+              </div>
+
+              {/* Question Structure Section */}
+              <div className="space-y-2">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-700 px-1">Question Structure</h3>
+                <div className="grid grid-cols-1 gap-2 md:grid-cols-5">
+                  {/* Question Type */}
+                  <Card className={`border-slate-200 bg-white shadow-sm ${filters.questionType && filters.questionType !== ALL_VALUE ? "ring-2 ring-blue-200" : ""}`}>
+                    <CardContent className="flex flex-col p-0">
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-center justify-between">
+                        <h4 className="text-xs font-semibold text-slate-900">Question Type</h4>
+                        {filters.questionType && filters.questionType !== ALL_VALUE && (
+                          <button
+                            onClick={() => setFilterValue("questionType", ALL_VALUE)}
+                            className="p-0.5 hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors"
+                            title="Reset filter"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
+                      <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
+                        <div className="flex flex-wrap gap-2">
+                          {(() => {
+                            const seen = new Set<string>();
+                            const rows: string[] = [];
+                            filteredData.forEach(record => {
+                              const value = normalizeValue(record.questionType);
+                              if (!seen.has(value) && value !== EMPTY_VALUE) {
+                                seen.add(value);
+                                rows.push(value);
+                              }
+                            });
+                            return rows.length === 0 ? (
+                              <p className="text-[10px] text-slate-400">—</p>
+                            ) : (
+                              rows.sort().map((value, idx) => (
+                                <button
+                                  key={`qt-${idx}`}
+                                  onClick={() => toggleFieldValue("questionType", value)}
+                                  className="block w-full text-left text-[11px] px-3 py-2 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
+                                  title={value}
+                                >
+                                  {value}
+                                </button>
+                              ))
+                            );
+                          })()}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  {/* Question ID */}
+                  <Card className={`border-slate-200 bg-white shadow-sm ${filters.questionId && filters.questionId !== ALL_VALUE ? "ring-2 ring-blue-200" : ""}`}>
+                    <CardContent className="flex flex-col p-0">
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-start justify-between gap-2">
+                        <div>
+                          <h4 className="text-xs font-semibold text-slate-900">Question ID</h4>
+                          <p className="text-[9px] text-slate-500">grouped by Form Name</p>
+                        </div>
+                        {filters.questionId && filters.questionId !== ALL_VALUE && (
+                          <button
+                            onClick={() => setFilterValue("questionId", ALL_VALUE)}
+                            className="p-0.5 hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors shrink-0"
+                            title="Reset filter"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
+                      <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
+                        <div className="space-y-2">
+                          {(() => {
+                            const grouped = new Map<string, Set<string>>();
+                            filteredData.forEach(record => {
+                              const formName = normalizeValue(record.formName) || "—";
+                              const id = normalizeValue(record.questionId);
+                              if (id !== EMPTY_VALUE) {
+                                if (!grouped.has(formName)) {
+                                  grouped.set(formName, new Set());
+                                }
+                                grouped.get(formName)!.add(id);
+                              }
+                            });
+
+                            if (grouped.size === 0) {
+                              return <p className="text-[10px] text-slate-400">—</p>;
+                            }
+
+                            return Array.from(grouped.entries())
+                              .sort((a, b) => a[0].localeCompare(b[0]))
+                              .map(([formName, ids]) => (
+                                <div key={`group-${formName}`} className="border-l-2 border-slate-200 pl-2">
+                                  <p className="text-[10px] font-semibold text-slate-600 mb-1">{formName}</p>
+                                  <div className="flex flex-wrap gap-1">
+                                    {Array.from(ids).sort().map((id) => (
+                                      <button
+                                        key={`qi-${id}`}
+                                        onClick={() => toggleFieldValue("questionId", id)}
+                                        className="block text-left text-[10px] px-2 py-1 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
+                                        title={id}
+                                      >
+                                        {id}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              ));
+                          })()}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  {/* Question Title */}
+                  <Card className={`border-slate-200 bg-white shadow-sm ${filters.questionTitle && filters.questionTitle !== ALL_VALUE ? "ring-2 ring-blue-200" : ""}`}>
+                    <CardContent className="flex flex-col p-0">
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-start justify-between gap-2">
+                        <div>
+                          <h4 className="text-xs font-semibold text-slate-900">Question Title</h4>
+                          <p className="text-[9px] text-slate-500">grouped by Form Section</p>
+                        </div>
+                        {filters.questionTitle && filters.questionTitle !== ALL_VALUE && (
+                          <button
+                            onClick={() => setFilterValue("questionTitle", ALL_VALUE)}
+                            className="p-0.5 hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors shrink-0"
+                            title="Reset filter"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
+                      <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
+                        <div className="space-y-2">
+                          {(() => {
+                            const grouped = new Map<string, Set<string>>();
+                            filteredData.forEach(record => {
+                              const formSection = normalizeValue(record.formSection) || "—";
+                              const title = normalizeValue(record.questionTitle);
+                              if (title !== EMPTY_VALUE) {
+                                if (!grouped.has(formSection)) {
+                                  grouped.set(formSection, new Set());
+                                }
+                                grouped.get(formSection)!.add(title);
+                              }
+                            });
+
+                            if (grouped.size === 0) {
+                              return <p className="text-[10px] text-slate-400">—</p>;
+                            }
+
+                            return Array.from(grouped.entries())
+                              .sort((a, b) => a[0].localeCompare(b[0]))
+                              .map(([formSection, titles]) => (
+                                <div key={`group-${formSection}`} className="border-l-2 border-slate-200 pl-2">
+                                  <p className="text-[10px] font-semibold text-slate-600 mb-1">{formSection}</p>
+                                  <div className="flex flex-wrap gap-1">
+                                    {Array.from(titles).sort().map((title) => (
+                                      <button
+                                        key={`qtl-${title}`}
+                                        onClick={() => toggleFieldValue("questionTitle", title)}
+                                        className="block text-left text-[10px] px-2 py-1 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
+                                        title={title}
+                                      >
+                                        {title}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              ));
+                          })()}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  {/* Question Description */}
+                  <Card className={`border-slate-200 bg-white shadow-sm ${filters.description && filters.description !== ALL_VALUE ? "ring-2 ring-blue-200" : ""}`}>
+                    <CardContent className="flex flex-col p-0">
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-start justify-between gap-2">
+                        <div>
+                          <h4 className="text-xs font-semibold text-slate-900">Question Description</h4>
+                          <p className="text-[9px] text-slate-500">grouped by Form Section</p>
+                        </div>
+                        {filters.description && filters.description !== ALL_VALUE && (
+                          <button
+                            onClick={() => setFilterValue("description", ALL_VALUE)}
+                            className="p-0.5 hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors shrink-0"
+                            title="Reset filter"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
+                      <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
+                        <div className="space-y-2">
+                          {(() => {
+                            const grouped = new Map<string, Set<string>>();
+                            filteredData.forEach(record => {
+                              const formSection = normalizeValue(record.formSection) || "—";
+                              const description = normalizeValue(record.description);
+                              if (description !== EMPTY_VALUE) {
+                                if (!grouped.has(formSection)) {
+                                  grouped.set(formSection, new Set());
+                                }
+                                grouped.get(formSection)!.add(description);
+                              }
+                            });
+
+                            if (grouped.size === 0) {
+                              return <p className="text-[10px] text-slate-400">—</p>;
+                            }
+
+                            return Array.from(grouped.entries())
+                              .sort((a, b) => a[0].localeCompare(b[0]))
+                              .map(([formSection, descriptions]) => (
+                                <div key={`group-${formSection}`} className="border-l-2 border-slate-200 pl-2">
+                                  <p className="text-[10px] font-semibold text-slate-600 mb-1">{formSection}</p>
+                                  <div className="flex flex-wrap gap-1">
+                                    {Array.from(descriptions).sort().map((desc) => (
+                                      <button
+                                        key={`qd-${desc}`}
+                                        onClick={() => toggleFieldValue("description", desc)}
+                                        className="block text-left text-[10px] px-2 py-1 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
+                                        title={desc}
+                                      >
+                                        {desc}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              ));
+                          })()}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  {/* Question Logic Condition */}
+                  <Card className={`border-slate-200 bg-white shadow-sm ${filters.questionLogicCondition && filters.questionLogicCondition !== ALL_VALUE ? "ring-2 ring-blue-200" : ""}`}>
+                    <CardContent className="flex flex-col p-0">
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-center justify-between">
+                        <h4 className="text-xs font-semibold text-slate-900">Question Logic Condition</h4>
+                        {filters.questionLogicCondition && filters.questionLogicCondition !== ALL_VALUE && (
+                          <button
+                            onClick={() => setFilterValue("questionLogicCondition", ALL_VALUE)}
+                            className="p-0.5 hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors"
+                            title="Reset filter"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
+                      <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
+                        <div className="flex flex-wrap gap-2">
+                          {(() => {
+                            const seen = new Set<string>();
+                            const rows: string[] = [];
+                            filteredData.forEach(record => {
+                              const pairs = extractLogicPairs(record.questionLogicCondition);
+                              pairs.forEach(pair => {
+                                if (!seen.has(pair) && pair !== EMPTY_VALUE) {
+                                  seen.add(pair);
+                                  rows.push(pair);
+                                }
+                              });
+                            });
+                            return rows.length === 0 ? (
+                              <p className="text-[10px] text-slate-400">—</p>
+                            ) : (
+                              rows.sort().map((value, idx) => {
+                                const questionId = value.split(" = ")[0];
+                                return (
+                                  <button
+                                    key={`qlc-${idx}`}
+                                    onClick={() => toggleFieldValue("questionId", questionId)}
+                                    className="block w-full text-left text-[11px] px-3 py-2 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
+                                    title={value}
+                                  >
+                                    {value}
+                                  </button>
+                                );
+                              })
+                            );
+                          })()}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                </div>
+              </div>
+
+              {/* Core Data Section */}
+              <div className="space-y-2">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-700 px-1">Data Mapping</h3>
+                <div className="grid grid-cols-1 gap-2 md:grid-cols-5">
+                  {/* Core Data */}
+                  <Card className={`border-slate-200 bg-white shadow-sm ${filters.coreDataSource && filters.coreDataSource !== ALL_VALUE ? "ring-2 ring-blue-200" : ""}`}>
+                    <CardContent className="flex flex-col p-0">
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-start justify-between gap-2">
+                        <div>
+                          <h4 className="text-xs font-semibold text-slate-900">Core Data</h4>
+                          <p className="text-[9px] text-slate-500">grouped by Question Title</p>
+                        </div>
+                        {filters.coreDataSource && filters.coreDataSource !== ALL_VALUE && (
+                          <button
+                            onClick={() => setFilterValue("coreDataSource", ALL_VALUE)}
+                            className="p-0.5 hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors shrink-0"
+                            title="Reset filter"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
+                      <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
+                        <div className="space-y-2">
+                          {(() => {
+                            const grouped = new Map<string, Set<string>>();
+                            coreDataWithSource.forEach(record => {
+                              const questionTitle = normalizeValue(record.questionTitle) || "—";
+                              const coreData = normalizeValue(record.coreDataSource);
+                              if (coreData !== EMPTY_VALUE) {
+                                if (!grouped.has(questionTitle)) {
+                                  grouped.set(questionTitle, new Set());
+                                }
+                                grouped.get(questionTitle)!.add(coreData);
+                              }
+                            });
+
+                            if (grouped.size === 0) {
+                              return <p className="text-[10px] text-slate-400">—</p>;
+                            }
+
+                            return Array.from(grouped.entries())
+                              .sort((a, b) => a[0].localeCompare(b[0]))
+                              .map(([questionTitle, coreDataValues]) => (
+                                <div key={`group-${questionTitle}`} className="border-l-2 border-slate-200 pl-2">
+                                  <p className="text-[10px] font-semibold text-slate-600 mb-1">{questionTitle}</p>
+                                  <div className="flex flex-wrap gap-1">
+                                    {Array.from(coreDataValues).sort().map((coreData) => (
+                                      <button
+                                        key={`cd-${coreData}`}
+                                        onClick={() => toggleFieldValue("coreDataSource", coreData)}
+                                        className="block text-left text-[10px] px-2 py-1 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
+                                        title={coreData}
+                                      >
+                                        {coreData}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              ));
+                          })()}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                </div>
+              </div>
+
+
+            {/* End of filter cards content */}
           </div>
         </div>
 
-        <Card className="border-slate-200 bg-white shadow-sm">
-          <CardContent className="grid gap-2 p-3 md:grid-cols-[minmax(220px,1.4fr)_repeat(5,minmax(140px,1fr))]">
-            <div className="space-y-1">
-              <FilterLabel label="Search" />
-              <Input
-                className="h-8 border-slate-200 text-xs placeholder:text-slate-400"
-                placeholder="Search metadata text..."
-                value={searchText}
-                onChange={(event) => setSearchText(event.target.value)}
-              />
-            </div>
-
-            {TOOLBAR_FIELDS.map(({ field, label }) => (
-              <div className="space-y-1" key={field}>
-                <FilterLabel label={label} />
-                <Select value={filters[field] ?? ALL_VALUE} onValueChange={(value) => setFilterValue(field, value)}>
-                  <SelectTrigger className="h-8 border-slate-200 px-2 text-xs">
-                    <SelectValue placeholder={`All ${label.toLowerCase()}`} />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={ALL_VALUE}>All {label}</SelectItem>
-                    {(toolbarOptions[field] ?? []).map((value) => (
-                      <SelectItem key={value} value={value}>
-                        {value}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            ))}
-          </CardContent>
-        </Card>
-
-        {(activeFilterCount > 0 || loading) && (
-          <div className="flex min-h-8 flex-wrap items-center gap-1.5 px-1 text-[11px] text-slate-500">
-            {loading ? <span>Loading metadata...</span> : null}
-            {Object.entries(filters).map(([field, value]) => (
-              <Badge
-                key={`${field}-${value}`}
-                className="h-6 cursor-pointer rounded-md bg-slate-100 px-2 text-[11px] font-medium text-slate-700 hover:bg-slate-200"
-                variant="secondary"
-                onClick={() => setFilterValue(field as FilterField, ALL_VALUE)}
-              >
-                {FIELD_LABELS[field as FilterField]}: {value}
-                <X className="ml-1 h-3 w-3" />
-              </Badge>
-            ))}
-            {searchText ? (
-              <Badge
-                className="h-6 cursor-pointer rounded-md bg-blue-50 px-2 text-[11px] font-medium text-blue-700 hover:bg-blue-100"
-                variant="secondary"
-                onClick={() => setSearchText("")}
-              >
-                Search: {searchText}
-                <X className="ml-1 h-3 w-3" />
-              </Badge>
-            ) : null}
-          </div>
-        )}
-
-        <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-          <TabsList className="grid w-full grid-cols-3">
-            <TabsTrigger value="overview">Overview</TabsTrigger>
-            <TabsTrigger value="logic">Logic</TabsTrigger>
-            <TabsTrigger value="tags">Tags</TabsTrigger>
-          </TabsList>
-
-          <TabsContent value="overview" className="space-y-3">
-            <div className="grid items-start gap-3 lg:grid-cols-2">
-              <div className="grid auto-rows-max content-start gap-3">
-                <FilterCardTable
-                  card={sectionCards.overview.questions}
-                  filters={filters}
-                  onToggle={(field, value) => toggleFieldValue(field, value)}
-                />
-                <TagsFilterCard
-                  className={sectionCards.overview.tags.heightClass}
-                  filters={filters}
-                  rows={tagCardRows}
-                  title={sectionCards.overview.tags.title}
-                  subtitle={sectionCards.overview.tags.subtitle}
-                  onToggleWorkflow={(value) => toggleFieldValue("workflow", value)}
-                />
-              </div>
-
-              <div className="grid auto-rows-max content-start gap-3">
-                <FilterCardTable
-                  card={sectionCards.overview.block}
-                  filters={filters}
-                  onToggle={(field, value) => toggleFieldValue(field, value)}
-                />
-                <FilterCardTable
-                  card={sectionCards.overview.formSections}
-                  filters={filters}
-                  onToggle={(field, value) => toggleFieldValue(field, value)}
-                />
-                <FilterCardTable
-                  card={sectionCards.overview.coreData}
-                  filters={filters}
-                  onToggle={(field, value) => toggleFieldValue(field, value)}
-                />
-              </div>
-            </div>
-          </TabsContent>
-
-          <TabsContent value="logic" className="space-y-3">
-            {sectionCards.logic.map((row, rowIndex) => (
-              <div className="grid shrink-0 items-start grid-cols-2 gap-3" key={`logic-row-${rowIndex}`}>
-                {row.map((card) => (
-                  <FilterCardTable
-                    card={card}
-                    filters={filters}
-                    key={card.title}
-                    onToggle={(field, value) => toggleFieldValue(field, value)}
-                  />
-                ))}
-              </div>
-            ))}
-          </TabsContent>
-
-          <TabsContent value="tags">
-            <TagsFilterCard
-              className={FILTER_CARD_HEIGHT}
-              filters={filters}
-              rows={tagCardRows}
-              title="Tags"
-              subtitle="Workflow tag rules and conditions"
-              onToggleWorkflow={(value) => toggleFieldValue("workflow", value)}
-            />
-          </TabsContent>
-        </Tabs>
-
+        {/* Metadata table */}
         <Card className="border-slate-200 bg-white shadow-sm">
           <CardContent className="flex flex-col p-0">
             <div className="flex items-center justify-between border-b border-slate-200 px-3 py-2">
@@ -582,17 +1476,6 @@ function FlowsMetadataViewPage() {
               <div className="min-w-[1800px]">
                 <table className="w-full table-fixed border-collapse text-[11px] text-slate-700">
                   <thead className="sticky top-0 z-10 bg-slate-100 text-[10px] uppercase tracking-[0.08em] text-slate-600">
-                    <tr className="bg-slate-200/70 text-[10px] text-slate-700">
-                      {TABLE_COLUMN_GROUPS.map((group) => (
-                        <th
-                          className="border-b border-slate-300 px-3 py-2 text-left font-semibold"
-                          colSpan={group.span}
-                          key={group.key}
-                        >
-                          {group.label}
-                        </th>
-                      ))}
-                    </tr>
                     <tr>
                       {TABLE_COLUMNS.map((column) => (
                         <TableHead className={column.width} key={column.field}>
@@ -605,7 +1488,7 @@ function FlowsMetadataViewPage() {
                       ))}
                     </tr>
                   </thead>
-                  <tbody>
+                  <tbody className="animate-fade-in">
                     {filteredData.length === 0 ? (
                       <tr>
                         <td className="px-3 py-10 text-center text-xs text-slate-500" colSpan={TABLE_COLUMNS.length}>
@@ -687,6 +1570,25 @@ function deriveConditionSummary(rawLogic: string | undefined): string {
   }
 }
 
+function extractQuestionIdFromLogic(rawLogic: string | undefined): string {
+  const logic = normalizeString(rawLogic);
+  if (!logic || logic.toLowerCase() === "na") return EMPTY_VALUE;
+
+  try {
+    const parsed = JSON.parse(logic);
+    const nodes: Array<Record<string, unknown>> = [];
+    collectLogicNodes(parsed, nodes);
+    if (nodes.length === 0) return EMPTY_VALUE;
+
+    const first = nodes[0];
+    const primary = asObject(first.primaryField);
+    const questionId = toDisplay(primary?.questionId);
+    return questionId || EMPTY_VALUE;
+  } catch {
+    return EMPTY_VALUE;
+  }
+}
+
 function formatOperator(operator: string): string {
   switch (operator) {
     case "EQUAL":
@@ -740,15 +1642,6 @@ function normalizeRequired(value: string): string {
 
 function FilterLabel({ label }: { label: string }) {
   return <div className="px-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-500">{label}</div>;
-}
-
-function MiniStat({ label, value }: { label: string; value: number }) {
-  return (
-    <div className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-center">
-      <div className="text-[10px] uppercase tracking-[0.08em] text-slate-500">{label}</div>
-      <div className="text-sm font-semibold text-slate-900">{value}</div>
-    </div>
-  );
 }
 
 function TagsFilterCard({

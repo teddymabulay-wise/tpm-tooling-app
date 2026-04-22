@@ -183,11 +183,16 @@ export async function makeOmneaRequest<T = unknown>(
     const duration = Math.round(performance.now() - startTime);
     const contentType = response.headers.get("content-type");
     let data: unknown;
+    const rawText = await response.text();
 
-    if (contentType?.includes("application/json")) {
-      data = await response.json();
+    if (contentType?.includes("application/json") && rawText.trim()) {
+      try {
+        data = JSON.parse(rawText);
+      } catch {
+        data = rawText;
+      }
     } else {
-      data = await response.text();
+      data = rawText;
     }
 
     if (!response.ok) {

@@ -3,6 +3,7 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   Dialog,
   DialogContent,
@@ -24,8 +25,15 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { Separator } from "@/components/ui/separator";
+import { CSVUploader } from "@/components/CSVUploader";
+import { CollapsibleSection } from "@/components/CollapsibleSection";
+import { convertToCSV, downloadCSV } from "@/lib/csv-export-utils";
+import { parseFlowsMetadataCSV } from "@/lib/flows-metadata-utils";
 import { fetchAllOmneaPages, makeOmneaRequest } from "@/lib/omnea-api-utils";
 import { getOmneaEnvironmentConfig } from "@/lib/omnea-environment";
+import useMaterialityAudit from "../features/audit/materiality/hooks/useMaterialityAudit";
+import type { AuditRow } from "../features/audit/materiality/types/audit.types";
 import {
   Loader2,
   Download,
@@ -37,6 +45,11 @@ import {
   Settings2,
 } from "lucide-react";
 import { toast } from "sonner";
+
+type QuestionMetadata = {
+  title: string;
+  description: string;
+};
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -317,6 +330,262 @@ const mapSupplierDetailToRecord = (
   };
 };
 
+const formatAuditComparisonValue = (value: string | boolean | null | undefined) => {
+  if (value == null || value === "") return "-";
+  if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
+  return value;
+};
+
+const TAG_CATEGORY_PRIORITY = [
+  "Materiality Impact",
+  "Materiality Substitutability",
+  "Criticality Tier",
+  "BSP Market Tier",
+  "TP InfoSec Tier",
+  "BP InfoSec Tier",
+  "Banking Supplier",
+  "Third Party Supplier",
+  "CIF",
+  "Supportive",
+  "Outsourcing",
+  "Customer PII",
+  "PII Processed",
+  "Data Processed",
+  "Safeguarding",
+  "UT",
+  "POC",
+  "DORA ICT Services",
+  "Light Touch Supplier",
+] as const;
+
+const TAG_ANALYSIS_PRIORITY = [
+  "Materiality Impact = High",
+  "Materiality Impact = Low",
+  "Materiality Substitutability = Impossible",
+  "Materiality Substitutability = Difficult",
+  "Materiality Substitutability = Easy",
+  "Materiality Substitutability = Instant Replacement",
+  "Criticality = Tier 1",
+  "Criticality = Tier 2",
+  "Criticality = Tier 3",
+  "Criticality = Tier 4",
+  "Tier A (TP)",
+  "Tier B (TP)",
+  "Tier C (TP)",
+  "Tier D (TP)",
+  "Tier A (BP)",
+  "Tier B (BP)",
+  "Tier C (BP)",
+  "Tier D (BP)",
+  "Banking Supplier",
+  "Third Party Supplier",
+  "CIF = TRUE",
+  "Supportive = TRUE",
+  "Outsourcing = Yes",
+  "Customer PII = TRUE",
+  "PII Processed = TRUE",
+  "Data Processed = TRUE",
+  "Safeguarding = TRUE",
+  "UT = TRUE",
+  "POC = TRUE",
+  "DORA ICT Services = YES",
+  "Light Touch Supplier",
+] as const;
+
+const categoryPriorityIndex = new Map(TAG_CATEGORY_PRIORITY.map((category, index) => [category, index]));
+const analysisPriorityIndex = new Map(TAG_ANALYSIS_PRIORITY.map((tagName, index) => [tagName, index]));
+
+const getCategoryPriority = (category: string) => categoryPriorityIndex.get(category) ?? TAG_CATEGORY_PRIORITY.length;
+const getAnalysisPriority = (tagName: string) => analysisPriorityIndex.get(tagName) ?? TAG_ANALYSIS_PRIORITY.length;
+
+const buildExpectedTagLabel = (category: string, value: string | boolean | null | undefined) => {
+  if (value == null || value === "") return "No tag value provided";
+
+  if (category === "Materiality Impact") return `Materiality Impact = ${value}`;
+  if (category === "Criticality Tier") return `Criticality = Tier ${value}`;
+  if (category === "Materiality Substitutability") {
+    return value === "Instant" ? "Materiality Substitutability = Instant Replacement" : `Materiality Substitutability = ${value}`;
+  }
+  if (category === "TP InfoSec Tier") return `Tier ${value} (TP)`;
+  if (category === "BP InfoSec Tier") return `Tier ${value} (BP)`;
+  if (category === "Banking Supplier") return value === true ? "Banking Supplier" : "Not Banking Supplier";
+  if (category === "Third Party Supplier") return value === true ? "Third Party Supplier" : "Not Third Party Supplier";
+  if (category === "CIF") return value === true ? "CIF = TRUE" : "CIF = FALSE";
+  if (category === "Supportive") return value === true ? "Supportive = TRUE" : "Supportive = FALSE";
+  if (category === "Outsourcing") return value === true ? "Outsourcing = Yes" : "Outsourcing = No";
+  if (category === "Customer PII") return value === true ? "Customer PII = TRUE" : "Customer PII = FALSE";
+  if (category === "PII Processed") return value === true ? "PII Processed = TRUE" : "PII Processed = FALSE";
+  if (category === "Data Processed") return value === true ? "Data Processed = TRUE" : "Data Processed = FALSE";
+  if (category === "Safeguarding") return value === true ? "Safeguarding = TRUE" : "Safeguarding = FALSE";
+  if (category === "UT") return value === true ? "UT = TRUE" : "UT = FALSE";
+  if (category === "POC") return value === true ? "POC = TRUE" : "POC = FALSE";
+  if (category === "DORA ICT Services") return value === true ? "DORA ICT Services = YES" : "DORA ICT Services = NO";
+  if (category === "Light Touch Supplier") return value === true ? "Light Touch Supplier" : "Not Light Touch Supplier";
+  if (category === "BSP Market Tier") return `BSP - Market Tier ${value}`;
+
+  return `${category} = ${String(value)}`;
+};
+
+const normalizeQuestionMetadataKey = (value: string) => value.trim().toLowerCase();
+
+const SPECIAL_QUESTION_METADATA: Record<string, QuestionMetadata> = {
+  __infosecscore__: {
+    title: "Derived InfoSec tier",
+    description: "Synthetic audit field derived from request criticality or sensitivity tiers.",
+  },
+  __cifcheck__: {
+    title: "Derived CIF check",
+    description: "Synthetic audit check based on CIF sub-function matches across the request answers.",
+  },
+  __supportivecheck__: {
+    title: "Derived supportive check",
+    description: "Synthetic audit check based on supportive sub-function matches across the request answers.",
+  },
+  __outsourcingcheck__: {
+    title: "Derived outsourcing check",
+    description: "Synthetic audit check based on outsourcing sub-function matches across the request answers.",
+  },
+};
+
+const formatAnalysisAnswerValue = (value: string | null | undefined) => {
+  if (value == null || value === "") return "No";
+  return value;
+};
+
+const getQuestionMetadata = (questionId: string, metadataById: Record<string, QuestionMetadata>) => {
+  const normalizedQuestionId = normalizeQuestionMetadataKey(questionId);
+  return metadataById[normalizedQuestionId] ?? SPECIAL_QUESTION_METADATA[normalizedQuestionId] ?? null;
+};
+
+const sortAnalyses = (analyses: AuditRow["tagAnalysis"]) =>
+  [...analyses].sort((left, right) => {
+    const leftPriority = getAnalysisPriority(left.tagName);
+    const rightPriority = getAnalysisPriority(right.tagName);
+    if (leftPriority !== rightPriority) return leftPriority - rightPriority;
+
+    if (left.result !== right.result) {
+      if (left.result === "true") return -1;
+      if (right.result === "true") return 1;
+      if (left.result === "false") return -1;
+      if (right.result === "false") return 1;
+    }
+
+    return left.tagName.localeCompare(right.tagName);
+  });
+
+const tagAnalysisMatchesCategory = (tagName: string, category: string) => {
+  const normalizedTagName = tagName.toLowerCase();
+  const normalizedCategory = category.toLowerCase();
+
+  if (normalizedCategory === "materiality impact") return normalizedTagName.includes("materiality impact");
+  if (normalizedCategory === "criticality tier") return normalizedTagName.includes("criticality = tier");
+  if (normalizedCategory === "materiality substitutability") return normalizedTagName.includes("materiality substitutability");
+  if (normalizedCategory === "bsp market tier") return normalizedTagName.includes("bsp - market tier");
+  if (normalizedCategory === "tp infosec tier") return normalizedTagName.includes("(tp)");
+  if (normalizedCategory === "bp infosec tier") return normalizedTagName.includes("(bp)");
+  if (normalizedCategory === "banking supplier") return normalizedTagName.includes("banking supplier");
+  if (normalizedCategory === "third party supplier") return normalizedTagName.includes("third party supplier");
+  if (normalizedCategory === "cif") return normalizedTagName.includes("cif");
+  if (normalizedCategory === "supportive") return normalizedTagName.includes("supportive");
+  if (normalizedCategory === "outsourcing") return normalizedTagName.includes("outsourcing");
+  if (normalizedCategory === "customer pii") return normalizedTagName.includes("customer pii");
+  if (normalizedCategory === "pii processed") return normalizedTagName.includes("pii processed");
+  if (normalizedCategory === "data processed") return normalizedTagName.includes("data processed");
+  if (normalizedCategory === "safeguarding") return normalizedTagName.includes("safeguarding");
+  if (normalizedCategory === "ut") return normalizedTagName.includes("ut = true");
+  if (normalizedCategory === "poc") return normalizedTagName.includes("poc = true");
+  if (normalizedCategory === "dora ict services") return normalizedTagName.includes("dora ict services");
+  if (normalizedCategory === "light touch supplier") return normalizedTagName.includes("light touch supplier");
+
+  return false;
+};
+
+const getRelevantTagAnalyses = (row: AuditRow) => {
+  const mismatchCategories = [
+    ...(row.tagDiffs ?? []),
+    ...(row.apiTagDiffs ?? []),
+  ]
+    .filter((diff) => !diff.match)
+    .map((diff) => diff.category);
+
+  if (mismatchCategories.length === 0) {
+    return sortAnalyses(row.tagAnalysis.filter((analysis) => analysis.result === "true")).slice(0, 6);
+  }
+
+  return sortAnalyses(
+    row.tagAnalysis.filter((analysis) =>
+      mismatchCategories.some((category) => tagAnalysisMatchesCategory(analysis.tagName, category))
+    )
+  );
+};
+
+const getAnalysesForDiff = (row: AuditRow, category: string) =>
+  sortAnalyses(row.tagAnalysis.filter((analysis) => tagAnalysisMatchesCategory(analysis.tagName, category)));
+
+const formatConditionEvidenceForExport = (
+  condition: AuditRow["tagAnalysis"][number]["conditions"][number],
+  metadataById: Record<string, QuestionMetadata>
+) => {
+  const questionMetadata = getQuestionMetadata(condition.questionId, metadataById);
+  const title = questionMetadata?.title ? ` | title: ${questionMetadata.title}` : "";
+  const description = questionMetadata?.description ? ` | description: ${questionMetadata.description}` : "";
+
+  return [
+    `questionId: ${condition.questionId}${title}${description}`,
+    `expected: ${condition.operator} ${condition.expectedValue}`,
+    `answer: ${formatAnalysisAnswerValue(condition.actualValue)}`,
+    `triggered: ${condition.match ? "Yes" : "No"}`,
+  ].join(" | ");
+};
+
+const formatAnalysisForExport = (
+  analysis: AuditRow["tagAnalysis"][number],
+  metadataById: Record<string, QuestionMetadata>
+) => {
+  const conditionEvidence = analysis.conditions
+    .map((condition) => formatConditionEvidenceForExport(condition, metadataById))
+    .join(" || ");
+
+  return `${analysis.tagName} [${analysis.result === "true" ? "generated" : analysis.result}] - ${analysis.summary}${conditionEvidence ? ` || ${conditionEvidence}` : ""}`;
+};
+
+const buildMismatchExportRows = (rows: AuditRow[], metadataById: Record<string, QuestionMetadata>) =>
+  rows
+    .sort((left, right) => left.requestId.localeCompare(right.requestId))
+    .map((row) => {
+      const requestReasons = (row.tagDiffs ?? [])
+        .filter((diff) => !diff.match)
+        .sort((left, right) => getCategoryPriority(left.category) - getCategoryPriority(right.category))
+        .map((diff) => `${diff.category}: expected ${formatAuditComparisonValue(diff.actual)} but derived ${formatAuditComparisonValue(diff.derived)}`)
+        .join(' | ');
+
+      const supplierReasons = (row.apiTagDiffs ?? [])
+        .filter((diff) => !diff.match)
+        .sort((left, right) => getCategoryPriority(left.category) - getCategoryPriority(right.category))
+        .map((diff) => `${diff.category}: supplier record ${formatAuditComparisonValue(diff.actual)} vs derived ${formatAuditComparisonValue(diff.derived)}`)
+        .join(' | ');
+
+      const matchedAnalyses = getRelevantTagAnalyses(row)
+        .map((analysis) => formatAnalysisForExport(analysis, metadataById))
+        .join(' | ');
+
+      return {
+        requestId: row.requestId,
+        requestUuid: row.requestUuid,
+        supplier: row.supplier,
+        workflowType: row.workflowType,
+        derivedMateriality: row.derivedMateriality,
+        inputMateriality: row.actualMaterialityFromRequest ?? '',
+        supplierMateriality: row.actualMaterialityFromApi ?? '',
+        matchedSupplierName: row.matchedSupplierName ?? '',
+        matchedSupplierId: row.matchedSupplierId ?? '',
+        enrichmentStatus: row.enrichmentStatus,
+        requestTagMismatches: requestReasons,
+        supplierTagMismatches: supplierReasons,
+        tagEvidence: matchedAnalyses,
+      };
+    });
+
 // ─── Field option config ──────────────────────────────────────────────────────
 
 const BUILTIN_SUPPLIER_FIELDS: Record<FieldKey, { label: string; customFieldKey: string; supplierKey: keyof SupplierRecord; isDate?: boolean }> = {
@@ -433,6 +702,7 @@ const SUPPLIER_CACHE_TTL_MS = 10 * 60 * 1000;
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function MaterialityAuditPage() {
+  const [questionMetadataById, setQuestionMetadataById] = useState<Record<string, QuestionMetadata>>({});
   const [suppliers, setSuppliers] = useState<SupplierRecord[]>([]);
   const [loadingSuppliers, setLoadingSuppliers] = useState(false);
   const [supplierError, setSupplierError] = useState<string | null>(null);
@@ -459,6 +729,14 @@ export default function MaterialityAuditPage() {
   const [nameSearch, setNameSearch] = useState("");
   const [showFailingOnly, setShowFailingOnly] = useState(false);
   const [showPassingOnly, setShowPassingOnly] = useState(false);
+  const [expandedRequestStepAuditRowIds, setExpandedRequestStepAuditRowIds] = useState<string[]>([]);
+  const {
+    auditState: requestStepAuditState,
+    isProcessing: isRequestStepAuditProcessing,
+    error: requestStepAuditError,
+    processFile: processRequestStepAuditFile,
+    reset: resetRequestStepAudit,
+  } = useMaterialityAudit();
 
   const supplierCacheRef = useRef<{ data: SupplierRecord[]; ts: number } | null>(null);
   const supplierListCacheRef = useRef<{ data: OmneaSupplierListItem[]; ts: number } | null>(null);
@@ -486,6 +764,46 @@ export default function MaterialityAuditPage() {
     () => new Map(supplierFieldOptions.map((o) => [o.id, o])),
     [supplierFieldOptions]
   );
+
+  useEffect(() => {
+    let active = true;
+
+    const loadQuestionMetadata = async () => {
+      try {
+        const response = await fetch("/doc/Omnea Flow Meta Data.csv");
+        if (!response.ok) return;
+
+        const csvText = await response.text();
+        const metadataRows = parseFlowsMetadataCSV(csvText);
+        const nextMetadataById: Record<string, QuestionMetadata> = {};
+
+        metadataRows.forEach((record) => {
+          const questionId = normalizeQuestionMetadataKey(record.questionId);
+          if (!questionId) return;
+
+          const existing = nextMetadataById[questionId];
+          if (existing?.title && existing.description) return;
+
+          nextMetadataById[questionId] = {
+            title: record.questionTitle?.trim() ?? existing?.title ?? "",
+            description: record.description?.trim() ?? existing?.description ?? "",
+          };
+        });
+
+        if (active) {
+          setQuestionMetadataById(nextMetadataById);
+        }
+      } catch {
+        // Leave question metadata empty if the CSV cannot be loaded.
+      }
+    };
+
+    void loadQuestionMetadata();
+
+    return () => {
+      active = false;
+    };
+  }, []);
 
   // Load default conditions from file on mount
   useEffect(() => {
@@ -857,6 +1175,50 @@ export default function MaterialityAuditPage() {
 
   const failingCount = useMemo(() => auditResults.filter((r) => r.failCount > 0).length, [auditResults]);
   const passingCount = useMemo(() => auditResults.filter((r) => r.failCount === 0).length, [auditResults]);
+
+  const requestStepAuditRows = useMemo(() => {
+    if (!requestStepAuditState) return [];
+
+    return requestStepAuditState.rows
+      .map((row, index) => ({ row, index }))
+      .sort((left, right) => {
+        const leftMismatch = left.row.hasAnyMismatch === true ? 1 : 0;
+        const rightMismatch = right.row.hasAnyMismatch === true ? 1 : 0;
+
+        if (leftMismatch !== rightMismatch) {
+          return rightMismatch - leftMismatch;
+        }
+
+        return left.index - right.index;
+      })
+      .map(({ row }) => row);
+  }, [requestStepAuditState]);
+
+  const requestStepMismatchRows = useMemo(
+    () => requestStepAuditRows.filter((row) => row.hasAnyMismatch === true),
+    [requestStepAuditRows]
+  );
+
+  const requestStepRemainingRows = useMemo(
+    () => requestStepAuditRows.filter((row) => row.hasAnyMismatch !== true),
+    [requestStepAuditRows]
+  );
+
+  const exportMismatchAnalysis = () => {
+    if (requestStepMismatchRows.length === 0) return;
+
+    const csv = convertToCSV(buildMismatchExportRows(requestStepMismatchRows, questionMetadataById));
+    const timestamp = new Date().toISOString().split("T")[0];
+    downloadCSV(csv, `materiality-request-step-mismatches_${timestamp}.csv`);
+  };
+
+  const getRequestStepAuditRowId = (requestId: string, requestUuid: string) => requestUuid || requestId;
+
+  const toggleRequestStepAuditRow = (rowId: string) => {
+    setExpandedRequestStepAuditRowIds((prev) =>
+      prev.includes(rowId) ? prev.filter((id) => id !== rowId) : [...prev, rowId]
+    );
+  };
 
   const activeConditions = conditions.filter(
     (c) => c.supplierField.trim() && c.supplierValue.trim()
@@ -1561,6 +1923,441 @@ export default function MaterialityAuditPage() {
           </div>
         </DialogContent>
       </Dialog>
+
+      <Separator />
+
+      <div className="space-y-4">
+        <div>
+          <h2 className="text-xl font-semibold text-foreground">Request Step Audit</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Upload an Omnea request-steps CSV export to derive and validate materiality tags per request.
+          </p>
+        </div>
+
+        {requestStepAuditError ? (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertDescription>{requestStepAuditError}</AlertDescription>
+          </Alert>
+        ) : null}
+
+        {!requestStepAuditState ? (
+          <div className="space-y-3">
+            <CSVUploader
+              title="Request Steps CSV Upload"
+              description="Upload a request-steps CSV export to derive materiality and compare it with the CSV values."
+              defaultOpen
+              onFileLoaded={(text) => processRequestStepAuditFile(text)}
+            />
+            {isRequestStepAuditProcessing ? (
+              <Card className="flex items-center gap-2 p-4 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                <span>Processing request-step audit…</span>
+              </Card>
+            ) : null}
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div className="flex flex-wrap gap-2">
+              <Badge variant="secondary" className="px-3 py-1 text-xs">
+                {requestStepAuditState.totalRequests} Requests
+              </Badge>
+              <Badge variant="secondary" className="px-3 py-1 text-xs">
+                {requestStepAuditState.totalSuppliers} Suppliers
+              </Badge>
+              <Badge variant={requestStepAuditState.mismatchCount > 0 ? "destructive" : "secondary"} className="px-3 py-1 text-xs">
+                {requestStepAuditState.mismatchCount} Mismatches
+              </Badge>
+              <Badge variant="outline" className="px-3 py-1 text-xs">
+                {requestStepAuditState.tagDiffCount} Tag Diffs
+              </Badge>
+              <Badge variant="outline" className="px-3 py-1 text-xs">
+                Phase {requestStepAuditState.phase}/7
+              </Badge>
+            </div>
+
+            <Card className="overflow-hidden">
+              <div className="flex items-center justify-between gap-3 border-b px-4 py-3">
+                <div>
+                  <div className="text-sm font-semibold text-foreground">Highlighted Mismatches</div>
+                  <div className="text-xs text-muted-foreground">Rows with any input-tag, materiality, or supplier-record mismatch.</div>
+                </div>
+                <Button variant="outline" size="sm" onClick={exportMismatchAnalysis} disabled={requestStepMismatchRows.length === 0} className="gap-1.5">
+                  <Download className="h-3.5 w-3.5" />
+                  Export Mismatches
+                </Button>
+              </div>
+              <div className="overflow-x-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Request ID</TableHead>
+                      <TableHead>Supplier</TableHead>
+                      <TableHead>Type</TableHead>
+                      <TableHead>Derived Materiality</TableHead>
+                      <TableHead>Input Materiality</TableHead>
+                      <TableHead>Supplier Record</TableHead>
+                      <TableHead>Status</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {requestStepMismatchRows.length > 0 ? requestStepMismatchRows.map((row) => {
+                      const rowId = getRequestStepAuditRowId(row.requestId, row.requestUuid);
+                      const isExpanded = expandedRequestStepAuditRowIds.includes(rowId);
+                      const mismatchTagDiffs = (row.tagDiffs?.filter((diff) => !diff.match) ?? []).sort(
+                        (left, right) => getCategoryPriority(left.category) - getCategoryPriority(right.category)
+                      );
+                      const mismatchApiTagDiffs = (row.apiTagDiffs?.filter((diff) => !diff.match) ?? []).sort(
+                        (left, right) => getCategoryPriority(left.category) - getCategoryPriority(right.category)
+                      );
+                      const relevantAnalyses = getRelevantTagAnalyses(row);
+
+                      return (
+                        <Fragment key={rowId}>
+                          <TableRow className="bg-red-50 dark:bg-red-950/20">
+                            <TableCell className="font-mono text-xs">{row.requestId}</TableCell>
+                            <TableCell>
+                              <button
+                                type="button"
+                                onClick={() => toggleRequestStepAuditRow(rowId)}
+                                className="flex items-start gap-1.5 text-left"
+                              >
+                                <ChevronRight className={`mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-muted-foreground transition-transform ${isExpanded ? "rotate-90" : ""}`} />
+                                <div className="space-y-0.5">
+                                  <div className="font-medium text-foreground">{row.supplier || "-"}</div>
+                                  <div className="text-[10px] text-red-600 dark:text-red-400">Click to view mismatch analysis</div>
+                                </div>
+                              </button>
+                            </TableCell>
+                            <TableCell>
+                              <Badge
+                                variant={
+                                  row.workflowType === "banking"
+                                    ? "outline"
+                                    : row.workflowType === "third-party"
+                                      ? "secondary"
+                                      : "destructive"
+                                }
+                              >
+                                {row.workflowType}
+                              </Badge>
+                            </TableCell>
+                            <TableCell>
+                              <Badge
+                                variant={
+                                  row.derivedMateriality === "Material"
+                                    ? "destructive"
+                                    : row.derivedMateriality === "Non-Material"
+                                      ? "default"
+                                      : row.derivedMateriality === "Standard"
+                                        ? "secondary"
+                                        : "outline"
+                                }
+                              >
+                                {row.derivedMateriality}
+                              </Badge>
+                            </TableCell>
+                            <TableCell>{row.actualMaterialityFromRequest ?? "-"}</TableCell>
+                            <TableCell>{row.actualMaterialityFromApi ?? row.matchedSupplierName ?? "-"}</TableCell>
+                            <TableCell>
+                              <Badge variant={row.enrichmentStatus === "success" ? "secondary" : row.enrichmentStatus === "error" ? "destructive" : "outline"}>
+                                {row.enrichmentStatus}
+                              </Badge>
+                            </TableCell>
+                          </TableRow>
+
+                          {isExpanded ? (
+                            <TableRow className="bg-secondary/40 hover:bg-secondary/50">
+                              <TableCell colSpan={7} className="py-3">
+                                <div className="grid gap-4 text-sm">
+                                  <div className="rounded-md border border-red-200 bg-red-50/80 p-3 text-red-900 dark:border-red-900/60 dark:bg-red-950/20 dark:text-red-100">
+                                    <div className="font-medium">Why this row is marked as mismatch</div>
+                                    <div className="mt-2 grid gap-1 text-xs leading-5 text-red-800 dark:text-red-200">
+                                      {row.materialityDiff?.match === false ? (
+                                        <div>
+                                          The request response was classified by the supplier as <span className="font-semibold">{row.materialityDiff.actual}</span>, but the request answers derive <span className="font-semibold">{row.materialityDiff.derived}</span> from the tag logic.
+                                        </div>
+                                      ) : null}
+                                      {row.apiMaterialityDiff?.match === false ? (
+                                        <div>
+                                          The supplier record in Omnea is marked as <span className="font-semibold">{row.apiMaterialityDiff.actual}</span>, but the request answers derive <span className="font-semibold">{row.apiMaterialityDiff.derived}</span>.
+                                        </div>
+                                      ) : null}
+                                      {mismatchTagDiffs.length > 0 ? (
+                                        <div>
+                                          {mismatchTagDiffs.length} request tag comparison{mismatchTagDiffs.length === 1 ? "" : "s"} show that the tags entered on the request do not line up with the tags generated from the answers.
+                                        </div>
+                                      ) : null}
+                                      {mismatchApiTagDiffs.length > 0 ? (
+                                        <div>
+                                          {mismatchApiTagDiffs.length} supplier record tag comparison{mismatchApiTagDiffs.length === 1 ? "" : "s"} show that the current supplier record in Omnea does not line up with the tags generated from the answers.
+                                        </div>
+                                      ) : null}
+                                    </div>
+                                  </div>
+
+                                  <div className="grid gap-3 md:grid-cols-2">
+                                    <div className="rounded-md border p-3">
+                                      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Derived Analysis</div>
+                                      <div className="grid gap-1 text-xs">
+                                        <div><span className="font-medium text-foreground">Workflow Type:</span> {row.workflowType}</div>
+                                        <div><span className="font-medium text-foreground">Impact:</span> {row.derivedTags.materialityImpact ?? "-"}</div>
+                                        <div><span className="font-medium text-foreground">Substitutability:</span> {row.derivedTags.materialitySubstitutability ?? "-"}</div>
+                                        <div><span className="font-medium text-foreground">Derived Materiality:</span> {row.derivedMateriality}</div>
+                                        <div><span className="font-medium text-foreground">Matched Group:</span> {row.derivedMaterialityMatchedGroup ?? "-"}</div>
+                                        <div><span className="font-medium text-foreground">Classification Rule:</span> {row.derivedMaterialityRule ?? "-"}</div>
+                                      </div>
+                                    </div>
+
+                                    <div className="rounded-md border p-3">
+                                      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Source Comparison</div>
+                                      <div className="grid gap-1 text-xs">
+                                        <div><span className="font-medium text-foreground">Input Tags:</span> {row.actualTagsRaw ?? "-"}</div>
+                                        <div><span className="font-medium text-foreground">Input Materiality:</span> {row.actualMaterialityFromRequest ?? "-"}</div>
+                                        <div><span className="font-medium text-foreground">Supplier Match:</span> {row.matchedSupplierName ?? "-"}</div>
+                                        <div><span className="font-medium text-foreground">Supplier Materiality:</span> {row.actualMaterialityFromApi ?? "-"}</div>
+                                        <div><span className="font-medium text-foreground">Supplier Tags:</span> {row.actualTagsFromApi?.raw ?? "-"}</div>
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  {mismatchTagDiffs.length > 0 ? (
+                                    <div className="rounded-md border p-3">
+                                      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Request Tag Comparison</div>
+                                      <div className="grid gap-2 text-xs">
+                                        {mismatchTagDiffs.map((diff) => (
+                                          <div key={`request-${rowId}-${diff.category}`} className="rounded border bg-background px-3 py-2">
+                                            <div className="font-medium text-foreground">{diff.category}</div>
+                                            <div className="mt-1 text-muted-foreground">
+                                              Supplier entered tag: {buildExpectedTagLabel(diff.category, diff.actual)}
+                                            </div>
+                                            <div className="mt-1 text-muted-foreground">
+                                              Tag generated from the request answers: {buildExpectedTagLabel(diff.category, diff.derived)}
+                                            </div>
+                                            <div className="mt-1 text-foreground">
+                                              Reason: the answers given in this request support {buildExpectedTagLabel(diff.category, diff.derived)}, not {buildExpectedTagLabel(diff.category, diff.actual)}.
+                                            </div>
+
+                                            {getAnalysesForDiff(row, diff.category).length > 0 ? (
+                                              <div className="mt-2 grid gap-2">
+                                                {getAnalysesForDiff(row, diff.category).map((analysis) => (
+                                                  <CollapsibleSection
+                                                    key={`${rowId}-${diff.category}-${analysis.tagName}`}
+                                                    title={analysis.tagName}
+                                                    defaultOpen={false}
+                                                    badge={
+                                                      <Badge variant={analysis.result === "true" ? "secondary" : analysis.result === "false" ? "outline" : "destructive"}>
+                                                        {analysis.result === "true" ? "generated" : analysis.result}
+                                                      </Badge>
+                                                    }
+                                                    className="border"
+                                                  >
+                                                    <div className="text-muted-foreground">{analysis.summary}</div>
+                                                    <div className="mt-2 grid gap-2">
+                                                      {analysis.conditions.map((condition, index) => {
+                                                        const questionMetadata = getQuestionMetadata(condition.questionId, questionMetadataById);
+
+                                                        return (
+                                                          <div key={`${analysis.tagName}-${condition.questionId}-${index}`} className="rounded border px-3 py-2">
+                                                            <div className="font-medium text-foreground">{condition.questionId}</div>
+                                                            {questionMetadata?.title ? (
+                                                              <div className="mt-1 text-foreground">{questionMetadata.title}</div>
+                                                            ) : null}
+                                                            {questionMetadata?.description ? (
+                                                              <div className="mt-1 text-muted-foreground">{questionMetadata.description}</div>
+                                                            ) : null}
+                                                            <div className="mt-2"><span className="font-medium text-foreground">Expected for this tag:</span> {condition.operator} {condition.expectedValue}</div>
+                                                            <div><span className="font-medium text-foreground">Supplier answer in the request:</span> {formatAnalysisAnswerValue(condition.actualValue)}</div>
+                                                            <div><span className="font-medium text-foreground">Did this answer trigger the tag?</span> {condition.match ? "Yes" : "No"}</div>
+                                                          </div>
+                                                        );
+                                                      })}
+                                                    </div>
+                                                  </CollapsibleSection>
+                                                ))}
+                                              </div>
+                                            ) : null}
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  ) : null}
+
+                                  {mismatchApiTagDiffs.length > 0 ? (
+                                    <div className="rounded-md border p-3">
+                                      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Supplier Record Tag Comparison</div>
+                                      <div className="grid gap-2 text-xs">
+                                        {mismatchApiTagDiffs.map((diff) => (
+                                          <div key={`api-${rowId}-${diff.category}`} className="rounded border bg-background px-3 py-2">
+                                            <div className="font-medium text-foreground">{diff.category}</div>
+                                            <div className="mt-1 text-muted-foreground">Supplier record currently shows: {buildExpectedTagLabel(diff.category, diff.actual)}</div>
+                                            <div className="mt-1 text-muted-foreground">Request answers generate: {buildExpectedTagLabel(diff.category, diff.derived)}</div>
+                                            <div className="mt-1 text-foreground">Reason: the live supplier record does not reflect what this request response would derive for the same tag category.</div>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  ) : null}
+
+                                  {relevantAnalyses.length > 0 ? (
+                                    <div className="rounded-md border p-3">
+                                      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Priority Tag Evidence</div>
+                                      <div className="grid gap-3">
+                                        {relevantAnalyses.map((analysis) => (
+                                          <CollapsibleSection
+                                            key={`${rowId}-${analysis.tagName}`}
+                                            title={analysis.tagName}
+                                            defaultOpen={false}
+                                            badge={
+                                              <Badge variant={analysis.result === "true" ? "secondary" : analysis.result === "false" ? "outline" : "destructive"}>
+                                                {analysis.result === "true" ? "generated" : analysis.result}
+                                              </Badge>
+                                            }
+                                            className="bg-background"
+                                          >
+                                            <div className="text-xs text-muted-foreground">{analysis.summary}</div>
+                                            <div className="mt-2 grid gap-2 text-xs">
+                                              {analysis.conditions.map((condition, index) => {
+                                                const questionMetadata = getQuestionMetadata(condition.questionId, questionMetadataById);
+
+                                                return (
+                                                  <div key={`${analysis.tagName}-${condition.questionId}-${index}`} className="rounded border px-3 py-2">
+                                                    <div className="font-medium text-foreground">{condition.questionId}</div>
+                                                    {questionMetadata?.title ? (
+                                                      <div className="mt-1 text-foreground">{questionMetadata.title}</div>
+                                                    ) : null}
+                                                    {questionMetadata?.description ? (
+                                                      <div className="mt-1 text-muted-foreground">{questionMetadata.description}</div>
+                                                    ) : null}
+                                                    <div className="mt-2"><span className="font-medium text-foreground">Expected for this tag:</span> {condition.operator} {condition.expectedValue}</div>
+                                                    <div><span className="font-medium text-foreground">Supplier answer in the request:</span> {formatAnalysisAnswerValue(condition.actualValue)}</div>
+                                                    <div><span className="font-medium text-foreground">Did this answer trigger the tag?</span> {condition.match ? "Yes" : "No"}</div>
+                                                  </div>
+                                                );
+                                              })}
+                                            </div>
+                                          </CollapsibleSection>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  ) : null}
+
+                                  {row.derivedTags.cannotDerive.length > 0 ? (
+                                    <div className="rounded-md border border-amber-200 bg-amber-50/80 p-3 text-xs text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/20 dark:text-amber-100">
+                                      <div className="font-medium">Tags that could not be derived</div>
+                                      <p className="mt-1 leading-5">{row.derivedTags.cannotDerive.join(", ")}</p>
+                                    </div>
+                                  ) : null}
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          ) : null}
+                        </Fragment>
+                      );
+                    }) : (
+                      <TableRow>
+                        <TableCell colSpan={7} className="py-8 text-center text-sm text-muted-foreground">
+                          No mismatches detected in the uploaded request-step CSV.
+                        </TableCell>
+                      </TableRow>
+                    )}
+                  </TableBody>
+                </Table>
+              </div>
+            </Card>
+
+            <Card className="overflow-hidden">
+              <div className="border-b px-4 py-3">
+                <div className="text-sm font-semibold text-foreground">Remaining Requests</div>
+                <div className="text-xs text-muted-foreground">Requests without detected mismatches.</div>
+              </div>
+              <div className="overflow-x-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Request ID</TableHead>
+                      <TableHead>Supplier</TableHead>
+                      <TableHead>Type</TableHead>
+                      <TableHead>Derived Impact</TableHead>
+                      <TableHead>Derived Substitutability</TableHead>
+                      <TableHead>Derived Materiality</TableHead>
+                      <TableHead>Supplier Enrichment</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {requestStepRemainingRows.length > 0 ? requestStepRemainingRows.map((row) => {
+                      const rowId = getRequestStepAuditRowId(row.requestId, row.requestUuid);
+
+                      return (
+                        <TableRow key={rowId}>
+                          <TableCell className="font-mono text-xs">{row.requestId}</TableCell>
+                          <TableCell>{row.supplier || "-"}</TableCell>
+                          <TableCell>
+                            <Badge
+                              variant={
+                                row.workflowType === "banking"
+                                  ? "outline"
+                                  : row.workflowType === "third-party"
+                                    ? "secondary"
+                                    : "destructive"
+                              }
+                            >
+                              {row.workflowType}
+                            </Badge>
+                          </TableCell>
+                          <TableCell>
+                            {row.derivedTags.materialityImpact === "High" ? (
+                              <Badge variant="destructive">High</Badge>
+                            ) : row.derivedTags.materialityImpact === "Low" ? (
+                              <Badge variant="secondary">Low</Badge>
+                            ) : (
+                              "-"
+                            )}
+                          </TableCell>
+                          <TableCell>{row.derivedTags.materialitySubstitutability ?? "-"}</TableCell>
+                          <TableCell>
+                            <Badge
+                              variant={
+                                row.derivedMateriality === "Material"
+                                  ? "destructive"
+                                  : row.derivedMateriality === "Non-Material"
+                                    ? "default"
+                                    : row.derivedMateriality === "Standard"
+                                      ? "secondary"
+                                      : "outline"
+                              }
+                            >
+                              {row.derivedMateriality}
+                            </Badge>
+                          </TableCell>
+                          <TableCell>
+                            <Badge variant={row.enrichmentStatus === "success" ? "secondary" : "outline"}>
+                              {row.enrichmentStatus}
+                            </Badge>
+                          </TableCell>
+                        </TableRow>
+                      );
+                    }) : (
+                      <TableRow>
+                        <TableCell colSpan={7} className="py-8 text-center text-sm text-muted-foreground">
+                          No remaining requests to display.
+                        </TableCell>
+                      </TableRow>
+                    )}
+                  </TableBody>
+                </Table>
+              </div>
+            </Card>
+
+            <div>
+              <Button variant="ghost" size="sm" onClick={() => {
+                setExpandedRequestStepAuditRowIds([]);
+                resetRequestStepAudit();
+              }}>Reset</Button>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

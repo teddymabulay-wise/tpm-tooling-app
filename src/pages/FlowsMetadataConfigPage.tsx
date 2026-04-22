@@ -58,7 +58,6 @@ import {
 } from "@/lib/flows-metadata-utils";
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
-const METADATA_LS_KEY = "omnea_metadata_v2";
 const TAGS_LS_KEY = "omnea_tags_v1";
 const LOGIC_LS_KEY = "omnea_logic_conditions_v1";
 const EDIT_COLUMNS_WIDTH_LS_KEY = "omnea_edit_columns_width_v1";
@@ -237,19 +236,8 @@ export function FlowsMetadataConfigPage() {
   const [resizingColumn, setResizingColumn] = useState<{ table: string; field: string; startX: number; startWidth: number } | null>(null);
 
   useEffect(() => {
-    // Load metadata: prefer localStorage, fall back to CSV fetch
-    const stored = localStorage.getItem(METADATA_LS_KEY);
-    if (stored) {
-      try {
-        const parsed = JSON.parse(stored) as FlowMetadata[];
-        setData(parsed);
-        setUpdatedAt(new Date().toLocaleString());
-      } catch {
-        void loadCSVData(true);
-      }
-    } else {
-      void loadCSVData(true);
-    }
+    // Load metadata from CSV (don't use localStorage for large datasets to avoid quota issues)
+    void loadCSVData(true);
 
     // Load tags: prefer localStorage, fall back to tag CSV, then old flow extraction
     const storedTags = localStorage.getItem(TAGS_LS_KEY);
@@ -462,7 +450,6 @@ export function FlowsMetadataConfigPage() {
       const parsedData = parseFlowsMetadataCSV(content);
 
       setData(parsedData);
-      localStorage.setItem(METADATA_LS_KEY, JSON.stringify(parsedData));
       setUpdatedAt(new Date().toLocaleString());
       setHasChanges(false);
       setSelectedRows(new Set());
@@ -851,7 +838,6 @@ export function FlowsMetadataConfigPage() {
       setError(null);
       const csvContent = exportMetadataToCSV(data);
       await saveCSVToWorkspace(FLOW_CSV_FILENAME, csvContent);
-      localStorage.setItem(METADATA_LS_KEY, JSON.stringify(data));
       setUpdatedAt(new Date().toLocaleString());
       setHasChanges(false);
     } catch (saveError) {
@@ -1848,15 +1834,15 @@ export function FlowsMetadataConfigPage() {
           </Dialog>
 
           <Dialog open={isAddTagDialogOpen} onOpenChange={setIsAddTagDialogOpen}>
-            <DialogContent className="max-w-2xl border-slate-200 bg-white">
-              <DialogHeader>
+            <DialogContent className="flex h-[720px] max-h-[80vh] max-w-2xl flex-col overflow-hidden border-slate-200 bg-white">
+              <DialogHeader className="shrink-0">
                 <DialogTitle className="text-base text-slate-900">Add Tag From JSON</DialogTitle>
                 <DialogDescription>
                   Select the workflow, paste the tag JSON, and the app will resolve question IDs from the flow metadata and create the tag row.
                 </DialogDescription>
               </DialogHeader>
 
-              <div className="grid gap-4">
+              <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pr-1">
                 <div className="grid gap-1.5">
                   <FilterLabel label="Workflow" />
                   <SelectOrCreateField
@@ -1880,18 +1866,20 @@ export function FlowsMetadataConfigPage() {
                   <p className="text-xs text-slate-500">If left blank, the parsed tag name will be used.</p>
                 </div>
 
-                <div className="grid gap-1.5">
+                <div className="grid min-h-0 flex-1 gap-1.5">
                   <FilterLabel label="Tag JSON" />
-                  <Textarea
-                    className="min-h-[180px] border-slate-200 px-3 py-2 text-xs leading-5"
-                    placeholder='Paste tag JSON here, for example: {"comparisons":[...],"sourceIds":["group-0-0"]}'
-                    value={tagImportJson}
-                    onChange={(event) => setTagImportJson(event.target.value)}
-                  />
+                  <div className="min-h-0 flex-1 overflow-y-auto rounded-md border border-slate-200">
+                    <Textarea
+                      className="h-full min-h-[240px] resize-none border-0 px-3 py-2 text-xs leading-5 focus-visible:ring-0 focus-visible:ring-offset-0"
+                      placeholder='Paste tag JSON here, for example: {"comparisons":[...],"sourceIds":["group-0-0"]}'
+                      value={tagImportJson}
+                      onChange={(event) => setTagImportJson(event.target.value)}
+                    />
+                  </div>
                 </div>
 
-                <Card className="border-slate-200 bg-slate-50/80 shadow-none">
-                  <CardContent className="grid gap-3 p-4">
+                <Card className="min-h-0 border-slate-200 bg-slate-50/80 shadow-none">
+                  <CardContent className="grid max-h-[220px] gap-3 overflow-y-auto p-4">
                     <div>
                       <h3 className="text-sm font-semibold text-slate-900">Parsed Preview</h3>
                       <p className="text-xs text-slate-500">Only workflow, tag name, and parsed conditions will be added to the Tags CSV.</p>
@@ -1938,7 +1926,7 @@ export function FlowsMetadataConfigPage() {
                 </Card>
               </div>
 
-              <DialogFooter>
+              <DialogFooter className="shrink-0">
                 <Button variant="outline" onClick={() => setIsAddTagDialogOpen(false)}>Cancel</Button>
                 <Button onClick={handleAddTagFromDialog} disabled={!tagImportPreview?.result || workflowOptions.length === 0}>
                   Add Tag

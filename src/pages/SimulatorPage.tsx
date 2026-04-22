@@ -18,7 +18,8 @@ import {
   Upload, Play, Download, CheckCircle2, XCircle, Loader2,
   AlertTriangle, RotateCcw, StopCircle, ChevronDown, ArrowRight,
 } from 'lucide-react';
-import { makeOmneaRequest } from '@/lib/omnea-api-utils';
+import { toast } from 'sonner';
+import { fetchAllOmneaPages, makeOmneaRequest } from '@/lib/omnea-api-utils';
 import { getOmneaEnvironmentConfig } from '@/lib/omnea-environment';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -106,6 +107,7 @@ interface SimRow {
   omnea_supplier_id?: string;
   omnea_profile_id?: string;
   omnea_bank_id?: string;
+  stale_bank_id?: string;
   existing_omnea_id?: string;
   error_message?: string;
   error_step?: number;       // index (0-5) of the step that failed
@@ -201,6 +203,32 @@ const STEP_LABELS = [
 ] as const;
 
 const WIZARD_STEPS = ['Upload CSV', 'Pre-flight', 'Simulation', 'Results'] as const;
+
+let currencyIdByCodePromise: Promise<Map<string, string>> | null = null;
+
+async function getCurrencyIdByCode(baseUrl: string): Promise<Map<string, string>> {
+  if (!currencyIdByCodePromise) {
+    currencyIdByCodePromise = (async () => {
+      const currencies = await fetchAllOmneaPages<Record<string, unknown>>(`${baseUrl}/v1/currencies`);
+      const byCode = new Map<string, string>();
+
+      currencies.forEach((currency) => {
+        const id = typeof currency.id === 'string' ? currency.id : '';
+        const code = typeof currency.code === 'string' ? currency.code.trim().toUpperCase() : '';
+        if (id && code) {
+          byCode.set(code, id);
+        }
+      });
+
+      return byCode;
+    })().catch((error) => {
+      currencyIdByCodePromise = null;
+      throw error;
+    });
+  }
+
+  return currencyIdByCodePromise;
+}
 
 // ─── RFC 4180-compliant CSV parser ────────────────────────────────────────────
 
@@ -423,9 +451,10 @@ async function executeSimRow(
   };
   const setStep = (i: number, s: StepStatus) => { steps[i] = s; };
 
-  const fail = (i: number, msg: string, errorData?: unknown) => {
+  const fail = (i: number, msg: string, errorData?: unknown, extra: RowPatch = {}) => {
     setStep(i, 'error');
     push({
+      ...extra,
       status: 'error',
       error_message: msg,
       error_step: i,
@@ -621,7 +650,21 @@ async function executeSimRow(
     if (row.swift_code) bankEntry.swiftCode = row.swift_code;
     if (row.bank_name) bankEntry.bankName = row.bank_name;
     if (row.bank_sort_code) bankEntry.sortCode = row.bank_sort_code;
-    if (row.bank_currency_code) bankEntry.currency = { code: row.bank_currency_code };
+    if (row.bank_currency_code) {
+      const currencyCode = row.bank_currency_code.trim().toUpperCase();
+      const currencyIdByCode = await getCurrencyIdByCode(base);
+      const currencyId = currencyIdByCode.get(currencyCode);
+
+      if (!currencyId) {
+        return void fail(
+          2,
+          `Create bank account: currency code "${currencyCode}" was not found in Omnea. Provide a valid bank_currency_code or leave it blank.`,
+          { bank_currency_code: row.bank_currency_code },
+        );
+      }
+
+      bankEntry.currency = { id: currencyId };
+    }
 
     const bankRes = await makeOmneaRequest<unknown>(
       `${base}/v1/suppliers/${omnea_supplier_id}/profiles/${subsidiary_id}/bank-accounts/batch`,
@@ -654,7 +697,9 @@ async function executeSimRow(
         const hint = staleAccountId
           ? ` Stale bank ID: ${staleAccountId}. Delete it in Omnea then re-run, or use a different account number in the CSV.`
           : ' Delete the conflicting bank account in Omnea then re-run.';
-        return void fail(2, `Create bank account: ${reason}.${hint}`, bankRes.data);
+        return void fail(2, `Create bank account: ${reason}.${hint}`, bankRes.data, {
+          stale_bank_id: staleAccountId,
+        });
       } else if (isAlreadyLinked) {
         // Bank already linked to THIS profile — retrieve it
         const profileBankRes = await makeOmneaRequest<unknown>(
@@ -802,9 +847,64 @@ function StepDots({ statuses }: { statuses: StepStatus[] }) {
   );
 }
 
-function RowStatusCard({ row }: { row: SimRow }) {
+function RowStatusCard({
+  row,
+  onPrepareRerun,
+}: {
+  row: SimRow;
+  onPrepareRerun: (id: string, patch: Partial<SimRow>) => void;
+}) {
   const [rawOpen, setRawOpen] = useState(false);
+  const [deleteState, setDeleteState] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const failedStepLabel = row.error_step !== undefined ? STEP_LABELS[row.error_step] : undefined;
+
+  const canDeleteStaleBank = Boolean(
+    row.status === 'error' &&
+    row.error_step === 2 &&
+    row.stale_bank_id &&
+    row.omnea_supplier_id &&
+    row.omnea_profile_id,
+  );
+
+  const handleDeleteStaleBank = async () => {
+    if (!row.stale_bank_id || !row.omnea_supplier_id || !row.omnea_profile_id) return;
+
+    setDeleteState('running');
+    setDeleteError(null);
+
+    const config = getOmneaEnvironmentConfig();
+    const deleteRes = await makeOmneaRequest<unknown>(
+      `${config.apiBaseUrl}/v1/suppliers/${row.omnea_supplier_id}/profiles/${row.omnea_profile_id}/bank-accounts/${row.stale_bank_id}`,
+      { method: 'DELETE' },
+    );
+
+    if (deleteRes.error) {
+      setDeleteState('error');
+      setDeleteError(deleteRes.error);
+      toast.error(`Failed to delete stale bank ${row.stale_bank_id}: ${deleteRes.error}`);
+      return;
+    }
+
+    setDeleteState('done');
+    toast.success(`Deleted stale bank ${row.stale_bank_id}. You can re-run this row now.`);
+    onPrepareRerun(row._id, {
+      status: 'pending',
+      supplierIntent: 'SKIP',
+      profileIntent: 'SKIP',
+      bankIntent: 'CREATE',
+      preflightSupplierId: row.omnea_supplier_id,
+      preflightProfileSubsidiaryId: row.omnea_profile_id,
+      preflightBankId: undefined,
+      stale_bank_id: undefined,
+      error_message: undefined,
+      error_step: undefined,
+      error_raw: undefined,
+      step_statuses: Array<StepStatus>(6).fill('idle'),
+      steps_completed: 0,
+      omnea_bank_id: undefined,
+    });
+  };
 
   return (
     <div className={cn(
@@ -895,6 +995,41 @@ function RowStatusCard({ row }: { row: SimRow }) {
                   Bank account: {row.omnea_bank_id}
                 </p>
               )}
+              {row.stale_bank_id && (
+                <p className="text-[11px] font-mono text-red-600 dark:text-red-400">
+                  Stale bank: {row.stale_bank_id}
+                </p>
+              )}
+            </div>
+          )}
+
+          {canDeleteStaleBank && (
+            <div className="rounded border border-red-200 dark:border-red-900 bg-background/70 px-2 py-2 space-y-2">
+              <div className="text-[11px] text-red-700 dark:text-red-400">
+                The bank create failed because this bank account is still linked elsewhere in Omnea. You can try deleting the stale bank link directly from here.
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  onClick={handleDeleteStaleBank}
+                  disabled={deleteState === 'running' || deleteState === 'done'}
+                  className="gap-1.5 h-8"
+                >
+                  {deleteState === 'running' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <XCircle className="h-3.5 w-3.5" />}
+                  {deleteState === 'done' ? 'Stale bank deleted' : 'Delete stale bank'}
+                </Button>
+                {deleteState === 'done' && (
+                  <span className="text-[11px] text-green-700 dark:text-green-400">
+                    Delete request succeeded. Re-run this row to recreate and relink the bank account.
+                  </span>
+                )}
+                {deleteState === 'error' && deleteError && (
+                  <span className="text-[11px] text-red-700 dark:text-red-400 break-all">
+                    Delete failed: {deleteError}
+                  </span>
+                )}
+              </div>
             </div>
           )}
 
@@ -1264,6 +1399,11 @@ function Step2Preflight({
     }
 
     // 2. For each row: match supplier, then check profile if supplier exists
+    const normalizeText = (value: unknown) =>
+      typeof value === 'string'
+        ? value.trim().toLowerCase().replace(/\s+/g, ' ')
+        : '';
+
     const updated = await Promise.all(rows.map(async (row): Promise<SimRow> => {
       const nameLower = row.legal_name.trim().toLowerCase();
       const matchedSupplier = existingSuppliers.find(
@@ -1278,32 +1418,84 @@ function Step2Preflight({
       let bankIntent: EntityIntent = 'CREATE';
       let preflightBankId: string | undefined;
 
-      if (supplierId && row.profile_subsidiary_id) {
-        // Check if a profile already exists for this supplier + subsidiary
-        const profRes = await makeOmneaRequest<unknown>(
-          `${base}/v1/suppliers/${supplierId}/profiles/${row.profile_subsidiary_id}`,
-        );
-        if (!profRes.error && profRes.data) {
-          const profRecord = toSingle(profRes.data);
-          if (profRecord) {
-            profileIntent = 'SKIP';
-            preflightProfileSubsidiaryId = row.profile_subsidiary_id;
+      if (supplierId) {
+        let resolvedProfileId: string | undefined;
 
-            // Check if a bank account is already attached to this profile
-            const bankListRes = await makeOmneaRequest<unknown>(
-              `${base}/v1/suppliers/${supplierId}/profiles/${row.profile_subsidiary_id}/bank-accounts?limit=10`,
-            );
-            if (!bankListRes.error && bankListRes.data) {
-              const attachedBanks = toList(bankListRes.data);
-              if (attachedBanks.length > 0) {
-                const firstBank = attachedBanks[0];
-                bankIntent = 'SKIP';
-                preflightBankId = typeof firstBank.id === 'string' ? firstBank.id : undefined;
+        if (row.profile_subsidiary_id) {
+          // Direct profile lookup by known subsidiary/profile ID.
+          const profRes = await makeOmneaRequest<unknown>(
+            `${base}/v1/suppliers/${supplierId}/profiles/${row.profile_subsidiary_id}`,
+          );
+          if (!profRes.error && profRes.data) {
+            const profRecord = toSingle(profRes.data);
+            if (profRecord) {
+              resolvedProfileId = row.profile_subsidiary_id;
+            }
+          }
+        }
+
+        if (!resolvedProfileId) {
+          // Fallback: list profiles and match by subsidiary name/wise entity.
+          const profileListRes = await makeOmneaRequest<unknown>(
+            `${base}/v1/suppliers/${supplierId}/profiles?limit=100`,
+          );
+          if (!profileListRes.error && profileListRes.data) {
+            const profiles = toList(profileListRes.data);
+            const targetNames = [
+              normalizeText(row.profile_subsidiary_name),
+              normalizeText(row.subsidiary_name),
+              normalizeText(row.wise_entity),
+            ].filter(Boolean);
+
+            const matchedProfile = profiles.find((profile) => {
+              const subsidiary = profile.subsidiary;
+              if (!subsidiary || typeof subsidiary !== 'object') return false;
+              const subsidiaryRecord = subsidiary as Record<string, unknown>;
+              const subsidiaryName = normalizeText(subsidiaryRecord.name);
+              if (!subsidiaryName) return false;
+              return targetNames.includes(subsidiaryName);
+            });
+
+            if (matchedProfile) {
+              const subsidiary = matchedProfile.subsidiary as Record<string, unknown> | undefined;
+              if (subsidiary && typeof subsidiary.id === 'string') {
+                resolvedProfileId = subsidiary.id;
               }
             }
           }
         }
-        // 404 or error → profile doesn't exist → keep CREATE
+
+        if (resolvedProfileId) {
+          profileIntent = 'SKIP';
+          preflightProfileSubsidiaryId = resolvedProfileId;
+
+          // Check whether this specific bank already exists on the profile.
+          const bankListRes = await makeOmneaRequest<unknown>(
+            `${base}/v1/suppliers/${supplierId}/profiles/${resolvedProfileId}/bank-accounts?limit=100`,
+          );
+          if (!bankListRes.error && bankListRes.data) {
+            const attachedBanks = toList(bankListRes.data);
+            const normalizedAccountNumber = normalizeText(row.account_number);
+            const normalizedIban = normalizeText(row.iban);
+            const normalizedRemoteId = normalizeText(row.bank_remote_id || row.account_number);
+
+            const matchedBank = attachedBanks.find((bank) => {
+              const bankAccountNumber = normalizeText(bank.accountNumber);
+              const bankIban = normalizeText(bank.iban);
+              const bankRemoteId = normalizeText(bank.remoteId);
+
+              if (normalizedRemoteId && bankRemoteId && bankRemoteId === normalizedRemoteId) return true;
+              if (normalizedIban && bankIban && bankIban === normalizedIban) return true;
+              if (normalizedAccountNumber && bankAccountNumber && bankAccountNumber === normalizedAccountNumber) return true;
+              return false;
+            });
+
+            if (matchedBank && typeof matchedBank.id === 'string') {
+              bankIntent = 'SKIP';
+              preflightBankId = matchedBank.id;
+            }
+          }
+        }
       }
 
       return {
@@ -1419,6 +1611,7 @@ function Step3Execute({
   onAbort,
   onNext,
   onBack,
+  onPrepareRerun,
 }: {
   rows: SimRow[];
   isRunning: boolean;
@@ -1429,7 +1622,10 @@ function Step3Execute({
   onAbort: () => void;
   onNext: () => void;
   onBack: () => void;
+  onPrepareRerun: (id: string, patch: Partial<SimRow>) => void;
 }) {
+  const pendingCount = rows.filter(r => r.status === 'pending').length;
+  const hasPendingRows = pendingCount > 0;
   const doneCount = rows.filter(r => !['pending', 'running'].includes(r.status)).length;
   const progressPct = rows.length > 0 ? Math.round((doneCount / rows.length) * 100) : 0;
   const createdCount = rows.filter(r => r.status === 'created').length;
@@ -1443,15 +1639,17 @@ function Step3Execute({
         <div>
           <h2 className="text-lg font-semibold">Execution</h2>
           <p className="text-sm text-muted-foreground">
-            {isComplete
+            {isComplete && !hasPendingRows
               ? 'Simulation complete.'
               : isRunning
               ? `Running — ${doneCount} / ${rows.length} done`
+              : hasPendingRows
+              ? `Ready to run ${pendingCount} vendor${pendingCount !== 1 ? 's' : ''}`
               : `Ready to run ${rows.length} vendor${rows.length !== 1 ? 's' : ''}`}
           </p>
         </div>
         <div className="flex items-center gap-3">
-          {!isRunning && !isComplete && (
+          {!isRunning && hasPendingRows && (
             <>
               <Button variant="outline" size="sm" onClick={onBack}>← Back</Button>
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -1471,7 +1669,7 @@ function Step3Execute({
                 </Select>
               </div>
               <Button onClick={onStart} className="gap-1.5">
-                <Play className="h-4 w-4" /> Start simulation
+                <Play className="h-4 w-4" /> {isComplete ? 'Re-run simulation' : 'Start simulation'}
               </Button>
             </>
           )}
@@ -1480,7 +1678,7 @@ function Step3Execute({
               <StopCircle className="h-4 w-4" /> Abort
             </Button>
           )}
-          {isComplete && (
+          {isComplete && !hasPendingRows && (
             <>
               <Button variant="outline" size="sm" onClick={onBack}>← Back</Button>
               <Button onClick={onNext} className="gap-1.5">
@@ -1521,7 +1719,7 @@ function Step3Execute({
       <ScrollArea className="h-[400px] pr-2">
         <div className="space-y-2">
           {rows.map(row => (
-            <RowStatusCard key={row._id} row={row} />
+            <RowStatusCard key={row._id} row={row} onPrepareRerun={onPrepareRerun} />
           ))}
         </div>
       </ScrollArea>
@@ -1680,6 +1878,11 @@ export default function SimulatorPage() {
     setRows(updated);
   }, []);
 
+  const handlePrepareRerun = useCallback((id: string, patch: Partial<SimRow>) => {
+    setRows(prev => prev.map(r => r._id === id ? { ...r, ...patch } : r));
+    setIsComplete(false);
+  }, []);
+
   const handleProceedToSimulation = useCallback(() => {
     setStep(3);
   }, []);
@@ -1740,6 +1943,7 @@ export default function SimulatorPage() {
           onAbort={handleAbort}
           onNext={() => setStep(4)}
           onBack={() => setStep(2)}
+          onPrepareRerun={handlePrepareRerun}
         />
       )}
 

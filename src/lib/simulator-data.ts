@@ -24,13 +24,44 @@ export interface ProcessingCard {
   finalStatus: 'pending' | 'running' | 'success' | 'warning' | 'error';
 }
 
+export interface ProfileInput {
+  subsidiaryId?: string;
+  subsidiaryName?: string;
+  state: 'active' | 'archived' | 'inactive';
+  paymentMethodId?: string;
+  paymentTermsId?: string;
+  relationshipOwnerEmail?: string;
+}
+
 export interface SupplierInput {
+  // Required
   legalName: string;
-  brn: string;
-  countryIso2: string;
-  /** Name of the subsidiary (Wise entity) to create the profile under */
+  bcVendorNo: string;
   subsidiaryName: string;
-  /** Resolved Omnea subsidiary UUID — set during the Review step */
+  countryIso2: string;
+  // Optional top-level
+  legalNameRegistered?: string;
+  taxNumber?: string;
+  entityType?: 'company' | 'individual';
+  description?: string;
+  website?: string;
+  isPreferred?: boolean;
+  isReseller?: boolean;
+  // Address
+  addressStreet1?: string;
+  addressStreet2?: string;
+  city?: string;
+  stateProvince?: string;
+  postCode?: string;
+  // Custom fields
+  brn?: string;
+  materialityLevel?: string;
+  infosecCriticalityTier?: string;
+  infosecSensitivityTier?: string;
+  entityTypeCf?: string;
+  supportsCif?: string;
+  nameOfParentEntity?: string;
+  // Resolved at runtime (not from CSV)
   subsidiaryId?: string;
 }
 
@@ -40,12 +71,32 @@ export interface SubsidiaryRef {
 }
 
 export interface BankInput {
+  accountName: string;
   bankName: string;
-  bankAccountNo: string;
+  accountNumber: string;
+  currencyCode?: string;
   iban: string;
-  swiftCode: string;
-  bankCode: string; // sort code / routing / branch
-  bankCountryIso2: string;
+  swiftCode?: string;
+  sortCode?: string;
+  isPrimary: boolean;
+  addressStreet1?: string;
+  addressCity?: string;
+  addressZipCode?: string;
+  addressCountry: string;
+}
+
+export type EntityIntent = 'CREATE' | 'UPDATE' | 'SKIP' | 'UNKNOWN';
+
+export interface RowIntent {
+  supplier: EntityIntent;
+  profile: EntityIntent;
+  bank: EntityIntent;
+  existingSupplierId?: string;
+  existingProfileId?: string;
+  existingBankAccountId?: string;
+  supplierReason?: string;
+  profileReason?: string;
+  bankReason?: string;
 }
 
 export interface OmneaRecord {
@@ -54,7 +105,8 @@ export interface OmneaRecord {
   subsidiaryName: string;
   profileId: string;
   bankAccountId: string;
-  outcome: 'created' | 'duplicate' | 'partial' | 'failed';
+  outcome: 'created' | 'duplicate' | 'partial' | 'failed' | 'updated' | 'skipped';
+  intent?: RowIntent;
 }
 
 export interface AuditLogEntry {
@@ -72,18 +124,54 @@ export interface AuditLogEntry {
 
 export const CSV_REQUIRED_COLUMNS = [
   'legal_name',
+  'bc_vendor_no',
   'subsidiary_name',
   'country_iso2',
   'bank_name',
   'bank_account_no',
-  'swift_code',
+  'bank_swift_code',
   'bank_country_iso2',
 ] as const;
 
 export const CSV_OPTIONAL_COLUMNS = [
+  // Supplier top-level fields
+  'legal_name_registered',
+  'tax_number',
+  'entity_type',
+  'description',
+  'website',
+  'is_preferred',
+  'is_reseller',
+  // Address fields
+  'address_street1',
+  'address_street2',
+  'city',
+  'state_province',
+  'post_code',
+  // Custom fields
   'brn',
-  'iban',
-  'sort_code',
+  'materiality_level',
+  'infosec_criticality_tier',
+  'infosec_sensitivity_tier',
+  'entity_type_cf',
+  'supports_cif',
+  'name_of_parent_entity',
+  // Profile fields
+  'profile_subsidiary_id',
+  'profile_subsidiary_name',
+  'profile_state',
+  'profile_payment_method_id',
+  'profile_payment_terms_id',
+  'profile_relationship_owner_email',
+  // Bank account fields
+  'bank_account_name',
+  'bank_currency_code',
+  'bank_iban',
+  'bank_sort_code',
+  'bank_is_primary',
+  'bank_address_street1',
+  'bank_address_city',
+  'bank_address_zip_code',
 ] as const;
 
 // ─── Countries (ISO2) — for reference ────────────────────────────────────────

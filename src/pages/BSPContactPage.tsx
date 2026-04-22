@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { StatusPill } from "@/components/StatusPill";
 import { mockSuppliers } from "@/lib/store";
+import type { VendorProfile } from "@/lib/mock-data";
 import {
   Dialog,
   DialogContent,
@@ -60,6 +61,40 @@ const formatContactRoleLabel = (value: string) =>
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
+
+const resolveInternalContactRole = (role?: string, title?: string) => {
+  const normalizedRole = role?.trim() ?? "";
+  const normalizedTitle = title?.trim() ?? "";
+
+  if (normalizedRole.toLowerCase() === "other" && normalizedTitle) {
+    return normalizedTitle;
+  }
+
+  if (!normalizedRole && normalizedTitle) {
+    return normalizedTitle;
+  }
+
+  return normalizedRole;
+};
+
+const readContactRoleValue = (value: unknown): string | undefined => {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed || undefined;
+  }
+
+  if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const fromTitle = typeof obj.title === "string" ? obj.title.trim() : "";
+    if (fromTitle) return fromTitle;
+    const fromName = typeof obj.name === "string" ? obj.name.trim() : "";
+    if (fromName) return fromName;
+    const fromValue = typeof obj.value === "string" ? obj.value.trim() : "";
+    if (fromValue) return fromValue;
+  }
+
+  return undefined;
+};
 
 const normalizeSupplierRoleForApi = (
   rawRole: string,
@@ -152,7 +187,7 @@ type SupplierAssignFailure = {
 };
 
 type PendingProductionAction = "assign-suppliers" | "add-unassigned";
-type AssignmentTableView = "users" | "suppliers";
+type AssignmentTableView = "users" | "suppliers" | "internal-roles";
 
 interface BSPUser {
   id: string;
@@ -174,11 +209,13 @@ type SupplierLoadScope = "non-bsp" | "bsp" | "all";
 
 // Session Storage helpers for caching Omnea data across page navigation
 const OMNEA_CACHE_KEYS = {
+  VERSION: "bsp_contact_cache_version",
   INTERNAL_CONTACTS: "bsp_contact_internal_contacts",
   OMNEA_ASSIGNMENTS: "bsp_contact_omnea_assignments",
   OMNEA_USERS: "bsp_contact_omnea_users",
   SUPPLIERS: "bsp_contact_suppliers",
 };
+const OMNEA_CACHE_VERSION = "v2";
 
 const saveBspContactDataToCache = (
   contacts: Array<{
@@ -214,6 +251,7 @@ const saveBspContactDataToCache = (
   }>
 ) => {
   try {
+    sessionStorage.setItem(OMNEA_CACHE_KEYS.VERSION, OMNEA_CACHE_VERSION);
     sessionStorage.setItem(OMNEA_CACHE_KEYS.INTERNAL_CONTACTS, JSON.stringify(contacts));
     sessionStorage.setItem(OMNEA_CACHE_KEYS.OMNEA_ASSIGNMENTS, JSON.stringify(assignments));
     sessionStorage.setItem(OMNEA_CACHE_KEYS.OMNEA_USERS, JSON.stringify(users));
@@ -225,6 +263,12 @@ const saveBspContactDataToCache = (
 
 const loadBspContactDataFromCache = () => {
   try {
+    const cacheVersion = sessionStorage.getItem(OMNEA_CACHE_KEYS.VERSION);
+    if (cacheVersion !== OMNEA_CACHE_VERSION) {
+      clearBspContactDataCache();
+      return null;
+    }
+
     const cachedContacts = sessionStorage.getItem(OMNEA_CACHE_KEYS.INTERNAL_CONTACTS);
     const cachedAssignments = sessionStorage.getItem(OMNEA_CACHE_KEYS.OMNEA_ASSIGNMENTS);
     const cachedUsers = sessionStorage.getItem(OMNEA_CACHE_KEYS.OMNEA_USERS);
@@ -247,6 +291,7 @@ const loadBspContactDataFromCache = () => {
 
 const clearBspContactDataCache = () => {
   try {
+    sessionStorage.removeItem(OMNEA_CACHE_KEYS.VERSION);
     sessionStorage.removeItem(OMNEA_CACHE_KEYS.INTERNAL_CONTACTS);
     sessionStorage.removeItem(OMNEA_CACHE_KEYS.OMNEA_ASSIGNMENTS);
     sessionStorage.removeItem(OMNEA_CACHE_KEYS.OMNEA_USERS);
@@ -286,6 +331,10 @@ const initialUsers: BSPUser[] = [
     assignedSupplierIds: [],
   },
 ];
+
+function isVendorProfile(s: any): s is VendorProfile {
+  return s && typeof s.legalName === "string";
+}
 
 const BSPContactPage = () => {
   const [users, setUsers] = useState<BSPUser[]>(initialUsers);
@@ -720,8 +769,10 @@ const BSPContactPage = () => {
     );
   };
 
-  const getSupplierName = (id: string) =>
-    mockSuppliers.find((s) => s.id === id)?.legalName || id;
+  const getSupplierName = (id: string) => {
+    const supplier = mockSuppliers.find((s) => s.id === id);
+    return supplier ? supplier.legalName : id;
+  };
 
   const currentUser = users.find((u) => u.id === addModalUserId);
   const currentOmneaUser = omneaAssignments.find((u) => u.userId === addModalUserId);
@@ -1090,8 +1141,17 @@ const BSPContactPage = () => {
                     : item.email
                     ? String(item.email)
                     : undefined;
-                const role =
-                  String(item.role || (user && user.role) || "");
+                const role = resolveInternalContactRole(
+                  readContactRoleValue(item.role) ??
+                    readContactRoleValue(item.internalContactRole) ??
+                    readContactRoleValue(item.contactRole) ??
+                    (user ? readContactRoleValue(user.role) : undefined),
+                  typeof item.title === "string"
+                    ? item.title
+                    : typeof item.contactTitle === "string"
+                    ? item.contactTitle
+                    : undefined
+                );
 
                 if (!userId || !name) return;
 
@@ -1134,6 +1194,7 @@ const BSPContactPage = () => {
           bspSuppliers: string[];
           nonBspSuppliers: string[];
           assignedSupplierIds: Set<string>;
+          supplierRoles: Record<string, string>;
         }
       >();
 
@@ -1151,6 +1212,9 @@ const BSPContactPage = () => {
             existing.nonBspSuppliers.push(supplierName);
           }
           existing.assignedSupplierIds.add(supplierId);
+          if (contact.role) {
+            existing.supplierRoles[supplierId] = contact.role;
+          }
           if (!existing.role && contact.role) existing.role = contact.role;
           if (!existing.email && contact.email) existing.email = contact.email;
         } else {
@@ -1161,6 +1225,7 @@ const BSPContactPage = () => {
             bspSuppliers: isBsp ? [supplierName] : [],
             nonBspSuppliers: !isBsp && hasEntityType ? [supplierName] : [],
             assignedSupplierIds: new Set([supplierId]),
+            supplierRoles: contact.role ? { [supplierId]: contact.role } : {},
           });
         }
       });
@@ -1173,6 +1238,7 @@ const BSPContactPage = () => {
         bspSuppliers: user.bspSuppliers,
         nonBspSuppliers: user.nonBspSuppliers,
         assignedSupplierIds: Array.from(user.assignedSupplierIds),
+        supplierRoles: user.supplierRoles,
       }));
 
       if (normalizedUsers.length === 0) {
@@ -1236,7 +1302,7 @@ const BSPContactPage = () => {
     const query = supplierSearch.trim().toLowerCase();
     if (!query) return true;
 
-    const supplierName = ("name" in supplier ? supplier.name : supplier.legalName) || "";
+    const supplierName = supplier && 'legalName' in supplier ? supplier.legalName : "";
     const supplierTaxNumber = supplier.taxNumber || "";
     const supplierStatus = supplier.status || "";
 
@@ -1250,6 +1316,39 @@ const BSPContactPage = () => {
   const nonBspAssignments = omneaAssignments.filter((u) => u.nonBspSuppliers.length > 0);
   const bspInternalContacts = internalContacts.filter((contact) => isBspEntityType(contact.supplierEntityType));
   const nonBspInternalContacts = internalContacts.filter((contact) => !isBspEntityType(contact.supplierEntityType));
+  const userScopedSupplierDetails = useMemo(() => {
+    const grouped = new Map<
+      string,
+      {
+        bsp: Array<{ supplierId: string; supplierName: string; role?: string }>;
+        nonBsp: Array<{ supplierId: string; supplierName: string; role?: string }>;
+      }
+    >();
+
+    internalContacts.forEach((contact) => {
+      if (!contact.userId || !contact.supplierId) return;
+
+      const existing = grouped.get(contact.userId) ?? { bsp: [], nonBsp: [] };
+      const target = isBspEntityType(contact.supplierEntityType) ? existing.bsp : existing.nonBsp;
+
+      if (!target.some((entry) => entry.supplierId === contact.supplierId)) {
+        target.push({
+          supplierId: contact.supplierId,
+          supplierName: contact.supplierName,
+          role: contact.role,
+        });
+      }
+
+      grouped.set(contact.userId, existing);
+    });
+
+    grouped.forEach((value) => {
+      value.bsp.sort((left, right) => left.supplierName.localeCompare(right.supplierName));
+      value.nonBsp.sort((left, right) => left.supplierName.localeCompare(right.supplierName));
+    });
+
+    return grouped;
+  }, [internalContacts]);
   const bspSupplierAssignments = useMemo(() => {
     const grouped = new Map<
       string,
@@ -1338,6 +1437,84 @@ const BSPContactPage = () => {
       left.supplierName.localeCompare(right.supplierName)
     );
   }, [nonBspInternalContacts]);
+
+  const buildRoleAssignments = (
+    contacts: OmneaContact[]
+  ): Array<{
+    role: string;
+    users: Array<{ userId: string; name: string; email?: string }>;
+    suppliers: Array<{ supplierId: string; supplierName: string }>;
+  }> => {
+    const grouped = new Map<
+      string,
+      {
+        role: string;
+        users: Map<string, { userId: string; name: string; email?: string }>;
+        suppliers: Map<string, { supplierId: string; supplierName: string }>;
+      }
+    >();
+
+    contacts.forEach((contact) => {
+      const role = contact.role?.trim() || "Unspecified";
+      const existing = grouped.get(role);
+
+      if (!existing) {
+        const users = new Map<string, { userId: string; name: string; email?: string }>();
+        users.set(contact.userId, {
+          userId: contact.userId,
+          name: contact.name,
+          email: contact.email,
+        });
+
+        const suppliers = new Map<string, { supplierId: string; supplierName: string }>();
+        suppliers.set(contact.supplierId, {
+          supplierId: contact.supplierId,
+          supplierName: contact.supplierName,
+        });
+
+        grouped.set(role, {
+          role,
+          users,
+          suppliers,
+        });
+        return;
+      }
+
+      if (!existing.users.has(contact.userId)) {
+        existing.users.set(contact.userId, {
+          userId: contact.userId,
+          name: contact.name,
+          email: contact.email,
+        });
+      }
+
+      if (!existing.suppliers.has(contact.supplierId)) {
+        existing.suppliers.set(contact.supplierId, {
+          supplierId: contact.supplierId,
+          supplierName: contact.supplierName,
+        });
+      }
+    });
+
+    return Array.from(grouped.values())
+      .map((entry) => ({
+        role: entry.role,
+        users: Array.from(entry.users.values()).sort((left, right) => left.name.localeCompare(right.name)),
+        suppliers: Array.from(entry.suppliers.values()).sort((left, right) =>
+          left.supplierName.localeCompare(right.supplierName)
+        ),
+      }))
+      .sort((left, right) => left.role.localeCompare(right.role));
+  };
+
+  const bspRoleAssignments = useMemo(
+    () => buildRoleAssignments(bspInternalContacts),
+    [bspInternalContacts]
+  );
+  const nonBspRoleAssignments = useMemo(
+    () => buildRoleAssignments(nonBspInternalContacts),
+    [nonBspInternalContacts]
+  );
 
   const handleDownloadTableCsv = (scope: "bsp" | "non-bsp") => {
     const csvContent = buildInternalContactsCsv(scope === "bsp" ? bspInternalContacts : nonBspInternalContacts);
@@ -1681,12 +1858,13 @@ const BSPContactPage = () => {
                   value={assignmentTableView}
                   onValueChange={(value) => setAssignmentTableView(value as AssignmentTableView)}
                 >
-                  <SelectTrigger className="h-7 w-[140px] text-xs">
+                  <SelectTrigger className="h-7 w-[170px] text-xs">
                     <SelectValue placeholder="Change view" />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="users">View by user</SelectItem>
                     <SelectItem value="suppliers">View by supplier</SelectItem>
+                    <SelectItem value="internal-roles">View by internal role</SelectItem>
                   </SelectContent>
                 </Select>
                 <Button
@@ -1719,11 +1897,17 @@ const BSPContactPage = () => {
                     <TableHead>BSP Suppliers</TableHead>
                     <TableHead className="w-[100px]">Actions</TableHead>
                   </TableRow>
-                ) : (
+                ) : assignmentTableView === "suppliers" ? (
                   <TableRow>
                     <TableHead className="w-[260px]">Supplier</TableHead>
                     <TableHead className="w-[160px]">Entity Type</TableHead>
                     <TableHead>Assigned Users</TableHead>
+                  </TableRow>
+                ) : (
+                  <TableRow>
+                    <TableHead className="w-[220px]">Internal Role</TableHead>
+                    <TableHead>Assigned Users</TableHead>
+                    <TableHead>Suppliers</TableHead>
                   </TableRow>
                 )}
               </TableHeader>
@@ -1731,9 +1915,16 @@ const BSPContactPage = () => {
                 {assignmentTableView === "users" && bspAssignments.length > 0 ? (
                   bspAssignments.map((u) => (
                     <TableRow key={`${u.userId}-${u.name}`}>
+                      {(() => {
+                        const bspSuppliersForUser = userScopedSupplierDetails.get(u.userId)?.bsp ?? [];
+                        return (
+                          <>
                       <TableCell>
                         <div>
                           <p className="text-sm font-medium text-foreground">{u.name}</p>
+                          <p className="text-[11px] text-muted-foreground">
+                            {bspSuppliersForUser.length} BSP supplier{bspSuppliersForUser.length === 1 ? "" : "s"}
+                          </p>
                           <p className="text-[11px] text-muted-foreground flex items-center gap-1">
                             <Mail className="h-3 w-3" />
                             {u.email || "—"}
@@ -1742,17 +1933,14 @@ const BSPContactPage = () => {
                       </TableCell>
                       <TableCell>
                         <div className="flex flex-wrap items-center gap-1.5">
-                          {u.bspSuppliers.map((supplierName, index) => {
-                            const supplierId = u.assignedSupplierIds.find(
-                              (id) => allSuppliers.find((s) => s.id === id)?.name === supplierName
-                            );
-                            const supplierRole = supplierId ? u.supplierRoles?.[supplierId] : undefined;
+                          {bspSuppliersForUser.map((supplier, index) => {
+                            const supplierRole = supplier.role ?? u.supplierRoles?.[supplier.supplierId];
                             return (
-                              <Badge key={`${u.userId}-${supplierName}-${index}`} variant="secondary" className="px-2 py-1 flex flex-col items-start gap-0">
-                                <span className="text-[11px] font-medium">{supplierName}</span>
-                                {supplierRole && (
-                                  <span className="text-[9px] text-muted-foreground font-normal leading-none">{supplierRole}</span>
-                                )}
+                              <Badge key={`${u.userId}-${supplier.supplierId}-${index}`} variant="secondary" className="px-2 py-1 flex flex-col items-start gap-0">
+                                <span className="text-[11px] font-medium">{supplier.supplierName}</span>
+                                <span className="text-[9px] text-muted-foreground font-normal leading-none">
+                                  {supplierRole ? formatContactRoleLabel(supplierRole) : "Role not set"}
+                                </span>
                               </Badge>
                             );
                           })}
@@ -1769,6 +1957,9 @@ const BSPContactPage = () => {
                           Add
                         </Button>
                       </TableCell>
+                          </>
+                        );
+                      })()}
                     </TableRow>
                   ))
                 ) : assignmentTableView === "suppliers" && bspSupplierAssignments.length > 0 ? (
@@ -1801,13 +1992,54 @@ const BSPContactPage = () => {
                       </TableCell>
                     </TableRow>
                   ))
+                ) : assignmentTableView === "internal-roles" && bspRoleAssignments.length > 0 ? (
+                  bspRoleAssignments.map((roleGroup) => (
+                    <TableRow key={`bsp-role-${roleGroup.role}`}>
+                      <TableCell>
+                        <div>
+                          <p className="text-sm font-medium text-foreground">{formatContactRoleLabel(roleGroup.role)}</p>
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {roleGroup.users.map((user) => (
+                            <Badge
+                              key={`${roleGroup.role}-${user.userId}`}
+                              variant="secondary"
+                              className="px-2 py-1 flex flex-col items-start gap-0"
+                            >
+                              <span className="text-[11px] font-medium">{user.name}</span>
+                              <span className="text-[9px] text-muted-foreground font-normal leading-none">
+                                {user.email || user.userId}
+                              </span>
+                            </Badge>
+                          ))}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {roleGroup.suppliers.map((supplier) => (
+                            <Badge
+                              key={`${roleGroup.role}-${supplier.supplierId}`}
+                              variant="outline"
+                              className="px-2 py-1"
+                            >
+                              {supplier.supplierName}
+                            </Badge>
+                          ))}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))
                 ) : hasLoadedOmneaContacts ? (
                   <TableRow>
                     <TableCell colSpan={3}>
                       <p className="text-sm text-muted-foreground">
                         {assignmentTableView === "users"
                           ? "Data loaded, but no BSP assignments were found for users with internal contacts."
-                          : "Data loaded, but no BSP suppliers with assigned users were found."}
+                          : assignmentTableView === "suppliers"
+                          ? "Data loaded, but no BSP suppliers with assigned users were found."
+                          : "Data loaded, but no BSP internal role assignments were found."}
                       </p>
                     </TableCell>
                   </TableRow>
@@ -1835,12 +2067,13 @@ const BSPContactPage = () => {
                   value={assignmentTableView}
                   onValueChange={(value) => setAssignmentTableView(value as AssignmentTableView)}
                 >
-                  <SelectTrigger className="h-7 w-[140px] text-xs">
+                  <SelectTrigger className="h-7 w-[170px] text-xs">
                     <SelectValue placeholder="Change view" />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="users">View by user</SelectItem>
                     <SelectItem value="suppliers">View by supplier</SelectItem>
+                    <SelectItem value="internal-roles">View by internal role</SelectItem>
                   </SelectContent>
                 </Select>
                 <Button
@@ -1873,11 +2106,17 @@ const BSPContactPage = () => {
                     <TableHead>Non-BSP Suppliers</TableHead>
                     <TableHead className="w-[100px]">Actions</TableHead>
                   </TableRow>
-                ) : (
+                ) : assignmentTableView === "suppliers" ? (
                   <TableRow>
                     <TableHead className="w-[260px]">Supplier</TableHead>
                     <TableHead className="w-[160px]">Entity Type</TableHead>
                     <TableHead>Assigned Users</TableHead>
+                  </TableRow>
+                ) : (
+                  <TableRow>
+                    <TableHead className="w-[220px]">Internal Role</TableHead>
+                    <TableHead>Assigned Users</TableHead>
+                    <TableHead>Suppliers</TableHead>
                   </TableRow>
                 )}
               </TableHeader>
@@ -1885,9 +2124,16 @@ const BSPContactPage = () => {
                 {assignmentTableView === "users" && nonBspAssignments.length > 0 ? (
                   nonBspAssignments.map((u) => (
                     <TableRow key={`non-bsp-${u.userId}-${u.name}`}>
+                      {(() => {
+                        const nonBspSuppliersForUser = userScopedSupplierDetails.get(u.userId)?.nonBsp ?? [];
+                        return (
+                          <>
                       <TableCell>
                         <div>
                           <p className="text-sm font-medium text-foreground">{u.name}</p>
+                          <p className="text-[11px] text-muted-foreground">
+                            {nonBspSuppliersForUser.length} Non-BSP supplier{nonBspSuppliersForUser.length === 1 ? "" : "s"}
+                          </p>
                           <p className="text-[11px] text-muted-foreground flex items-center gap-1">
                             <Mail className="h-3 w-3" />
                             {u.email || "—"}
@@ -1896,17 +2142,14 @@ const BSPContactPage = () => {
                       </TableCell>
                       <TableCell>
                         <div className="flex flex-wrap items-center gap-1.5">
-                          {u.nonBspSuppliers.map((supplierName, index) => {
-                            const supplierId = u.assignedSupplierIds.find(
-                              (id) => allSuppliers.find((s) => s.id === id)?.name === supplierName
-                            );
-                            const supplierRole = supplierId ? u.supplierRoles?.[supplierId] : undefined;
+                          {nonBspSuppliersForUser.map((supplier, index) => {
+                            const supplierRole = supplier.role ?? u.supplierRoles?.[supplier.supplierId];
                             return (
-                              <Badge key={`non-${u.userId}-${supplierName}-${index}`} variant="secondary" className="px-2 py-1 flex flex-col items-start gap-0">
-                                <span className="text-[11px] font-medium">{supplierName}</span>
-                                {supplierRole && (
-                                  <span className="text-[9px] text-muted-foreground font-normal leading-none">{supplierRole}</span>
-                                )}
+                              <Badge key={`non-${u.userId}-${supplier.supplierId}-${index}`} variant="secondary" className="px-2 py-1 flex flex-col items-start gap-0">
+                                <span className="text-[11px] font-medium">{supplier.supplierName}</span>
+                                <span className="text-[9px] text-muted-foreground font-normal leading-none">
+                                  {supplierRole ? formatContactRoleLabel(supplierRole) : "Role not set"}
+                                </span>
                               </Badge>
                             );
                           })}
@@ -1923,6 +2166,9 @@ const BSPContactPage = () => {
                           Add
                         </Button>
                       </TableCell>
+                          </>
+                        );
+                      })()}
                     </TableRow>
                   ))
                 ) : assignmentTableView === "suppliers" && nonBspSupplierAssignments.length > 0 ? (
@@ -1955,6 +2201,45 @@ const BSPContactPage = () => {
                       </TableCell>
                     </TableRow>
                   ))
+                ) : assignmentTableView === "internal-roles" && nonBspRoleAssignments.length > 0 ? (
+                  nonBspRoleAssignments.map((roleGroup) => (
+                    <TableRow key={`non-bsp-role-${roleGroup.role}`}>
+                      <TableCell>
+                        <div>
+                          <p className="text-sm font-medium text-foreground">{formatContactRoleLabel(roleGroup.role)}</p>
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {roleGroup.users.map((user) => (
+                            <Badge
+                              key={`${roleGroup.role}-${user.userId}`}
+                              variant="secondary"
+                              className="px-2 py-1 flex flex-col items-start gap-0"
+                            >
+                              <span className="text-[11px] font-medium">{user.name}</span>
+                              <span className="text-[9px] text-muted-foreground font-normal leading-none">
+                                {user.email || user.userId}
+                              </span>
+                            </Badge>
+                          ))}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {roleGroup.suppliers.map((supplier) => (
+                            <Badge
+                              key={`${roleGroup.role}-${supplier.supplierId}`}
+                              variant="outline"
+                              className="px-2 py-1"
+                            >
+                              {supplier.supplierName}
+                            </Badge>
+                          ))}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))
                 ) : (
                   <TableRow>
                     <TableCell colSpan={3}>
@@ -1962,7 +2247,9 @@ const BSPContactPage = () => {
                         {hasLoadedOmneaContacts
                           ? assignmentTableView === "users"
                             ? "No non-BSP supplier assignments found."
-                            : "No non-BSP suppliers with assigned users were found."
+                            : assignmentTableView === "suppliers"
+                            ? "No non-BSP suppliers with assigned users were found."
+                            : "No non-BSP internal role assignments were found."
                           : 'No data loaded. Click "Load Omnea internal contacts" to fetch user assignments.'}
                       </p>
                     </TableCell>
@@ -2303,7 +2590,7 @@ const BSPContactPage = () => {
                         disabled={isAssigningSuppliers}
                       />
                       <div className="min-w-0 flex-1">
-                        <p className="text-sm font-medium text-foreground">{("name" in s ? s.name : s.legalName) || "Unnamed supplier"}</p>
+                        <p className="text-sm font-medium text-foreground">{s && 'legalName' in s ? s.legalName : "Unnamed supplier"}</p>
                         <p className="text-[11px] text-muted-foreground">
                           {s.taxNumber} · {s.status}
                         </p>
@@ -2421,7 +2708,7 @@ const BSPContactPage = () => {
       <Sheet open={!!detailSupplierId} onOpenChange={(o) => !o && setDetailSupplierId(null)}>
         <SheetContent className="sm:max-w-md">
           <SheetHeader>
-            <SheetTitle>{detailSupplier?.legalName}</SheetTitle>
+            <SheetTitle>{detailSupplier && 'legalName' in detailSupplier ? detailSupplier.legalName : null}</SheetTitle>
           </SheetHeader>
           {detailSupplier && (
             <div className="mt-4 space-y-4">

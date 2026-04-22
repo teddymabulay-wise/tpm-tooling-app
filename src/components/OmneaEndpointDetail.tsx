@@ -90,9 +90,16 @@ interface OmneaMatch {
   score: number;
 }
 
+interface OngoingMatch {
+  supplier: string;
+  state: string;
+  score: number;
+}
+
 interface CsvMatchResult {
   csvName: string;
-  matches: OmneaMatch[]; // empty array = not found
+  matches: OmneaMatch[];           // empty = not found in Omnea
+  ongoingMatch: OngoingMatch | null; // best match from ongoing requests CSV (only when matches is empty)
 }
 
 const FUZZY_THRESHOLD = 0.72;
@@ -163,7 +170,11 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
   const [csvProgress, setCsvProgress] = useState<{ phase: 'fetching'; fetched: number } | { phase: 'matching'; matched: number; total: number } | null>(null);
   const [noiseWordsInput, setNoiseWordsInput] = useState(DEFAULT_NOISE_WORDS.join(', '));
   const [noiseSettingsOpen, setNoiseSettingsOpen] = useState(false);
-  const [csvTableOpen, setCsvTableOpen] = useState<{ perfect: boolean; partial: boolean; notFound: boolean }>({ perfect: true, partial: true, notFound: true });
+  const [csvTableOpen, setCsvTableOpen] = useState<{ perfect: boolean; partial: boolean; ongoing: boolean; notFound: boolean }>({ perfect: true, partial: true, ongoing: true, notFound: true });
+  // Ongoing requests CSV (Supplier, State columns)
+  const ongoingInputRef = useRef<HTMLInputElement>(null);
+  const [ongoingRequests, setOngoingRequests] = useState<Array<{ supplier: string; state: string }>>([]);
+  const [ongoingFileName, setOngoingFileName] = useState<string>('');
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({});
   const [response, setResponse] = useState<Record<string, unknown> | null>(null);
   const [loading, setLoading] = useState(false);
@@ -254,6 +265,27 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
     reader.readAsText(file);
   };
 
+  const parseOngoingCsvFile = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = (e.target?.result as string) ?? '';
+      const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      // Skip header row (Supplier, State)
+      const dataLines = lines[0]?.toLowerCase().includes('supplier') ? lines.slice(1) : lines;
+      const rows = dataLines.map(line => {
+        // Handle quoted CSV values
+        const parts = line.match(/("([^"]*)"|([^,]*)),("([^"]*)"|([^,]*))/);
+        const supplier = (parts?.[2] ?? parts?.[3] ?? line.split(',')[0] ?? '').trim();
+        const state = (parts?.[5] ?? parts?.[6] ?? line.split(',')[1] ?? '').trim();
+        return { supplier, state };
+      }).filter(r => r.supplier);
+      setOngoingRequests(rows);
+      setOngoingFileName(file.name);
+      setCsvResults(null);
+    };
+    reader.readAsText(file);
+  };
+
   const runCsvLookup = async () => {
     if (csvNames.length === 0) {
       toast.error('Upload a CSV with supplier names first');
@@ -283,7 +315,23 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
           if (score >= FUZZY_THRESHOLD) matches.push({ name, id, score });
         }
         matches.sort((a, b) => b.score - a.score);
-        results.push({ csvName, matches });
+
+        // If not found in Omnea, check ongoing requests as a second data point
+        let ongoingMatch: OngoingMatch | null = null;
+        if (matches.length === 0 && ongoingRequests.length > 0) {
+          let bestScore = 0;
+          let bestRow: { supplier: string; state: string } | null = null;
+          for (const row of ongoingRequests) {
+            const score = combinedScore(csvName, row.supplier, noiseSet);
+            if (score >= FUZZY_THRESHOLD && score > bestScore) {
+              bestScore = score;
+              bestRow = row;
+            }
+          }
+          if (bestRow) ongoingMatch = { supplier: bestRow.supplier, state: bestRow.state, score: bestScore };
+        }
+
+        results.push({ csvName, matches, ongoingMatch });
 
         // Yield to React every 5 names so the progress state renders
         if (i % 5 === 0 || i === csvNames.length - 1) {
@@ -294,7 +342,8 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
 
       setCsvResults(results);
       const found = results.filter(r => r.matches.length > 0).length;
-      toast.success(`Matched ${found} of ${csvNames.length} suppliers`);
+      const inProgress = results.filter(r => r.matches.length === 0 && r.ongoingMatch).length;
+      toast.success(`Matched ${found} in Omnea, ${inProgress} in ongoing requests, ${csvNames.length - found - inProgress} not found`);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Lookup failed');
     } finally {
@@ -305,18 +354,30 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
 
   const exportCsvResults = () => {
     if (!csvResults) return;
-    const header = 'csv_name,status,omnea_name,omnea_id,match_score';
-    const rows = csvResults.flatMap(r =>
-      r.matches.length > 0
-        ? r.matches.map(m => [
-            `"${r.csvName.replace(/"/g, '""')}"`,
-            'found',
-            `"${m.name.replace(/"/g, '""')}"`,
-            m.id,
-            m.score.toFixed(2),
-          ].join(','))
-        : [[`"${r.csvName.replace(/"/g, '""')}"`, 'not_found', '', '', ''].join(',')]
-    );
+    const header = 'csv_name,status,omnea_name,omnea_id,match_score,ongoing_state';
+    const rows = csvResults.flatMap(r => {
+      if (r.matches.length > 0) {
+        return r.matches.map(m => [
+          `"${r.csvName.replace(/"/g, '""')}"`,
+          'found',
+          `"${m.name.replace(/"/g, '""')}"`,
+          m.id,
+          m.score.toFixed(2),
+          '',
+        ].join(','));
+      }
+      if (r.ongoingMatch) {
+        return [[
+          `"${r.csvName.replace(/"/g, '""')}"`,
+          'ongoing_request',
+          `"${r.ongoingMatch.supplier.replace(/"/g, '""')}"`,
+          '',
+          r.ongoingMatch.score.toFixed(2),
+          `"${r.ongoingMatch.state.replace(/"/g, '""')}"`,
+        ].join(',')];
+      }
+      return [[`"${r.csvName.replace(/"/g, '""')}"`, 'not_found', '', '', '', ''].join(',')];
+    });
     const blob = new Blob([`${header}\n${rows.join('\n')}`], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -499,7 +560,7 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
         };
       } else {
         result = await makeOmneaRequest(endpoint.path, {
-          method: endpoint.method,
+          method: endpoint.method as "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
           body,
           params,
         });
@@ -1142,6 +1203,42 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
               )}
             </div>
 
+            {/* Ongoing requests CSV — second data point */}
+            <div className="border-t pt-3 space-y-2">
+              <p className="text-xs font-semibold text-foreground">Ongoing requests <span className="font-normal text-muted-foreground">(optional)</span></p>
+              <p className="text-[11px] text-muted-foreground">
+                Upload a 2-column CSV (<span className="font-mono">Supplier, State</span>) of in-progress requests. Suppliers not found in Omnea will be matched against this list as a second data point.
+              </p>
+              <div
+                role="button"
+                tabIndex={0}
+                onClick={() => ongoingInputRef.current?.click()}
+                onKeyDown={e => e.key === 'Enter' && ongoingInputRef.current?.click()}
+                onDragOver={e => e.preventDefault()}
+                onDrop={e => {
+                  e.preventDefault();
+                  const file = e.dataTransfer.files[0];
+                  if (file) parseOngoingCsvFile(file);
+                }}
+                className="border-2 border-dashed rounded-lg p-4 text-center cursor-pointer hover:border-primary/50 hover:bg-muted/30 transition-colors"
+              >
+                <Upload className="h-4 w-4 mx-auto mb-1.5 text-muted-foreground" />
+                {ongoingRequests.length > 0 ? (
+                  <p className="text-sm font-medium text-foreground">
+                    {ongoingFileName} — <span className="text-primary">{ongoingRequests.length} requests loaded</span>
+                  </p>
+                ) : (
+                  <p className="text-sm text-muted-foreground">Drop ongoing requests CSV here or click to browse</p>
+                )}
+                <input ref={ongoingInputRef} type="file" accept=".csv" className="hidden"
+                  onChange={e => {
+                    const file = e.target.files?.[0];
+                    if (file) parseOngoingCsvFile(file);
+                  }}
+                />
+              </div>
+            </div>
+
             <Button onClick={runCsvLookup} disabled={csvRunning || csvNames.length === 0} size="sm" className="gap-1.5 min-w-[160px]">
               <Loader2 className={`h-3.5 w-3.5 ${csvRunning ? 'animate-spin' : 'hidden'}`} />
               {!csvRunning && <Play className="h-3.5 w-3.5" />}
@@ -1155,7 +1252,8 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
           {csvResults && (() => {
             const perfectResults = csvResults.filter(r => r.matches.length > 0 && r.matches[0].score >= 0.99);
             const partialResults = csvResults.filter(r => r.matches.length > 0 && r.matches[0].score < 0.99);
-            const notFoundResults = csvResults.filter(r => r.matches.length === 0);
+            const ongoingResults = csvResults.filter(r => r.matches.length === 0 && r.ongoingMatch);
+            const notFoundResults = csvResults.filter(r => r.matches.length === 0 && !r.ongoingMatch);
 
             const matchTable = (
               rows: CsvMatchResult[],
@@ -1235,6 +1333,12 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
                       {partialResults.length} found partial
                     </Badge>
                   )}
+                  {ongoingResults.length > 0 && (
+                    <Badge className="bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 gap-1">
+                      <AlertCircle className="h-3 w-3" />
+                      {ongoingResults.length} in ongoing requests
+                    </Badge>
+                  )}
                   <Badge className="bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400 gap-1">
                     <XCircle className="h-3 w-3" />
                     {notFoundResults.length} not found
@@ -1262,6 +1366,48 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
                   'partial',
                 )}
 
+                {/* In ongoing requests */}
+                {ongoingResults.length > 0 && (() => {
+                  const isOpen = csvTableOpen.ongoing;
+                  return (
+                    <Card className="overflow-hidden">
+                      <button
+                        onClick={() => setCsvTableOpen(prev => ({ ...prev, ongoing: !prev.ongoing }))}
+                        className="w-full flex items-center justify-between px-3 py-2 border-b bg-blue-50 dark:bg-blue-950/20 border-blue-200 dark:border-blue-800 hover:brightness-95 transition-all"
+                      >
+                        <p className="text-xs font-semibold text-blue-700 dark:text-blue-400">In ongoing requests — {ongoingResults.length} supplier{ongoingResults.length !== 1 ? 's' : ''}</p>
+                        {isOpen ? <ChevronDown className="h-3.5 w-3.5 text-blue-700 dark:text-blue-400" /> : <ChevronRight className="h-3.5 w-3.5 text-blue-700 dark:text-blue-400" />}
+                      </button>
+                      {isOpen && (
+                        <Table>
+                          <TableHeader>
+                            <TableRow>
+                              <TableHead className="text-xs">CSV Name</TableHead>
+                              <TableHead className="text-xs">Ongoing Request Supplier</TableHead>
+                              <TableHead className="text-xs">State</TableHead>
+                              <TableHead className="text-xs w-20">Score</TableHead>
+                            </TableRow>
+                          </TableHeader>
+                          <TableBody>
+                            {ongoingResults.map((r, i) => (
+                              <TableRow key={i}>
+                                <TableCell className="text-xs font-mono align-top">{r.csvName}</TableCell>
+                                <TableCell className="text-xs">{r.ongoingMatch?.supplier}</TableCell>
+                                <TableCell className="text-xs text-muted-foreground">{r.ongoingMatch?.state}</TableCell>
+                                <TableCell className="text-xs">
+                                  <span className="font-mono font-semibold text-blue-600 dark:text-blue-400">
+                                    {r.ongoingMatch ? `${(r.ongoingMatch.score * 100).toFixed(0)}%` : '-'}
+                                  </span>
+                                </TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      )}
+                    </Card>
+                  );
+                })()}
+
                 {/* Not found */}
                 {notFoundResults.length > 0 && (() => {
                   const isOpen = csvTableOpen.notFound;
@@ -1271,7 +1417,7 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
                         onClick={() => setCsvTableOpen(prev => ({ ...prev, notFound: !prev.notFound }))}
                         className="w-full flex items-center justify-between px-3 py-2 border-b bg-red-50 dark:bg-red-950/20 border-red-200 dark:border-red-800 hover:brightness-95 transition-all"
                       >
-                        <p className="text-xs font-semibold text-red-700 dark:text-red-400">Not found in Omnea — {notFoundResults.length} supplier{notFoundResults.length !== 1 ? 's' : ''}</p>
+                        <p className="text-xs font-semibold text-red-700 dark:text-red-400">Not found in Omnea or ongoing requests — {notFoundResults.length} supplier{notFoundResults.length !== 1 ? 's' : ''}</p>
                         {isOpen ? <ChevronDown className="h-3.5 w-3.5 text-red-700 dark:text-red-400" /> : <ChevronRight className="h-3.5 w-3.5 text-red-700 dark:text-red-400" />}
                       </button>
                       {isOpen && (
