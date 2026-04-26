@@ -116,6 +116,20 @@ type SubsidiaryDraft = {
 
 const defaultSubsidiary: SubsidiaryDraft = { name: "", remoteId: "" };
 
+type SubsidiaryUpdateDraft = {
+  name: string;
+  remoteId: string;
+  isArchived: "unset" | "true" | "false";
+  dependsOnStr: string;
+};
+
+const defaultSubsidiaryUpdate: SubsidiaryUpdateDraft = {
+  name: "",
+  remoteId: "",
+  isArchived: "unset",
+  dependsOnStr: "",
+};
+
 type SupplierDraft = {
   name: string;
   legalName: string;
@@ -160,6 +174,7 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
   const [bodyStr, setBodyStr] = useState("");
   const [suppliers, setSuppliers] = useState<Array<SupplierDraft>>([defaultSupplier]);
   const [subsidiaries, setSubsidiaries] = useState<Array<SubsidiaryDraft>>([defaultSubsidiary]);
+  const [subsidiaryUpdate, setSubsidiaryUpdate] = useState<SubsidiaryUpdateDraft>(defaultSubsidiaryUpdate);
 
   // CSV supplier lookup state
   const csvInputRef = useRef<HTMLInputElement>(null);
@@ -523,6 +538,38 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
               remoteId: s.remoteId.trim(),
             })),
         };
+      } else if (endpoint.id === "update-subsidiary-by-id" || endpoint.id === "update-subsidiary-by-remote-id") {
+        const patchBody: Record<string, unknown> = {};
+
+        if (subsidiaryUpdate.name.trim()) {
+          patchBody.name = subsidiaryUpdate.name.trim();
+        }
+
+        if (subsidiaryUpdate.remoteId.trim()) {
+          patchBody.remoteId = subsidiaryUpdate.remoteId.trim();
+        }
+
+        if (subsidiaryUpdate.isArchived !== "unset") {
+          patchBody.isArchived = subsidiaryUpdate.isArchived === "true";
+        }
+
+        if (subsidiaryUpdate.dependsOnStr.trim()) {
+          try {
+            patchBody.dependsOn = JSON.parse(subsidiaryUpdate.dependsOnStr);
+          } catch {
+            setError("Invalid JSON in dependsOn field");
+            setLoading(false);
+            return;
+          }
+        }
+
+        if (Object.keys(patchBody).length === 0) {
+          setError("Please provide at least one field to update");
+          setLoading(false);
+          return;
+        }
+
+        body = patchBody;
       } else {
         // For other endpoints, parse JSON body if provided
         if (bodyStr) {
@@ -537,34 +584,11 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
       }
 
       // Make the API request
-      // For GET requests to known list endpoints, fetch all pages automatically
-      let result;
-      const autoPaginatedEndpointIds = new Set([
-        "get-suppliers",
-        "list-departments",
-        "list-custom-data",
-        "list-custom-data-records",
-      ]);
-
-      if (endpoint.method === "GET" && autoPaginatedEndpointIds.has(endpoint.id)) {
-        const config = getOmneaEnvironmentConfig();
-        const resolvedPath = endpoint.path
-          .replace(/\{\{baseUrl\}\}/g, config.apiBaseUrl)
-          .replace(/\{\{(\w+)\}\}/g, (_, key) => params[key] || `{{${key}}}`);
-        const allItems = await fetchAllOmneaPages<Record<string, unknown>>(resolvedPath);
-        result = {
-          data: { data: allItems },
-          statusCode: 200,
-          duration: 0,
-          error: undefined,
-        };
-      } else {
-        result = await makeOmneaRequest(endpoint.path, {
-          method: endpoint.method as "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
-          body,
-          params,
-        });
-      }
+      const result = await makeOmneaRequest(endpoint.path, {
+        method: endpoint.method as "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+        body,
+        params,
+      });
 
       setResponse(result.data as Record<string, unknown> || { error: result.error });
       setStatusCode(result.statusCode);
@@ -619,27 +643,17 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
     }
   };
 
+  const getRawRows = (): Record<string, unknown>[] => {
+    if (!response) return [];
+    if (Array.isArray(response)) return response;
+    if (typeof response === "object") return [response];
+    return [{ value: response }];
+  };
+
   // Helper to convert response data to table rows
   const getTableData = (): { headers: string[]; rows: Record<string, unknown>[] } => {
     if (!response) return { headers: [], rows: [] };
-
-    // Extract data array from response
-    let dataArray: Record<string, unknown>[] = [];
-
-    if (Array.isArray(response)) {
-      dataArray = response;
-    } else if (response.data) {
-      // If response.data exists, use it
-      if (Array.isArray(response.data)) {
-        dataArray = response.data;
-      } else if (typeof response.data === "object") {
-        // Single object in data property
-        dataArray = [response.data as Record<string, unknown>];
-      }
-    } else if (typeof response === "object") {
-      // Direct single object response
-      dataArray = [response];
-    }
+    const dataArray = getRawRows();
 
     if (dataArray.length === 0) return { headers: [], rows: [] };
 
@@ -847,7 +861,7 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
         </Card>
       )}
 
-      {endpoint.bodyParams && endpoint.bodyParams.length > 0 && endpoint.id !== "create-suppliers-batch" && endpoint.id !== "create-subsidiaries-batch" && (
+      {endpoint.bodyParams && endpoint.bodyParams.length > 0 && endpoint.id !== "create-suppliers-batch" && endpoint.id !== "create-subsidiaries-batch" && endpoint.id !== "update-subsidiary-by-id" && endpoint.id !== "update-subsidiary-by-remote-id" && (
         <Card className="p-4 space-y-3">
           <p className="text-xs font-semibold text-foreground">Request Body (JSON)</p>
           <Textarea
@@ -863,6 +877,83 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
               </p>
             ))}
           </div>
+        </Card>
+      )}
+
+      {(endpoint.id === "update-subsidiary-by-id" || endpoint.id === "update-subsidiary-by-remote-id") && (
+        <Card className="p-4 space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs font-semibold text-foreground">Request Body (Form)</p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-[10px]"
+              onClick={() => {
+                const seed = Date.now().toString().slice(-6);
+                setSubsidiaryUpdate((prev) => ({
+                  ...prev,
+                  name: `Subsidiary ${seed}`,
+                  remoteId: `SUB-${seed}`,
+                  isArchived: "false",
+                }));
+              }}
+            >
+              Generate sample values
+            </Button>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <Label className="text-[10px] font-medium">Name</Label>
+              <Input
+                placeholder="Subsidiary name"
+                value={subsidiaryUpdate.name}
+                onChange={(e) => setSubsidiaryUpdate((prev) => ({ ...prev, name: e.target.value }))}
+                className="mt-0.5 text-xs h-7"
+              />
+            </div>
+
+            <div>
+              <Label className="text-[10px] font-medium">Remote ID</Label>
+              <Input
+                placeholder="External system identifier"
+                value={subsidiaryUpdate.remoteId}
+                onChange={(e) => setSubsidiaryUpdate((prev) => ({ ...prev, remoteId: e.target.value }))}
+                className="mt-0.5 text-xs h-7"
+              />
+            </div>
+
+            <div>
+              <Label className="text-[10px] font-medium">isArchived</Label>
+              <Select
+                value={subsidiaryUpdate.isArchived}
+                onValueChange={(value: "unset" | "true" | "false") => setSubsidiaryUpdate((prev) => ({ ...prev, isArchived: value }))}
+              >
+                <SelectTrigger className="mt-0.5 text-xs h-7">
+                  <SelectValue placeholder="Do not send" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="unset">Do not send</SelectItem>
+                  <SelectItem value="false">false</SelectItem>
+                  <SelectItem value="true">true</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          <div>
+            <Label className="text-[10px] font-medium">dependsOn (JSON object, optional)</Label>
+            <Textarea
+              placeholder='{"customData":{"region":"EMEA"}}'
+              value={subsidiaryUpdate.dependsOnStr}
+              onChange={(e) => setSubsidiaryUpdate((prev) => ({ ...prev, dependsOnStr: e.target.value }))}
+              className="mt-0.5 font-mono text-xs min-h-[70px]"
+            />
+          </div>
+
+          <p className="text-[10px] text-muted-foreground">
+            Only non-empty fields are sent. Set isArchived to "Do not send" to omit it from the payload.
+          </p>
         </Card>
       )}
 

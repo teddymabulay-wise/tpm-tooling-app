@@ -8,6 +8,7 @@ const ALLOWED_CSV_FILES = new Set([
   "Omnea Flow Meta Data.csv",
   "Omnea Tag Meta data.csv",
   "Omnea Logic and Condition.csv",
+  "Omnea Block Structure.csv",
 ]);
 
 function localCsvSavePlugin() {

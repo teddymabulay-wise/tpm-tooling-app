@@ -1,10 +1,14 @@
-import { useState, useEffect } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { AlertTriangle, ArrowRight, CheckCircle2, Loader2, Search, SkipForward, X, XCircle } from "lucide-react";
+
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
+import { CollapsibleSection } from "@/components/CollapsibleSection";
 import { Input } from "@/components/ui/input";
-import { Loader2, ArrowRight, CheckCircle2, XCircle, AlertTriangle, SkipForward } from "lucide-react";
-import { toast } from "sonner";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   Table,
   TableBody,
@@ -13,703 +17,1221 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import {
-  makeOmneaRequest,
-  fetchAllInternalContacts,
-  createSupplierProfilesBatch,
-  createInternalContactsBatch,
-} from "@/lib/omnea-api-utils";
-import type { OmneaEnvironment } from "@/lib/omnea-environment";
-import { getOmneaEnvironmentConfig } from "@/lib/omnea-environment";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { CollapsibleSection } from "@/components/CollapsibleSection";
+import { toast } from "sonner";
 
-// Always read from Production, always write to QA — independent of global env switcher
+import {
+  createInternalContactsBatch,
+  createSupplierProfilesBatch,
+  fetchAllInternalContacts,
+  makeOmneaRequest,
+} from "@/lib/omnea-api-utils";
+import { getOmneaEnvironmentConfig, type OmneaEnvironment } from "@/lib/omnea-environment";
+
+type SupplierLike = {
+  id: string;
+  name?: string;
+  legalName?: string;
+  createdAt?: string | number;
+  createdOn?: string | number;
+  created_on?: string | number;
+  state?: string;
+  entityType?: string;
+  website?: string;
+  taxNumber?: string;
+  description?: string;
+  customFields?: Record<string, { name?: string; value?: unknown }>;
+};
+
+type SubsidiaryRef = { id: string; name: string };
+
+type CloneRunRow = {
+  supplierId: string;
+  supplierName: string;
+  supplierStatus: string;
+  profilesStatus: string;
+  contactsStatus: string;
+  productsServicesStatus: string;
+  warnings: string[];
+};
+
+type PreflightRow = {
+  supplierId: string;
+  supplierName: string;
+  duplicateQaSupplierId: string | null;
+  duplicateQaSupplierName: string | null;
+};
+
 const PROD: OmneaEnvironment = "production";
 const QA: OmneaEnvironment = "qa";
+const LIMIT = 100;
 
-// ─── Subsidiary CSV loader ─────────────────────────────────────────────────────
+function normalizeName(value: string | undefined): string {
+  return (value ?? "").trim().toLowerCase();
+}
 
-interface SubsidiaryRef { id: string; name: string; }
+function getSupplierMatchName(supplier: { name?: string; legalName?: string }): string {
+  return normalizeName(supplier.name ?? supplier.legalName);
+}
+
+function buildSupplierNameIndex<T extends { name?: string; legalName?: string }>(suppliers: T[]): Map<string, T> {
+  const index = new Map<string, T>();
+  for (const supplier of suppliers) {
+    const key = getSupplierMatchName(supplier);
+    if (key) index.set(key, supplier);
+  }
+  return index;
+}
+
+function parseSupplierCreatedAt(supplier: SupplierLike): Date | null {
+  const rawValue = supplier.createdAt ?? supplier.createdOn ?? supplier.created_on;
+  if (rawValue === undefined || rawValue === null) return null;
+
+  if (typeof rawValue === "number") {
+    const millis = rawValue < 1_000_000_000_000 ? rawValue * 1000 : rawValue;
+    const date = new Date(millis);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  const date = new Date(rawValue);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function formatSupplierCreatedAt(supplier: SupplierLike): string {
+  const date = parseSupplierCreatedAt(supplier);
+  if (!date) return "—";
+  return date.toISOString().slice(0, 10);
+}
+
+function extractArrayData(raw: unknown): any[] {
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === "object") {
+    const obj = raw as Record<string, unknown>;
+    if (Array.isArray(obj.data)) return obj.data as any[];
+    if (obj.data && typeof obj.data === "object") {
+      const nested = obj.data as Record<string, unknown>;
+      if (Array.isArray(nested.data)) return nested.data as any[];
+    }
+  }
+  return [];
+}
+
+function extractNextCursor(raw: unknown): string | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const dataObj = obj.data && typeof obj.data === "object" ? (obj.data as Record<string, unknown>) : undefined;
+  const containers = [obj, dataObj].filter((v): v is Record<string, unknown> => Boolean(v));
+
+  for (const container of containers) {
+    for (const field of ["nextCursor", "next_cursor"]) {
+      const value = container[field];
+      if (typeof value === "string" && value) return value;
+    }
+
+    const meta = container.meta;
+    if (meta && typeof meta === "object") {
+      const m = meta as Record<string, unknown>;
+      for (const field of ["nextCursor", "next_cursor", "cursor", "pageToken", "page_token"]) {
+        const value = m[field];
+        if (typeof value === "string" && value) return value;
+      }
+    }
+  }
+  return null;
+}
+
+async function fetchAllPagesWithEnvironment<T>(environment: OmneaEnvironment, basePath: string): Promise<T[]> {
+  const allItems: T[] = [];
+  const seenCursors = new Set<string>();
+
+  let cursor: string | undefined;
+  let pageCount = 0;
+
+  while (pageCount < 1000) {
+    pageCount += 1;
+    const params: Record<string, string> = { limit: String(LIMIT) };
+    if (cursor) params.cursor = cursor;
+
+    const res = await makeOmneaRequest<unknown>(basePath, {
+      method: "GET",
+      authEnvironment: environment,
+      params,
+    });
+
+    if (res.error || !res.data) {
+      throw new Error(res.error ?? `Failed loading page ${pageCount}`);
+    }
+
+    const items = extractArrayData(res.data);
+    allItems.push(...(items as T[]));
+
+    const next = extractNextCursor(res.data);
+    if (!next || seenCursors.has(next)) break;
+    seenCursors.add(next);
+    cursor = next;
+  }
+
+  return allItems;
+}
 
 async function loadSubsidiaryCSV(path: string): Promise<SubsidiaryRef[]> {
   const res = await fetch(path);
   const text = await res.text();
+
   return text
     .trim()
     .split("\n")
-    .slice(1) // skip header
+    .slice(1)
     .map((line) => {
       const commaIdx = line.indexOf(",");
       if (commaIdx === -1) return null;
-      const id   = line.slice(0, commaIdx).trim().replace(/^"|"$/g, "");
+      const id = line.slice(0, commaIdx).trim().replace(/^"|"$/g, "");
       const name = line.slice(commaIdx + 1).trim().replace(/^"|"$/g, "");
       return id && name ? { id, name } : null;
     })
-    .filter((r): r is SubsidiaryRef => r !== null);
+    .filter((v): v is SubsidiaryRef => Boolean(v));
 }
 
-/** Look up QA subsidiary ID by matching name from QA CSV */
 function resolveQASubsidiaryId(subsidiaryName: string, qaRefs: SubsidiaryRef[]): string | null {
-  const needle = subsidiaryName.trim().toLowerCase();
-  return qaRefs.find((r) => r.name.trim().toLowerCase() === needle)?.id ?? null;
+  const needle = normalizeName(subsidiaryName);
+  return qaRefs.find((r) => normalizeName(r.name) === needle)?.id ?? null;
 }
 
-// ─── Clone step status pill ───────────────────────────────────────────────────
-
-function StepStatus({ value }: { value: string }) {
-  if (value === "success")
-    return <span className="flex items-center gap-1 text-green-600 font-medium"><CheckCircle2 className="h-3.5 w-3.5" />Success</span>;
-  if (value.startsWith("failed"))
-    return <span className="flex items-center gap-1 text-red-600 font-medium"><XCircle className="h-3.5 w-3.5" />{value}</span>;
-  if (value.startsWith("skipped"))
-    return <span className="flex items-center gap-1 text-muted-foreground"><SkipForward className="h-3.5 w-3.5" />{value}</span>;
-  if (value === "pending")
-    return <span className="flex items-center gap-1 text-muted-foreground"><Loader2 className="h-3.5 w-3.5 animate-spin" />Pending</span>;
-  return <span className="text-amber-600 flex items-center gap-1"><AlertTriangle className="h-3.5 w-3.5" />{value}</span>;
+function getPrevalentFieldValue(supplier: SupplierLike): unknown {
+  const fields = supplier.customFields ?? {};
+  for (const field of Object.values(fields)) {
+    const label = normalizeName(field?.name);
+    if (label.includes("prevalent") || label.includes("prevalance") || label.includes("prevalence")) {
+      return field?.value;
+    }
+  }
+  return undefined;
 }
 
-// ─── Custom field value renderer ──────────────────────────────────────────────
-
-function FieldValue({ value }: { value: unknown }) {
-  if (value === null || value === undefined) return <span className="text-muted-foreground">—</span>;
-  if (Array.isArray(value)) return <span>{value.map((v: any) => v?.name ?? String(v)).join(", ") || "—"}</span>;
-  if (typeof value === "object" && "name" in (value as object)) return <span>{String((value as any).name)}</span>;
-  return <span>{String(value) || "—"}</span>;
+function hasPrevalentFieldValue(supplier: SupplierLike): boolean {
+  const value = getPrevalentFieldValue(supplier);
+  if (value === null || value === undefined) return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "string") return value.trim().length > 0;
+  if (typeof value === "object") return Object.keys(value as Record<string, unknown>).length > 0;
+  return true;
 }
 
-// ─── Component ────────────────────────────────────────────────────────────────
+function hasFieldValue(value: unknown): boolean {
+  if (value === null || value === undefined) return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "string") return value.trim().length > 0;
+  if (typeof value === "object") return Object.keys(value as Record<string, unknown>).length > 0;
+  return true;
+}
+
+function getMaterialityFieldValue(supplier: SupplierLike): unknown {
+  const fields = supplier.customFields ?? {};
+  for (const field of Object.values(fields)) {
+    const label = normalizeName(field?.name);
+    if (label.includes("materiality")) return field?.value;
+  }
+  return undefined;
+}
+
+function valueToFilterString(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (Array.isArray(value)) return value.map((item) => String(item)).join(" | ").trim();
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value).trim();
+}
+
+function getCustomFieldValueByName(supplier: SupplierLike, fieldName: string): unknown {
+  const needle = normalizeName(fieldName);
+  for (const field of Object.values(supplier.customFields ?? {})) {
+    if (normalizeName(field?.name) === needle) return field?.value;
+  }
+  return undefined;
+}
+
+function csvEscape(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  const str = String(value);
+  if (str.includes(",") || str.includes("\n") || str.includes("\"")) {
+    return `"${str.replace(/\"/g, "\"\"")}"`;
+  }
+  return str;
+}
+
+async function fetchSupplierProfiles(environment: OmneaEnvironment, supplierId: string): Promise<any[]> {
+  const config = getOmneaEnvironmentConfig(environment);
+  const path = `${config.apiBaseUrl}/v1/suppliers/${supplierId}/profiles`;
+  const res = await makeOmneaRequest<unknown>(path, { method: "GET", authEnvironment: environment, params: { limit: String(LIMIT) } });
+  if (res.error || !res.data) return [];
+  return extractArrayData(res.data);
+}
+
+async function fetchProductsServices(environment: OmneaEnvironment, supplierId: string): Promise<any[]> {
+  const config = getOmneaEnvironmentConfig(environment);
+  const candidates = [
+    `${config.apiBaseUrl}/v1/suppliers/${supplierId}/products-services`,
+    `${config.apiBaseUrl}/v1/suppliers/${supplierId}/products-and-services`,
+    `${config.apiBaseUrl}/v1/suppliers/${supplierId}/products_services`,
+  ];
+
+  for (const path of candidates) {
+    const res = await makeOmneaRequest<unknown>(path, {
+      method: "GET",
+      authEnvironment: environment,
+      params: { limit: String(LIMIT) },
+    });
+
+    if (!res.error && res.data) {
+      return extractArrayData(res.data);
+    }
+  }
+  return [];
+}
+
+async function createProductsServicesBatch(environment: OmneaEnvironment, supplierId: string, items: any[]): Promise<{ ok: boolean; message: string }> {
+  if (items.length === 0) return { ok: true, message: "skipped (no products/services)" };
+
+  const config = getOmneaEnvironmentConfig(environment);
+  const endpoints = [
+    `${config.apiBaseUrl}/v1/suppliers/${supplierId}/products-services/batch`,
+    `${config.apiBaseUrl}/v1/suppliers/${supplierId}/products-and-services/batch`,
+    `${config.apiBaseUrl}/v1/suppliers/${supplierId}/products_services/batch`,
+    `${config.apiBaseUrl}/v1/suppliers/${supplierId}/products-services`,
+    `${config.apiBaseUrl}/v1/suppliers/${supplierId}/products-and-services`,
+  ];
+
+  const payloads = [
+    { productsServices: items },
+    { productsAndServices: items },
+    { items },
+  ];
+
+  for (const endpoint of endpoints) {
+    for (const body of payloads) {
+      const res = await makeOmneaRequest<unknown>(endpoint, {
+        method: "POST",
+        authEnvironment: environment,
+        body,
+      });
+      if (!res.error) return { ok: true, message: "success" };
+    }
+  }
+
+  return { ok: false, message: "failed: could not find a valid products/services create endpoint" };
+}
+
+function StepBadge({ number, title, active, completed }: { number: number; title: string; active: boolean; completed: boolean }) {
+  return (
+    <div className={`rounded-md border px-3 py-2 text-xs ${active ? "border-primary bg-primary/5" : completed ? "border-green-300 bg-green-50" : "border-border"}`}>
+      <span className="font-semibold">Step {number}</span>
+      <span className="text-muted-foreground ml-2">{title}</span>
+    </div>
+  );
+}
+
+function StatusPill({ value }: { value: string }) {
+  if (value.startsWith("success")) {
+    return <span className="text-green-600 inline-flex items-center gap-1"><CheckCircle2 className="h-3.5 w-3.5" />{value}</span>;
+  }
+  if (value.startsWith("failed")) {
+    return <span className="text-red-600 inline-flex items-center gap-1"><XCircle className="h-3.5 w-3.5" />{value}</span>;
+  }
+  if (value.startsWith("skipped")) {
+    return <span className="text-muted-foreground inline-flex items-center gap-1"><SkipForward className="h-3.5 w-3.5" />{value}</span>;
+  }
+  return <span className="text-amber-600 inline-flex items-center gap-1"><AlertTriangle className="h-3.5 w-3.5" />{value}</span>;
+}
 
 export default function ProdToQAClonePage() {
-  const [supplierId, setSupplierId]       = useState("");
-  const [step, setStep]                   = useState<1 | 2 | 3>(1);
-  const [loading, setLoading]             = useState(false);
-  const [supplierData, setSupplierData]   = useState<any>(null);
-  const [profiles, setProfiles]           = useState<any[]>([]);
-  const [contacts, setContacts]           = useState<any[]>([]);
-  const [loadingProfiles, setLoadingProfiles] = useState(false);
-  const [loadingContacts, setLoadingContacts] = useState(false);
-  const [fetchError, setFetchError]       = useState<string | null>(null);
-  const [cloneStatus, setCloneStatus]     = useState<{ supplier: string; profiles: string; contacts: string } | null>(null);
-  const [cloneErrors, setCloneErrors]     = useState<string[]>([]);
-  const [activeTab, setActiveTab]         = useState("supplier");
+  const ALL_FILTER = "__all__";
+  const [step, setStep] = useState<1 | 2 | 3>(1);
 
-  // QA fetched data (shown after clone completes)
-  const [qaSupplierData, setQASupplierData] = useState<any>(null);
-  const [qaProfiles, setQAProfiles]         = useState<any[]>([]);
-  const [qaContacts, setQAContacts]         = useState<any[]>([]);
-  const [qaActiveTab, setQAActiveTab]       = useState("supplier");
-
-  // QA subsidiary refs — loaded once on mount
   const [qaSubsidiaryRefs, setQASubsidiaryRefs] = useState<SubsidiaryRef[]>([]);
+  const [loadQASuppliers, setLoadQASuppliers] = useState(true);
+  const [loadingStep1, setLoadingStep1] = useState(false);
+
+  const [prodSuppliers, setProdSuppliers] = useState<SupplierLike[]>([]);
+  const [qaSuppliers, setQASuppliers] = useState<SupplierLike[]>([]);
+
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [searchText, setSearchText] = useState("");
+  const [prevalentFilter, setPrevalentFilter] = useState<"all" | "has" | "none">("has");
+  const [stateFilter, setStateFilter] = useState<"all" | "active" | "inactive">("all");
+  const [materialityFilter, setMaterialityFilter] = useState<string>(ALL_FILTER);
+  const [attachedFieldNameFilter, setAttachedFieldNameFilter] = useState<string>(ALL_FILTER);
+  const [attachedFieldDataFilter, setAttachedFieldDataFilter] = useState<"all" | "has" | "none">("all");
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  const [runningClone, setRunningClone] = useState(false);
+  const [cloneResults, setCloneResults] = useState<CloneRunRow[]>([]);
+  const [runningPreflight, setRunningPreflight] = useState(false);
+  const [preflightRows, setPreflightRows] = useState<PreflightRow[]>([]);
+  const [preflightReady, setPreflightReady] = useState(false);
+  const [duplicateMode, setDuplicateMode] = useState<"merge" | "skip">("merge");
+
   useEffect(() => {
-    loadSubsidiaryCSV("/doc/subsidiary QA.csv").then(setQASubsidiaryRefs);
+    loadSubsidiaryCSV("/doc/subsidiary QA.csv")
+      .then(setQASubsidiaryRefs)
+      .catch(() => {
+        toast.warning("Could not load QA subsidiary mapping CSV.");
+      });
   }, []);
 
-  // ── Fetch from Production ────────────────────────────────────────────────
-  const handleFetch = async () => {
-    setLoading(true);
-    setLoadingProfiles(true);
-    setLoadingContacts(true);
-    setFetchError(null);
-    setProfiles([]);
-    setContacts([]);
+  const qaBySupplierName = useMemo(() => {
+    return buildSupplierNameIndex(qaSuppliers);
+  }, [qaSuppliers]);
 
+  const materialityOptions = useMemo(() => {
+    const values = new Set<string>();
+    for (const supplier of prodSuppliers) {
+      const value = valueToFilterString(getMaterialityFieldValue(supplier));
+      if (value) values.add(value);
+    }
+    return [...values].sort((a, b) => a.localeCompare(b));
+  }, [prodSuppliers]);
+
+  const attachedFieldOptions = useMemo(() => {
+    const names = new Set<string>();
+    for (const supplier of prodSuppliers) {
+      for (const field of Object.values(supplier.customFields ?? {})) {
+        const name = (field?.name ?? "").trim();
+        if (name) names.add(name);
+      }
+    }
+    return [...names].sort((a, b) => a.localeCompare(b));
+  }, [prodSuppliers]);
+
+  const filteredSuppliers = useMemo(() => {
+    const query = normalizeName(searchText);
+
+    return prodSuppliers.filter((supplier) => {
+      const supplierState = normalizeName(supplier.state);
+      if (stateFilter === "active" && supplierState !== "active") return false;
+      if (stateFilter === "inactive" && supplierState !== "inactive") return false;
+
+      const hasPrevalent = hasPrevalentFieldValue(supplier);
+      if (prevalentFilter === "has" && !hasPrevalent) return false;
+      if (prevalentFilter === "none" && hasPrevalent) return false;
+
+      if (materialityFilter !== ALL_FILTER) {
+        const materialityValue = valueToFilterString(getMaterialityFieldValue(supplier));
+        if (materialityValue !== materialityFilter) return false;
+      }
+
+      if (attachedFieldNameFilter !== ALL_FILTER) {
+        const attachedValue = getCustomFieldValueByName(supplier, attachedFieldNameFilter);
+        const hasAttachedValue = hasFieldValue(attachedValue);
+        if (attachedFieldDataFilter === "has" && !hasAttachedValue) return false;
+        if (attachedFieldDataFilter === "none" && hasAttachedValue) return false;
+      }
+
+      if (!query) return true;
+      const hay = [supplier.name, supplier.legalName, supplier.id].map(normalizeName).join(" ");
+      return hay.includes(query);
+    });
+  }, [
+    prodSuppliers,
+    searchText,
+    prevalentFilter,
+    stateFilter,
+    materialityFilter,
+    attachedFieldNameFilter,
+    attachedFieldDataFilter,
+    ALL_FILTER,
+  ]);
+
+  const selectedSuppliers = useMemo(() => {
+    return prodSuppliers.filter((s) => selectedIds.has(s.id));
+  }, [prodSuppliers, selectedIds]);
+
+  const allFilteredSelected = useMemo(() => {
+    return filteredSuppliers.length > 0 && filteredSuppliers.every((supplier) => selectedIds.has(supplier.id));
+  }, [filteredSuppliers, selectedIds]);
+
+  const someFilteredSelected = useMemo(() => {
+    return filteredSuppliers.some((supplier) => selectedIds.has(supplier.id));
+  }, [filteredSuppliers, selectedIds]);
+
+  const duplicatesInFiltered = useMemo(() => {
+    if (qaSuppliers.length === 0) return 0;
+    return filteredSuppliers.filter((supplier) => qaBySupplierName.has(getSupplierMatchName(supplier))).length;
+  }, [filteredSuppliers, qaSuppliers, qaBySupplierName]);
+
+  const toggleSelected = (supplierId: string, checked: boolean) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(supplierId);
+      else next.delete(supplierId);
+      return next;
+    });
+  };
+
+  const toggleAllFilteredSelection = (checked: boolean) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) {
+        for (const supplier of filteredSuppliers) next.add(supplier.id);
+      } else {
+        for (const supplier of filteredSuppliers) next.delete(supplier.id);
+      }
+      return next;
+    });
+  };
+
+  const loadStep1Data = async () => {
+    setLoadingStep1(true);
     try {
       const prodConfig = getOmneaEnvironmentConfig(PROD);
+      const prod = await fetchAllPagesWithEnvironment<SupplierLike>(PROD, `${prodConfig.apiBaseUrl}/v1/suppliers`);
+      setProdSuppliers(prod);
 
-      // Supplier
-      const supplierRes = await makeOmneaRequest(
-        `${prodConfig.apiBaseUrl}/v1/suppliers/${supplierId}`,
-        { method: "GET", authEnvironment: PROD },
-      );
-      if (supplierRes.error) throw new Error(supplierRes.error);
-      const supplier = supplierRes.data && typeof supplierRes.data === "object" && "data" in supplierRes.data
-        ? (supplierRes.data as any).data
-        : supplierRes.data;
-      setSupplierData(supplier);
-
-      // Profiles
-      try {
-        const profilesRes = await makeOmneaRequest(
-          `${prodConfig.apiBaseUrl}/v1/suppliers/${supplier.id}/profiles`,
-          { method: "GET", authEnvironment: PROD },
-        );
-        const raw = profilesRes.data as any;
-        const arr = Array.isArray(raw) ? raw
-          : Array.isArray(raw?.data) ? raw.data
-          : Array.isArray(raw?.data?.data) ? raw.data.data
-          : [];
-        setProfiles(arr);
-      } catch (err: any) {
-        setFetchError(`Profiles fetch error: ${err?.message ?? err}`);
-      } finally {
-        setLoadingProfiles(false);
+      if (loadQASuppliers) {
+        const qaConfig = getOmneaEnvironmentConfig(QA);
+        const qa = await fetchAllPagesWithEnvironment<SupplierLike>(QA, `${qaConfig.apiBaseUrl}/v1/suppliers`);
+        setQASuppliers(qa);
+      } else {
+        setQASuppliers([]);
       }
 
-      // Internal contacts
-      try {
-        const arr = await fetchAllInternalContacts(PROD, supplier.id);
-        setContacts(Array.isArray(arr) ? arr : []);
-      } catch (err: any) {
-        setFetchError((prev) => (prev ? `${prev}\n` : "") + `Contacts fetch error: ${err?.message ?? err}`);
-      } finally {
-        setLoadingContacts(false);
-      }
-
+      setSelectedIds(new Set());
+      setPreflightRows([]);
+      setPreflightReady(false);
       setStep(2);
-    } catch (e: any) {
-      toast.error("Failed to fetch supplier from Production");
-      setFetchError(e?.message ?? String(e));
-      setLoadingProfiles(false);
-      setLoadingContacts(false);
+      toast.success("Supplier lists loaded.");
+    } catch (error: any) {
+      toast.error(`Failed to load suppliers: ${error?.message ?? String(error)}`);
     } finally {
-      setLoading(false);
+      setLoadingStep1(false);
     }
   };
 
-  // ── Clone to QA ────────────────────────────────────────────────────────
-  const handleClone = async () => {
-    setLoading(true);
-    setCloneStatus(null);
-    setCloneErrors([]);
+  const ensureQASupplierIndex = async (): Promise<SupplierLike[]> => {
+    if (qaSuppliers.length > 0) return qaSuppliers;
+    const qaConfig = getOmneaEnvironmentConfig(QA);
+    const qa = await fetchAllPagesWithEnvironment<SupplierLike>(QA, `${qaConfig.apiBaseUrl}/v1/suppliers`);
+    setQASuppliers(qa);
+    return qa;
+  };
 
-    let qaSupplierId: string | null = null;
-    const errors: string[] = [];
-    const status = {
-      supplier: "pending",
-      profiles: profiles.length > 0 ? "pending" : "skipped (no profiles)",
-      contacts: contacts.length > 0 ? "pending" : "skipped (no contacts)",
-    };
+  const runPreflightForSelected = async () => {
+    if (selectedSuppliers.length === 0) {
+      toast.warning("Select at least one supplier first.");
+      return;
+    }
+
+    setRunningPreflight(true);
+    setStep(3);
+    setCloneResults([]);
+    setPreflightRows([]);
+    setPreflightReady(false);
+
+    try {
+      const qaIndex = await ensureQASupplierIndex();
+      const qaByName = buildSupplierNameIndex(qaIndex);
+
+      const rows: PreflightRow[] = selectedSuppliers.map((supplier) => {
+        const existing = qaByName.get(getSupplierMatchName(supplier));
+        return {
+          supplierId: supplier.id,
+          supplierName: supplier.name ?? supplier.legalName ?? supplier.id,
+          duplicateQaSupplierId: existing?.id ?? null,
+          duplicateQaSupplierName: existing?.name ?? existing?.legalName ?? null,
+        };
+      });
+
+      setPreflightRows(rows);
+      setPreflightReady(true);
+      const duplicateCount = rows.filter((r) => Boolean(r.duplicateQaSupplierId)).length;
+      if (duplicateCount > 0) {
+        toast.warning(`Preflight complete: ${duplicateCount} potential duplicate(s) found on QA.`);
+      } else {
+        toast.success("Preflight complete: no QA duplicates detected.");
+      }
+    } catch (error: any) {
+      toast.error(`Preflight failed: ${error?.message ?? String(error)}`);
+    } finally {
+      setRunningPreflight(false);
+    }
+  };
+
+  const executeCloneFromPreflight = async () => {
+    if (!preflightReady || preflightRows.length === 0) {
+      toast.warning("Run preflight first.");
+      return;
+    }
+
+    setRunningClone(true);
+    setCloneResults([]);
+    setStep(3);
 
     try {
       const qaConfig = getOmneaEnvironmentConfig(QA);
+      const prodConfig = getOmneaEnvironmentConfig(PROD);
+      const qaIndex = await ensureQASupplierIndex();
 
-      // 1. Preflight — search QA for an existing supplier with the same name
-      const nameLower = (supplierData.name ?? "").trim().toLowerCase();
-      const preflightRes = await makeOmneaRequest<unknown>(
-        `${qaConfig.apiBaseUrl}/v1/suppliers`,
-        { method: "GET", authEnvironment: QA, params: { limit: "100" } },
-      );
-      const preflightItems: any[] = (() => {
-        const raw = preflightRes.data as any;
-        if (Array.isArray(raw)) return raw;
-        if (Array.isArray(raw?.data)) return raw.data;
-        if (Array.isArray(raw?.data?.data)) return raw.data.data;
-        return [];
-      })();
-      const existing = preflightItems.find(
-        (s: any) =>
-          (s.name ?? "").trim().toLowerCase() === nameLower ||
-          (s.legalName ?? "").trim().toLowerCase() === nameLower,
-      );
+      const qaByName = buildSupplierNameIndex(qaIndex);
 
-      if (existing?.id) {
-        qaSupplierId = existing.id;
-        status.supplier = `skipped — existing supplier found on QA (ID: ${qaSupplierId})`;
-      } else {
-        // 1b. No duplicate found — create the supplier
-        const supplierPayload: Record<string, unknown> = {
-          name: supplierData.name,
-          legalName: supplierData.legalName ?? supplierData.name,
-          state: supplierData.state ?? "active",
-          entityType: supplierData.entityType ?? "company",
+      const results: CloneRunRow[] = [];
+
+      for (const preflightRow of preflightRows) {
+        const supplierSummary = prodSuppliers.find((s) => s.id === preflightRow.supplierId);
+        if (!supplierSummary) continue;
+        const warnings: string[] = [];
+        const row: CloneRunRow = {
+          supplierId: supplierSummary.id,
+          supplierName: supplierSummary.name ?? supplierSummary.legalName ?? supplierSummary.id,
+          supplierStatus: "pending",
+          profilesStatus: "pending",
+          contactsStatus: "pending",
+          productsServicesStatus: "pending",
+          warnings,
         };
-        if (supplierData.taxNumber)   supplierPayload.taxNumber   = supplierData.taxNumber;
-        if (supplierData.website)     supplierPayload.website     = supplierData.website;
-        if (supplierData.description) supplierPayload.description = supplierData.description;
 
-        const createRes = await makeOmneaRequest(
-          `${qaConfig.apiBaseUrl}/v1/suppliers/batch`,
-          { method: "POST", authEnvironment: QA, body: { suppliers: [supplierPayload] } },
-        );
-
-        if (createRes.error) {
-          status.supplier = `failed: ${createRes.error}`;
-          errors.push(`Supplier creation failed: ${createRes.error}`);
-        } else {
-          const raw = createRes.data as any;
-          qaSupplierId = Array.isArray(raw?.data) && raw.data[0]?.id
-            ? raw.data[0].id
-            : Array.isArray(raw) && raw[0]?.id
-            ? raw[0].id
-            : raw?.id ?? null;
-          status.supplier = `success${qaSupplierId ? ` (ID: ${qaSupplierId})` : ""}`;
-        }
-      }
-
-      if (!qaSupplierId) {
-        status.profiles = "skipped (no supplier ID)";
-        status.contacts = "skipped (no supplier ID)";
-        setCloneStatus({ ...status });
-        setCloneErrors(errors);
-        setStep(3);
-        return;
-      }
-
-      // 2. Create profiles on QA — remap subsidiary IDs using QA CSV
-      if (profiles.length > 0) {
         try {
-          const profilesToCreate = profiles.map((profile: any) => {
-            const { id, createdAt, updatedAt, ...rest } = profile;
-            // Resolve the QA subsidiary ID by name
-            const subsidiaryName = profile.subsidiary?.name ?? "";
-            const qaSubsidiaryId = resolveQASubsidiaryId(subsidiaryName, qaSubsidiaryRefs);
+          const supplierRes = await makeOmneaRequest<unknown>(
+            `${prodConfig.apiBaseUrl}/v1/suppliers/${supplierSummary.id}`,
+            { method: "GET", authEnvironment: PROD }
+          );
 
-            if (!qaSubsidiaryId) {
-              errors.push(`Profile "${subsidiaryName}": no matching QA subsidiary ID found — profile skipped.`);
-              return null;
-            }
-
-            return {
-              ...rest,
-              subsidiary: { id: qaSubsidiaryId },
-            };
-          }).filter(Boolean);
-
-          if (profilesToCreate.length > 0) {
-            const res = await createSupplierProfilesBatch(QA, qaSupplierId, profilesToCreate);
-            if (res.error) {
-              status.profiles = `failed: ${res.error}`;
-              errors.push(`Profiles: ${res.error}`);
-            } else {
-              const skipped = profiles.length - profilesToCreate.length;
-              status.profiles = skipped > 0
-                ? `success (${profilesToCreate.length} created, ${skipped} skipped — no QA subsidiary match)`
-                : "success";
-            }
-          } else {
-            status.profiles = "skipped (no profiles with matching QA subsidiary)";
+          if (supplierRes.error || !supplierRes.data) {
+            row.supplierStatus = `failed: ${supplierRes.error ?? "supplier fetch failed"}`;
+            row.profilesStatus = "skipped (supplier fetch failed)";
+            row.contactsStatus = "skipped (supplier fetch failed)";
+            row.productsServicesStatus = "skipped (supplier fetch failed)";
+            results.push(row);
+            continue;
           }
-        } catch (e: any) {
-          status.profiles = `failed: ${e?.message ?? e}`;
-          errors.push(`Profiles: ${e?.message ?? e}`);
+
+          const prodSupplier = (supplierRes.data as any)?.data ?? supplierRes.data;
+          const supplierName = prodSupplier?.name ?? prodSupplier?.legalName ?? row.supplierName;
+          row.supplierName = supplierName;
+
+          const existing = preflightRow.duplicateQaSupplierId
+            ? { id: preflightRow.duplicateQaSupplierId }
+            : qaByName.get(getSupplierMatchName(prodSupplier ?? {}));
+
+          let qaSupplierId: string | null = existing?.id ?? null;
+          if (qaSupplierId) {
+            if (duplicateMode === "skip") {
+              row.supplierStatus = `skipped (duplicate on QA: ${qaSupplierId})`;
+              row.profilesStatus = "skipped (duplicate mode = skip)";
+              row.contactsStatus = "skipped (duplicate mode = skip)";
+              row.productsServicesStatus = "skipped (duplicate mode = skip)";
+              results.push(row);
+              setCloneResults([...results]);
+              continue;
+            }
+
+            row.supplierStatus = `merged into existing QA supplier (${qaSupplierId})`;
+          } else {
+            const supplierPayload: Record<string, unknown> = {
+              name: prodSupplier.name,
+              legalName: prodSupplier.legalName ?? prodSupplier.name,
+              state: prodSupplier.state ?? "active",
+              entityType: prodSupplier.entityType ?? "company",
+            };
+
+            if (prodSupplier.taxNumber) supplierPayload.taxNumber = prodSupplier.taxNumber;
+            if (prodSupplier.website) supplierPayload.website = prodSupplier.website;
+            if (prodSupplier.description) supplierPayload.description = prodSupplier.description;
+            if (prodSupplier.customFields && typeof prodSupplier.customFields === "object") {
+              supplierPayload.customFields = prodSupplier.customFields;
+            }
+
+            const createRes = await makeOmneaRequest<unknown>(
+              `${qaConfig.apiBaseUrl}/v1/suppliers/batch`,
+              { method: "POST", authEnvironment: QA, body: { suppliers: [supplierPayload] } }
+            );
+
+            if (createRes.error) {
+              row.supplierStatus = `failed: ${createRes.error}`;
+              row.profilesStatus = "skipped (supplier create failed)";
+              row.contactsStatus = "skipped (supplier create failed)";
+              row.productsServicesStatus = "skipped (supplier create failed)";
+              results.push(row);
+              continue;
+            }
+
+            const created = extractArrayData(createRes.data);
+            qaSupplierId = created[0]?.id ?? (createRes.data as any)?.id ?? null;
+            row.supplierStatus = qaSupplierId ? `success (${qaSupplierId})` : "success";
+
+            if (qaSupplierId) {
+              const key = getSupplierMatchName(prodSupplier ?? {});
+              if (key) {
+                qaByName.set(key, {
+                  id: qaSupplierId,
+                  name: prodSupplier.name,
+                  legalName: prodSupplier.legalName,
+                });
+              }
+            }
+          }
+
+          if (!qaSupplierId) {
+            row.profilesStatus = "skipped (no QA supplier id)";
+            row.contactsStatus = "skipped (no QA supplier id)";
+            row.productsServicesStatus = "skipped (no QA supplier id)";
+            results.push(row);
+            continue;
+          }
+
+          const [profiles, contacts, productsServices] = await Promise.all([
+            fetchSupplierProfiles(PROD, supplierSummary.id),
+            fetchAllInternalContacts(PROD, supplierSummary.id),
+            fetchProductsServices(PROD, supplierSummary.id),
+          ]);
+
+          if (profiles.length === 0) {
+            row.profilesStatus = "skipped (no profiles)";
+          } else {
+            const profilesToCreate = profiles
+              .map((profile) => {
+                const { id, createdAt, updatedAt, ...rest } = profile;
+                const subsidiaryName = profile?.subsidiary?.name ?? "";
+                const qaSubsidiaryId = resolveQASubsidiaryId(subsidiaryName, qaSubsidiaryRefs);
+                if (!qaSubsidiaryId) {
+                  warnings.push(`Profile for "${subsidiaryName}" skipped: no QA subsidiary match.`);
+                  return null;
+                }
+                return { ...rest, subsidiary: { id: qaSubsidiaryId } };
+              })
+              .filter(Boolean) as any[];
+
+            if (profilesToCreate.length === 0) {
+              row.profilesStatus = "skipped (no profiles with QA subsidiary mapping)";
+            } else {
+              const res = await createSupplierProfilesBatch(QA, qaSupplierId, profilesToCreate);
+              row.profilesStatus = res.error
+                ? `failed: ${res.error}`
+                : `success (${profilesToCreate.length}/${profiles.length})`;
+            }
+          }
+
+          if (contacts.length === 0) {
+            row.contactsStatus = "skipped (no contacts)";
+          } else {
+            const contactsToCreate = contacts.map(({ id, createdAt, updatedAt, ...rest }: any) => rest);
+            const res = await createInternalContactsBatch(QA, qaSupplierId, contactsToCreate);
+            row.contactsStatus = res.error
+              ? `failed: ${res.error}`
+              : `success (${contactsToCreate.length})`;
+          }
+
+          const productsServicesToCreate = productsServices.map(({ id, createdAt, updatedAt, ...rest }) => rest);
+          const productsRes = await createProductsServicesBatch(QA, qaSupplierId, productsServicesToCreate);
+          row.productsServicesStatus = productsRes.ok
+            ? (productsServicesToCreate.length > 0 ? `success (${productsServicesToCreate.length})` : productsRes.message)
+            : productsRes.message;
+        } catch (error: any) {
+          row.supplierStatus = row.supplierStatus === "pending" ? `failed: ${error?.message ?? String(error)}` : row.supplierStatus;
+          row.profilesStatus = row.profilesStatus === "pending" ? "skipped (unexpected error)" : row.profilesStatus;
+          row.contactsStatus = row.contactsStatus === "pending" ? "skipped (unexpected error)" : row.contactsStatus;
+          row.productsServicesStatus = row.productsServicesStatus === "pending" ? "skipped (unexpected error)" : row.productsServicesStatus;
+          warnings.push(error?.message ?? String(error));
         }
+
+        results.push(row);
+        setCloneResults([...results]);
       }
 
-      // 3. Create contacts on QA
-      if (contacts.length > 0) {
-        try {
-          const contactsToCreate = contacts.map(({ id, createdAt, updatedAt, ...rest }: any) => rest);
-          const res = await createInternalContactsBatch(QA, qaSupplierId, contactsToCreate);
-          status.contacts = res.error ? `failed: ${res.error}` : "success";
-          if (res.error) errors.push(`Contacts: ${res.error}`);
-        } catch (e: any) {
-          status.contacts = `failed: ${e?.message ?? e}`;
-          errors.push(`Contacts: ${e?.message ?? e}`);
-        }
-      }
+      const failed = results.filter((r) =>
+        r.supplierStatus.startsWith("failed") ||
+        r.profilesStatus.startsWith("failed") ||
+        r.contactsStatus.startsWith("failed") ||
+        r.productsServicesStatus.startsWith("failed")
+      ).length;
 
-      setCloneStatus({ ...status });
-      setCloneErrors(errors);
-      setStep(3);
-
-      if (errors.length === 0) {
-        toast.success("Supplier cloned to QA successfully!");
-      } else {
-        toast.warning("Clone completed with some warnings — see details.");
-      }
-
-      // Fetch the newly created QA records so we can display them
-      if (qaSupplierId) {
-        try {
-          const qaConfig = getOmneaEnvironmentConfig(QA);
-          const qaSupRes = await makeOmneaRequest(
-            `${qaConfig.apiBaseUrl}/v1/suppliers/${qaSupplierId}`,
-            { method: "GET", authEnvironment: QA },
-          );
-          const qaSupplier = qaSupRes.data && typeof qaSupRes.data === "object" && "data" in qaSupRes.data
-            ? (qaSupRes.data as any).data
-            : qaSupRes.data;
-          if (qaSupplier) setQASupplierData(qaSupplier);
-
-          const qaProfilesRes = await makeOmneaRequest(
-            `${qaConfig.apiBaseUrl}/v1/suppliers/${qaSupplierId}/profiles`,
-            { method: "GET", authEnvironment: QA },
-          );
-          const rawP = qaProfilesRes.data as any;
-          setQAProfiles(
-            Array.isArray(rawP) ? rawP
-            : Array.isArray(rawP?.data) ? rawP.data
-            : Array.isArray(rawP?.data?.data) ? rawP.data.data
-            : []
-          );
-
-          const qaContactsArr = await fetchAllInternalContacts(QA, qaSupplierId);
-          setQAContacts(Array.isArray(qaContactsArr) ? qaContactsArr : []);
-        } catch {
-          // Non-fatal — status summary already shown
-        }
-      }
+      if (failed === 0) toast.success("Clone run completed successfully.");
+      else toast.warning(`Clone run finished with ${failed} supplier(s) containing failures.`);
+    } catch (error: any) {
+      toast.error(error?.message ?? "Clone run failed");
     } finally {
-      setLoading(false);
+      setRunningClone(false);
     }
   };
 
-  const handleReset = () => {
-    setSupplierId("");
-    setStep(1);
-    setSupplierData(null);
-    setProfiles([]);
-    setContacts([]);
-    setFetchError(null);
-    setCloneStatus(null);
-    setCloneErrors([]);
-    setQASupplierData(null);
-    setQAProfiles([]);
-    setQAContacts([]);
-    setQAActiveTab("supplier");
+  const downloadSelectedSuppliers = () => {
+    if (selectedSuppliers.length === 0) {
+      toast.warning("No selected suppliers to download.");
+      return;
+    }
+
+    const headers = [
+      "supplier_id",
+      "name",
+      "legal_name",
+      "state",
+      "entity_type",
+      "tax_number",
+      "website",
+      "has_prevalent_data",
+      "prevalent_value",
+      "potential_qa_duplicate",
+    ];
+
+    const rows = selectedSuppliers.map((supplier) => {
+      const duplicate = qaSuppliers.length > 0 && qaBySupplierName.has(getSupplierMatchName(supplier));
+      const prevalentValue = getPrevalentFieldValue(supplier);
+      const prevalentText = Array.isArray(prevalentValue)
+        ? prevalentValue.join(" | ")
+        : prevalentValue && typeof prevalentValue === "object"
+          ? JSON.stringify(prevalentValue)
+          : (prevalentValue ?? "");
+
+      return [
+        supplier.id,
+        supplier.name ?? "",
+        supplier.legalName ?? "",
+        supplier.state ?? "",
+        supplier.entityType ?? "",
+        supplier.taxNumber ?? "",
+        supplier.website ?? "",
+        hasPrevalentFieldValue(supplier) ? "yes" : "no",
+        prevalentText,
+        qaSuppliers.length > 0 ? (duplicate ? "yes" : "no") : "not_checked",
+      ];
+    });
+
+    const csv = [headers, ...rows]
+      .map((row) => row.map((cell) => csvEscape(cell)).join(","))
+      .join("\n");
+
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `prod_to_qa_selected_suppliers_${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
 
-  // ── Render ─────────────────────────────────────────────────────────────
+  const resetAll = () => {
+    setStep(1);
+    setProdSuppliers([]);
+    setQASuppliers([]);
+    setSelectedIds(new Set());
+    setCloneResults([]);
+    setIsSearchOpen(false);
+    setSearchText("");
+    setPrevalentFilter("has");
+    setStateFilter("all");
+    setMaterialityFilter(ALL_FILTER);
+    setAttachedFieldNameFilter(ALL_FILTER);
+    setAttachedFieldDataFilter("all");
+  };
+
   return (
-    <div className="p-6 max-w-[1400px] mx-auto">
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold">Clone Supplier: Production → QA</h1>
+    <div className="p-6 max-w-none space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold">Prod -&gt; QA Supplier Clone</h1>
         <p className="text-sm text-muted-foreground mt-1">
-          Fetches supplier data from Production, then recreates the supplier, profiles, and contacts on QA using QA credentials.
-          Subsidiary IDs are remapped automatically using the QA subsidiary reference.
+          Step-based workflow: load suppliers, select suppliers to clone, then clone supplier + profiles + contacts + products/services.
         </p>
       </div>
 
-      {/* Step 1 — ID input */}
-      <Card className="mb-6 max-w-lg">
-        <CardContent className="pt-5">
-          <div className="flex gap-3 items-end">
-            <div className="flex-1">
-              <label className="text-xs font-medium text-muted-foreground mb-1.5 block">Omnea Supplier ID (Production)</label>
-              <Input
-                placeholder="e.g. 3f8a1c2d-..."
-                value={supplierId}
-                onChange={(e) => setSupplierId(e.target.value)}
-                disabled={loading || step !== 1}
-                onKeyDown={(e) => e.key === "Enter" && supplierId && !loading && handleFetch()}
-              />
-            </div>
-            {step === 1 ? (
-              <Button onClick={handleFetch} disabled={!supplierId || loading} className="gap-2">
-                {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
-                Fetch
-              </Button>
-            ) : (
-              <Button variant="outline" onClick={handleReset}>Start Over</Button>
-            )}
+      <div className="grid gap-3 sm:grid-cols-3">
+        <StepBadge number={1} title="Load Suppliers" active={step === 1} completed={step > 1} />
+        <StepBadge number={2} title="Filter & Select" active={step === 2} completed={step > 2} />
+        <StepBadge number={3} title="Clone Selected" active={step === 3} completed={step === 3 && !runningClone && cloneResults.length > 0} />
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Step 1: Load supplier lists</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex items-center gap-3">
+            <Checkbox
+              id="load-qa"
+              checked={loadQASuppliers}
+              onCheckedChange={(v) => setLoadQASuppliers(v === true)}
+              disabled={loadingStep1}
+            />
+            <Label htmlFor="load-qa" className="text-sm">
+              Also load suppliers from QA (optional, enables duplicate hints in Step 2)
+            </Label>
           </div>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <Button onClick={loadStep1Data} disabled={loadingStep1} className="gap-2">
+              {loadingStep1 ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
+              Load Step 1 Data
+            </Button>
+            <Button variant="outline" onClick={resetAll} disabled={loadingStep1 || runningClone}>Reset</Button>
+          </div>
+
+          {(prodSuppliers.length > 0 || qaSuppliers.length > 0) && (
+            <div className="rounded-md border bg-muted/20 p-3 text-sm flex flex-wrap gap-4">
+              <div>
+                <span className="text-muted-foreground">Production suppliers:</span>{" "}
+                <span className="font-semibold">{prodSuppliers.length}</span>
+              </div>
+              <div>
+                <span className="text-muted-foreground">QA suppliers:</span>{" "}
+                <span className="font-semibold">{qaSuppliers.length}</span>
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 
-      {/* Steps 2 + 3 — two-column */}
-      {step >= 2 && supplierData && (
-        <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+      {step >= 2 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Step 2: Filter and select suppliers to clone</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex flex-wrap gap-2 items-center">
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                className="h-9 w-9"
+                onClick={() => {
+                  if (isSearchOpen && searchText) {
+                    setSearchText("");
+                  }
+                  setIsSearchOpen((v) => !v);
+                }}
+                title="Search suppliers"
+              >
+                {isSearchOpen ? <X className="h-4 w-4" /> : <Search className="h-4 w-4" />}
+              </Button>
 
-          {/* ── Production panel ── */}
-          <Card>
-            <CardHeader className="pb-3">
-              <div className="flex items-center gap-2">
-                <CardTitle className="text-base">Production</CardTitle>
-                <Badge variant="outline" className="text-rose-600 border-rose-300 bg-rose-50">PROD</Badge>
-                <span className="text-sm text-muted-foreground font-normal">{supplierData.name}</span>
+              {isSearchOpen && (
+                <Input
+                  id="search-supplier"
+                  placeholder="Search name / legal name / id"
+                  value={searchText}
+                  onChange={(e) => setSearchText(e.target.value)}
+                  className="h-9 w-[280px]"
+                />
+              )}
+
+              <Select value={stateFilter} onValueChange={(v) => setStateFilter(v as "all" | "active" | "inactive") }>
+                <SelectTrigger className="h-9 w-[145px]">
+                  <SelectValue placeholder="State" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">State: All</SelectItem>
+                  <SelectItem value="active">State: Active</SelectItem>
+                  <SelectItem value="inactive">State: Inactive</SelectItem>
+                </SelectContent>
+              </Select>
+
+              <Select value={prevalentFilter} onValueChange={(v) => setPrevalentFilter(v as "all" | "has" | "none") }>
+                <SelectTrigger className="h-9 w-[190px]">
+                  <SelectValue placeholder="Prevalent" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">Prevalent: All</SelectItem>
+                  <SelectItem value="has">Prevalent: Has data</SelectItem>
+                  <SelectItem value="none">Prevalent: No data</SelectItem>
+                </SelectContent>
+              </Select>
+
+              <Select value={materialityFilter} onValueChange={setMaterialityFilter}>
+                <SelectTrigger className="h-9 w-[220px]">
+                  <SelectValue placeholder="Materiality" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ALL_FILTER}>Materiality: All</SelectItem>
+                  {materialityOptions.map((option) => (
+                    <SelectItem key={option} value={option}>{option}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+
+              <Select value={attachedFieldNameFilter} onValueChange={setAttachedFieldNameFilter}>
+                <SelectTrigger className="h-9 w-[240px]">
+                  <SelectValue placeholder="Advanced: Attached field" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ALL_FILTER}>Advanced field: All</SelectItem>
+                  {attachedFieldOptions.map((option) => (
+                    <SelectItem key={option} value={option}>{option}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+
+              <Select
+                value={attachedFieldDataFilter}
+                onValueChange={(v) => setAttachedFieldDataFilter(v as "all" | "has" | "none")}
+                disabled={attachedFieldNameFilter === ALL_FILTER}
+              >
+                <SelectTrigger className="h-9 w-[180px]">
+                  <SelectValue placeholder="Field data" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">Field data: All</SelectItem>
+                  <SelectItem value="has">Field data: Has data</SelectItem>
+                  <SelectItem value="none">Field data: No data</SelectItem>
+                </SelectContent>
+              </Select>
+
+              <div className="flex gap-2 ml-auto">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 px-2 text-xs"
+                  onClick={downloadSelectedSuppliers}
+                  disabled={selectedSuppliers.length === 0}
+                >
+                  Download selected
+                </Button>
               </div>
-            </CardHeader>
-            <CardContent>
-              <Tabs value={activeTab} onValueChange={setActiveTab}>
-                <TabsList className="mb-4">
-                  <TabsTrigger value="supplier">Supplier</TabsTrigger>
-                  <TabsTrigger value="profiles">
-                    Profiles
-                    {profiles.length > 0 && <Badge variant="secondary" className="ml-1.5 text-[10px]">{profiles.length}</Badge>}
-                  </TabsTrigger>
-                  <TabsTrigger value="contacts">
-                    Contacts
-                    {contacts.length > 0 && <Badge variant="secondary" className="ml-1.5 text-[10px]">{contacts.length}</Badge>}
-                  </TabsTrigger>
-                </TabsList>
+            </div>
 
-                <TabsContent value="supplier">
-                  <div className="space-y-1 text-sm">
-                    {([
-                      ["ID",          supplierData.id],
-                      ["Name",        supplierData.name],
-                      ["Legal Name",  supplierData.legalName],
-                      ["State",       supplierData.state],
-                      ["Entity Type", supplierData.entityType],
-                      ["Tax Number",  supplierData.taxNumber],
-                      ["Website",     supplierData.website],
-                      ["Description", supplierData.description],
-                    ] as [string, unknown][]).filter(([, v]) => v).map(([label, val]) => (
-                      <div key={label} className="flex gap-2">
-                        <span className="text-muted-foreground w-28 shrink-0 text-xs">{label}</span>
-                        <span className="text-xs break-all">{String(val)}</span>
-                      </div>
-                    ))}
-
-                    {supplierData.address && (
-                      <div className="flex gap-2">
-                        <span className="text-muted-foreground w-28 shrink-0 text-xs">Address</span>
-                        <span className="text-xs">
-                          {[supplierData.address.street1, supplierData.address.city, supplierData.address.country].filter(Boolean).join(", ")}
-                        </span>
-                      </div>
-                    )}
-
-                    {supplierData.customFields && Object.keys(supplierData.customFields).length > 0 && (
-                      <div className="mt-3 pt-3 border-t">
-                        <p className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground mb-2">Custom Fields</p>
-                        {Object.entries(supplierData.customFields).map(([key, field]: any) => (
-                          <div key={key} className="flex gap-2 text-xs">
-                            <span className="text-muted-foreground w-40 shrink-0">{field.name}</span>
-                            <FieldValue value={field.value} />
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </TabsContent>
-
-                <TabsContent value="profiles">
-                  {loadingProfiles ? (
-                    <div className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />Loading…</div>
-                  ) : profiles.length === 0 ? (
-                    <p className="text-sm text-muted-foreground">No profiles found.</p>
-                  ) : (
-                    <div className="space-y-2">
-                      {profiles.map((profile: any) => {
-                        const subsidiaryName = profile.subsidiary?.name ?? "—";
-                        const qaId = resolveQASubsidiaryId(subsidiaryName, qaSubsidiaryRefs);
-                        return (
-                          <CollapsibleSection
-                            key={profile.id}
-                            title={`${subsidiaryName} (${profile.state ?? "—"})`}
-                            defaultOpen={false}
-                          >
-                            <div className="text-xs space-y-0.5">
-                              <div><span className="text-muted-foreground">Prod Profile ID:</span> {profile.id}</div>
-                              <div><span className="text-muted-foreground">Payment Method:</span> {profile.paymentMethod?.name ?? "—"}</div>
-                              <div><span className="text-muted-foreground">Payment Terms:</span> {profile.paymentTerms?.name ?? "—"}</div>
-                              <div className={`flex items-center gap-1 ${qaId ? "text-green-600" : "text-amber-600"}`}>
-                                {qaId
-                                  ? <><CheckCircle2 className="h-3 w-3" />QA subsidiary mapped: {qaId}</>
-                                  : <><AlertTriangle className="h-3 w-3" />No QA subsidiary match for "{subsidiaryName}"</>}
-                              </div>
-                            </div>
-                          </CollapsibleSection>
-                        );
-                      })}
-                    </div>
-                  )}
-                </TabsContent>
-
-                <TabsContent value="contacts">
-                  {loadingContacts ? (
-                    <div className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />Loading…</div>
-                  ) : contacts.length === 0 ? (
-                    <p className="text-sm text-muted-foreground">No contacts found.</p>
-                  ) : (
-                    <div className="space-y-2">
-                      {contacts.map((contact: any) => (
-                        <CollapsibleSection
-                          key={contact.id ?? contact.user?.email}
-                          title={`${contact.user?.firstName ?? ""} ${contact.user?.lastName ?? ""}`.trim() || (contact.user?.email ?? "—")}
-                          defaultOpen={false}
-                        >
-                          <div className="text-xs space-y-0.5">
-                            <div><span className="text-muted-foreground">Email:</span> {contact.user?.email ?? "—"}</div>
-                            <div><span className="text-muted-foreground">Role:</span> {contact.role ?? "—"}</div>
-                            <div><span className="text-muted-foreground">Title:</span> {contact.title ?? "—"}</div>
-                          </div>
-                        </CollapsibleSection>
-                      ))}
-                    </div>
-                  )}
-                </TabsContent>
-              </Tabs>
-
-              {fetchError && (
-                <div className="mt-4 flex items-start gap-2 text-sm text-red-600 bg-red-50 border border-red-200 rounded p-3 whitespace-pre-wrap">
-                  <XCircle className="h-4 w-4 shrink-0 mt-0.5" />{fetchError}
+            <div className="rounded-md border bg-muted/20 p-3 text-sm flex flex-wrap gap-4">
+              <div><span className="text-muted-foreground">Filtered:</span> <span className="font-semibold">{filteredSuppliers.length}</span></div>
+              <div><span className="text-muted-foreground">Selected:</span> <span className="font-semibold">{selectedSuppliers.length}</span></div>
+              {qaSuppliers.length > 0 && (
+                <div>
+                  <span className="text-muted-foreground">Potential duplicates on QA:</span>{" "}
+                  <span className="font-semibold">{duplicatesInFiltered}</span>
                 </div>
               )}
+            </div>
+
+            <CollapsibleSection
+              title={`Supplier list (${filteredSuppliers.length})`}
+              defaultOpen={false}
+            >
+              <div className="overflow-x-auto border rounded-md">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-[60px]">
+                        <div className="flex items-center justify-center">
+                          <Checkbox
+                            checked={allFilteredSelected ? true : someFilteredSelected ? "indeterminate" : false}
+                            onCheckedChange={(v) => toggleAllFilteredSelection(v === true)}
+                          />
+                        </div>
+                      </TableHead>
+                      <TableHead>Supplier</TableHead>
+                      <TableHead>Created</TableHead>
+                      <TableHead>Prevalent Field</TableHead>
+                      <TableHead>QA Duplicate</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {filteredSuppliers.map((supplier) => {
+                      const selected = selectedIds.has(supplier.id);
+                      const duplicate = qaSuppliers.length > 0 && qaBySupplierName.has(getSupplierMatchName(supplier));
+                      const prevalentValue = getPrevalentFieldValue(supplier);
+
+                      return (
+                        <TableRow key={supplier.id} className={selected ? "bg-primary/5" : ""}>
+                          <TableCell>
+                            <Checkbox checked={selected} onCheckedChange={(v) => toggleSelected(supplier.id, v === true)} />
+                          </TableCell>
+                          <TableCell>
+                            <div className="font-medium text-sm">{supplier.name ?? supplier.legalName ?? "—"}</div>
+                            <div className="text-[11px] text-muted-foreground font-mono">{supplier.id}</div>
+                          </TableCell>
+                          <TableCell className="text-xs">{formatSupplierCreatedAt(supplier)}</TableCell>
+                          <TableCell className="text-xs">
+                            {hasPrevalentFieldValue(supplier)
+                              ? <span className="text-green-600">Has data</span>
+                              : <span className="text-muted-foreground">No data</span>}
+                            {prevalentValue !== undefined && prevalentValue !== null && (
+                              <div className="text-[11px] text-muted-foreground mt-0.5 max-w-[280px] truncate">{String(Array.isArray(prevalentValue) ? prevalentValue.join(", ") : prevalentValue)}</div>
+                            )}
+                          </TableCell>
+                          <TableCell className="text-xs">
+                            {qaSuppliers.length === 0
+                              ? <span className="text-muted-foreground">Not checked (QA list not loaded)</span>
+                              : duplicate
+                                ? <span className="text-amber-600 inline-flex items-center gap-1"><AlertTriangle className="h-3.5 w-3.5" />Potential duplicate</span>
+                                : <span className="text-green-600">No duplicate detected</span>}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </div>
+            </CollapsibleSection>
+
+            <div className="flex items-center gap-3">
+              <Button onClick={runPreflightForSelected} disabled={runningPreflight || runningClone || selectedSuppliers.length === 0} className="gap-2">
+                {runningPreflight ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
+                Run preflight for selected ({selectedSuppliers.length})
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                Preflight checks QA duplicates first. Then choose whether duplicates should merge or be skipped before cloning.
+              </span>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {step === 3 && (
+        <div className="space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Step 3A: Preflight</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <div className="flex items-center gap-3">
+                <Button onClick={runPreflightForSelected} disabled={runningPreflight || runningClone || selectedSuppliers.length === 0} className="gap-2">
+                  {runningPreflight ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
+                  {preflightRows.length > 0 ? "Re-run preflight" : "Run preflight"}
+                </Button>
+                <span className="text-xs text-muted-foreground">
+                  Run preflight here to refresh QA duplicate checks before cloning.
+                </span>
+              </div>
+
+              <CollapsibleSection title={`Preflight results (${preflightRows.length})`} defaultOpen={false}>
+                <div className="space-y-3">
+                  {runningPreflight && (
+                    <div className="text-sm text-muted-foreground inline-flex items-center gap-2">
+                      <Loader2 className="h-4 w-4 animate-spin" />Running preflight checks...
+                    </div>
+                  )}
+
+                  {!runningPreflight && preflightRows.length > 0 && (
+                    <>
+                      <div className="rounded-md border bg-muted/20 p-3 text-sm flex flex-wrap gap-4">
+                        <div><span className="text-muted-foreground">Selected:</span> <span className="font-semibold">{preflightRows.length}</span></div>
+                        <div><span className="text-muted-foreground">Potential duplicates:</span> <span className="font-semibold">{preflightRows.filter((r) => Boolean(r.duplicateQaSupplierId)).length}</span></div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-4">
+                        <label className="inline-flex items-center gap-2 text-sm cursor-pointer">
+                          <Checkbox
+                            checked={duplicateMode === "merge"}
+                            onCheckedChange={(checked) => {
+                              if (checked === true) setDuplicateMode("merge");
+                            }}
+                          />
+                          <span>Merge duplicates</span>
+                        </label>
+                        <label className="inline-flex items-center gap-2 text-sm cursor-pointer">
+                          <Checkbox
+                            checked={duplicateMode === "skip"}
+                            onCheckedChange={(checked) => {
+                              if (checked === true) setDuplicateMode("skip");
+                            }}
+                          />
+                          <span>Skip duplicates</span>
+                        </label>
+                        <span className="text-xs text-muted-foreground">
+                          Current mode: {duplicateMode === "merge" ? "merge into existing QA supplier" : "skip duplicate suppliers"}
+                        </span>
+                      </div>
+
+                      <div className="overflow-x-auto border rounded-md">
+                        <Table>
+                          <TableHeader>
+                            <TableRow>
+                              <TableHead>Supplier</TableHead>
+                              <TableHead>Duplicate on QA</TableHead>
+                            </TableRow>
+                          </TableHeader>
+                          <TableBody>
+                            {preflightRows.map((row) => (
+                              <TableRow key={row.supplierId}>
+                                <TableCell>
+                                  <div className="font-medium text-sm">{row.supplierName}</div>
+                                  <div className="text-[11px] text-muted-foreground font-mono">{row.supplierId}</div>
+                                </TableCell>
+                                <TableCell className="text-xs">
+                                  {row.duplicateQaSupplierId ? (
+                                    <div className="space-y-0.5">
+                                      <span className="text-amber-600 inline-flex items-center gap-1">
+                                        <AlertTriangle className="h-3.5 w-3.5" />Yes
+                                      </span>
+                                      {row.duplicateQaSupplierName && (
+                                        <div className="text-[11px] text-muted-foreground">{row.duplicateQaSupplierName}</div>
+                                      )}
+                                      <div className="text-[11px] text-muted-foreground font-mono">{row.duplicateQaSupplierId}</div>
+                                    </div>
+                                  ) : (
+                                    <span className="text-green-600">No</span>
+                                  )}
+                                </TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      </div>
+
+                      <Button onClick={executeCloneFromPreflight} disabled={runningClone || !preflightReady} className="gap-2">
+                        {runningClone ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
+                        Start cloning from preflight selection
+                      </Button>
+                    </>
+                  )}
+                </div>
+              </CollapsibleSection>
             </CardContent>
           </Card>
 
-          {/* ── QA panel ── */}
           <Card>
-            <CardHeader className="pb-3">
-              <div className="flex items-center gap-2">
-                <CardTitle className="text-base">QA</CardTitle>
-                <Badge variant="outline" className="text-blue-600 border-blue-300 bg-blue-50">QA</Badge>
-                {step === 2 && <span className="text-sm text-muted-foreground font-normal">Ready to clone</span>}
-                {step === 3 && <span className="text-sm text-muted-foreground font-normal">Clone complete</span>}
-              </div>
+            <CardHeader>
+              <CardTitle className="text-base">Step 3B: Clone execution results</CardTitle>
             </CardHeader>
-            <CardContent>
-              {step === 2 && (
-                <div>
-                  {/* QA subsidiary mapping summary */}
-                  {profiles.length > 0 && (
-                    <div className="mb-4 rounded-md border overflow-auto">
-                      <Table>
-                        <TableHeader>
-                          <TableRow>
-                            <TableHead className="text-xs">Profile (subsidiary)</TableHead>
-                            <TableHead className="text-xs">QA Subsidiary ID</TableHead>
-                          </TableRow>
-                        </TableHeader>
-                        <TableBody>
-                          {profiles.map((p: any) => {
-                            const name = p.subsidiary?.name ?? "—";
-                            const qaId = resolveQASubsidiaryId(name, qaSubsidiaryRefs);
-                            return (
-                              <TableRow key={p.id}>
-                                <TableCell className="text-xs">{name}</TableCell>
-                                <TableCell className="text-xs font-mono">
-                                  {qaId
-                                    ? <span className="text-green-600">{qaId}</span>
-                                    : <span className="text-amber-600 flex items-center gap-1"><AlertTriangle className="h-3 w-3" />No match</span>}
-                                </TableCell>
-                              </TableRow>
-                            );
-                          })}
-                        </TableBody>
-                      </Table>
-                    </div>
-                  )}
+            <CardContent className="space-y-3">
+            <div className="flex items-center gap-3">
+              <Button onClick={executeCloneFromPreflight} disabled={runningClone || !preflightReady} className="gap-2">
+                {runningClone ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
+                {cloneResults.length > 0 ? "Re-run clone" : "Start clone"}
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                Run clone here using the latest preflight selection.
+              </span>
+            </div>
 
-                  <Button
-                    onClick={handleClone}
-                    disabled={loading}
-                    className="w-full gap-2"
-                  >
-                    {loading
-                      ? <><Loader2 className="h-4 w-4 animate-spin" />Cloning…</>
-                      : <><ArrowRight className="h-4 w-4" />Clone to QA</>}
-                  </Button>
-                </div>
-              )}
+            <div className="text-sm text-muted-foreground">
+              {runningClone
+                ? "Clone run in progress..."
+                : `Processed ${cloneResults.length} supplier(s).`}
+            </div>
 
-              {step === 3 && cloneStatus && (
-                <div className="space-y-4">
-                  {/* Clone summary banner */}
-                  <div className={`rounded-md border p-3 text-xs space-y-1 ${cloneErrors.length > 0 ? "bg-amber-50 border-amber-200 text-amber-700" : "bg-green-50 border-green-200 text-green-700"}`}>
-                    <div className="flex items-center gap-1.5 font-medium mb-2">
-                      {cloneErrors.length === 0
-                        ? <><CheckCircle2 className="h-3.5 w-3.5" />All records cloned successfully.</>
-                        : <><AlertTriangle className="h-3.5 w-3.5" />Clone completed with warnings.</>}
-                    </div>
-                    {[
-                      ["Supplier", cloneStatus.supplier],
-                      ["Profiles", cloneStatus.profiles],
-                      ["Contacts", cloneStatus.contacts],
-                    ].map(([label, value]) => (
-                      <div key={label} className="flex items-center gap-2">
-                        <span className="w-16 shrink-0 font-medium">{label}</span>
-                        <StepStatus value={value} />
-                      </div>
-                    ))}
-                    {cloneErrors.map((e, i) => (
-                      <div key={i} className="flex items-start gap-1.5 mt-1">
-                        <AlertTriangle className="h-3 w-3 shrink-0 mt-0.5" />{e}
-                      </div>
-                    ))}
-                  </div>
-
-                  {/* QA record tabs — mirrors Production panel */}
-                  {qaSupplierData ? (
-                    <Tabs value={qaActiveTab} onValueChange={setQAActiveTab}>
-                      <TabsList className="mb-4">
-                        <TabsTrigger value="supplier">Supplier</TabsTrigger>
-                        <TabsTrigger value="profiles">
-                          Profiles
-                          {qaProfiles.length > 0 && <Badge variant="secondary" className="ml-1.5 text-[10px]">{qaProfiles.length}</Badge>}
-                        </TabsTrigger>
-                        <TabsTrigger value="contacts">
-                          Contacts
-                          {qaContacts.length > 0 && <Badge variant="secondary" className="ml-1.5 text-[10px]">{qaContacts.length}</Badge>}
-                        </TabsTrigger>
-                      </TabsList>
-
-                      <TabsContent value="supplier">
-                        <div className="space-y-1 text-sm">
-                          {([
-                            ["ID",          qaSupplierData.id],
-                            ["Name",        qaSupplierData.name],
-                            ["Legal Name",  qaSupplierData.legalName],
-                            ["State",       qaSupplierData.state],
-                            ["Entity Type", qaSupplierData.entityType],
-                            ["Tax Number",  qaSupplierData.taxNumber],
-                            ["Website",     qaSupplierData.website],
-                            ["Description", qaSupplierData.description],
-                          ] as [string, unknown][]).filter(([, v]) => v).map(([label, val]) => (
-                            <div key={label} className="flex gap-2">
-                              <span className="text-muted-foreground w-28 shrink-0 text-xs">{label}</span>
-                              <span className="text-xs break-all">{String(val)}</span>
-                            </div>
-                          ))}
-                          {qaSupplierData.customFields && Object.keys(qaSupplierData.customFields).length > 0 && (
-                            <div className="mt-3 pt-3 border-t">
-                              <p className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground mb-2">Custom Fields</p>
-                              {Object.entries(qaSupplierData.customFields).map(([key, field]: any) => (
-                                <div key={key} className="flex gap-2 text-xs">
-                                  <span className="text-muted-foreground w-40 shrink-0">{field.name}</span>
-                                  <FieldValue value={field.value} />
-                                </div>
+            <div className="overflow-x-auto border rounded-md">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Supplier</TableHead>
+                    <TableHead>Supplier</TableHead>
+                    <TableHead>Profiles</TableHead>
+                    <TableHead>Contacts</TableHead>
+                    <TableHead>Products/Services</TableHead>
+                    <TableHead>Warnings</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {cloneResults.map((row) => (
+                    <TableRow key={row.supplierId}>
+                      <TableCell>
+                        <div className="font-medium text-sm">{row.supplierName}</div>
+                        <div className="text-[11px] text-muted-foreground font-mono">{row.supplierId}</div>
+                      </TableCell>
+                      <TableCell className="text-xs"><StatusPill value={row.supplierStatus} /></TableCell>
+                      <TableCell className="text-xs"><StatusPill value={row.profilesStatus} /></TableCell>
+                      <TableCell className="text-xs"><StatusPill value={row.contactsStatus} /></TableCell>
+                      <TableCell className="text-xs"><StatusPill value={row.productsServicesStatus} /></TableCell>
+                      <TableCell className="text-xs">
+                        {row.warnings.length === 0
+                          ? <span className="text-muted-foreground">—</span>
+                          : (
+                            <ul className="space-y-1">
+                              {row.warnings.map((w, i) => (
+                                <li key={i} className="text-amber-700">{w}</li>
                               ))}
-                            </div>
+                            </ul>
                           )}
-                        </div>
-                      </TabsContent>
-
-                      <TabsContent value="profiles">
-                        {qaProfiles.length === 0 ? (
-                          <p className="text-sm text-muted-foreground">No profiles found.</p>
-                        ) : (
-                          <div className="space-y-2">
-                            {qaProfiles.map((profile: any) => (
-                              <CollapsibleSection
-                                key={profile.id}
-                                title={`${profile.subsidiary?.name ?? "—"} (${profile.state ?? "—"})`}
-                                defaultOpen={false}
-                              >
-                                <div className="text-xs space-y-0.5">
-                                  <div><span className="text-muted-foreground">QA Profile ID:</span> {profile.id}</div>
-                                  <div><span className="text-muted-foreground">Payment Method:</span> {profile.paymentMethod?.name ?? "—"}</div>
-                                  <div><span className="text-muted-foreground">Payment Terms:</span> {profile.paymentTerms?.name ?? "—"}</div>
-                                </div>
-                              </CollapsibleSection>
-                            ))}
-                          </div>
-                        )}
-                      </TabsContent>
-
-                      <TabsContent value="contacts">
-                        {qaContacts.length === 0 ? (
-                          <p className="text-sm text-muted-foreground">No contacts found.</p>
-                        ) : (
-                          <div className="space-y-2">
-                            {qaContacts.map((contact: any) => (
-                              <CollapsibleSection
-                                key={contact.id ?? contact.user?.email}
-                                title={`${contact.user?.firstName ?? ""} ${contact.user?.lastName ?? ""}`.trim() || (contact.user?.email ?? "—")}
-                                defaultOpen={false}
-                              >
-                                <div className="text-xs space-y-0.5">
-                                  <div><span className="text-muted-foreground">Email:</span> {contact.user?.email ?? "—"}</div>
-                                  <div><span className="text-muted-foreground">Role:</span> {contact.role ?? "—"}</div>
-                                  <div><span className="text-muted-foreground">Title:</span> {contact.title ?? "—"}</div>
-                                </div>
-                              </CollapsibleSection>
-                            ))}
-                          </div>
-                        )}
-                      </TabsContent>
-                    </Tabs>
-                  ) : (
-                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                      <Loader2 className="h-4 w-4 animate-spin" />Loading QA records…
-                    </div>
-                  )}
-                </div>
-              )}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
             </CardContent>
           </Card>
         </div>

@@ -53,6 +53,16 @@ export interface FlowLogicCondition {
   conditionSummary?: string;
 }
 
+/** Block routing / milestone mapping CSV row. */
+export interface FlowBlockStructure {
+  id?: string;
+  workflow: string;
+  block: string;
+  nextBlocks: string[];
+  milestone?: string;
+  milestoneReference?: string;
+}
+
 export interface FlowsMetadataState {
   data: FlowMetadata[];
   filename: string | null;

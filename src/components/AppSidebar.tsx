@@ -11,6 +11,8 @@ import {
   ShieldAlert,
   BarChart2,
   FlaskConical,
+  Lightbulb,
+  Trash2,
 } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import { useLocation } from "react-router-dom";
@@ -32,6 +34,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 const toolsItems = [
   { title: "BSP Internal Contact", url: "/tools/bsp-contact", icon: Users },
   { title: "Prod→QA Supplier Clone", url: "/tools/prod-to-qa-clone", icon: ArrowRightLeft },
+  { title: "QA Cleanup", url: "/tools/qa-cleanup", icon: Trash2 },
 ];
 
 const auditItems = [
@@ -51,6 +54,7 @@ const simulatorItems = [
 const flowsMetadataItems = [
   { title: "Configuration", url: "/flows-metadata/configuration", icon: Settings },
   { title: "View", url: "/flows-metadata/view", icon: BarChart3 },
+  { title: "Logic Helper", url: "/flows-metadata/logic-helper", icon: Lightbulb },
 ];
 
 export function AppSidebar() {

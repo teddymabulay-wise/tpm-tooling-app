@@ -40,15 +40,17 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
-import type { FlowLogicCondition, FlowMetadata, FlowTag } from "@/lib/flows-metadata-types";
+import type { FlowBlockStructure, FlowLogicCondition, FlowMetadata, FlowTag } from "@/lib/flows-metadata-types";
 import {
   buildFlowMetadataFromTemplateCSV,
+  exportFlowBlockStructureToCSV,
   exportFlowLogicConditionsToCSV,
   exportFlowTagsToCSV,
   exportMetadataToCSV,
   extractLogicConditionsFromMetadata,
   extractTagsFromFlowsCSV,
   generateMetadataSummary,
+  parseFlowBlockStructureCSV,
   parseFlowLogicConditionsCSV,
   parseLogicConditionJSON,
   parseTagImportJSON,
@@ -60,16 +62,142 @@ import {
 // ── Storage keys ──────────────────────────────────────────────────────────────
 const TAGS_LS_KEY = "omnea_tags_v1";
 const LOGIC_LS_KEY = "omnea_logic_conditions_v1";
+const BLOCK_STRUCTURE_LS_KEY = "omnea_block_structure_v1";
+const METADATA_LS_KEY = "omnea_flow_metadata_v1";
 const EDIT_COLUMNS_WIDTH_LS_KEY = "omnea_edit_columns_width_v1";
 const TAG_COLUMNS_WIDTH_LS_KEY = "omnea_tag_columns_width_v1";
 const LOGIC_COLUMNS_WIDTH_LS_KEY = "omnea_logic_columns_width_v1";
 const FLOW_CSV_PATH = "/doc/Omnea Flow Meta Data.csv";
 const TAGS_CSV_PATH = "/doc/Omnea Tag Meta data.csv";
 const LOGIC_CSV_PATH = "/doc/Omnea Logic and Condition.csv";
+const BLOCK_STRUCTURE_CSV_PATH = "/doc/Omnea Block Structure.csv";
 const FLOW_CSV_FILENAME = "Omnea Flow Meta Data.csv";
 const TAGS_CSV_FILENAME = "Omnea Tag Meta data.csv";
 const LOGIC_CSV_FILENAME = "Omnea Logic and Condition.csv";
+const BLOCK_STRUCTURE_CSV_FILENAME = "Omnea Block Structure.csv";
 const FLOW_IMPORT_BLOCK_TYPES = ["Intake", "Task", "Trigger Integration", "Supplier Portal"];
+
+const normalizeActorLookupLabel = (value: string) => value.toLowerCase().replace(/^milestone:\s*/i, "").replace(/\s*\([^)]*\)\s*/g, " ").replace(/[^a-z0-9]+/g, " ").trim();
+
+const getActorLookupKey = (workflow: string, label: string) => `${workflow.trim().toLowerCase()}::${label.trim().toLowerCase()}`;
+
+const generateMilestoneReference = (workflow: string, block: string, milestone: string) => {
+  const slug = `${workflow}-${block}-${milestone}`
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return `ms-${slug}-${Date.now().toString(36).slice(-6)}`;
+};
+
+const extractTagConditionReferences = (rawCondition: string) => {
+  const results: Array<{ questionId: string; value: string; operator: string }> = [];
+
+  const addDeduped = (entries: Array<{ questionId: string; value: string; operator: string }>) => {
+    const dedup = new Map<string, { questionId: string; value: string; operator: string }>();
+    entries.forEach((entry) => {
+      const key = `${entry.questionId}::${entry.value}::${entry.operator}`;
+      if (!dedup.has(key)) dedup.set(key, entry);
+    });
+    return Array.from(dedup.values());
+  };
+
+  const parsePlainTextReferences = (condition: string) => {
+    const operators = [
+      "LESS_THAN_OR_EQUAL_TO",
+      "GREATER_THAN_OR_EQUAL_TO",
+      "NOT_CONTAINS",
+      "NOT_EQUAL",
+      "LESS_THAN",
+      "GREATER_THAN",
+      "CONTAINS",
+      "EQUAL",
+    ];
+
+    const cleaned = condition
+      .replace(/[()]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (!cleaned) return [] as Array<{ questionId: string; value: string; operator: string }>;
+
+    const segments = cleaned.split(/\s+(?:AND|OR)\s+/i);
+    const plainResults: Array<{ questionId: string; value: string; operator: string }> = [];
+
+    segments.forEach((segment) => {
+      const token = segment.trim();
+      if (!token) return;
+
+      const op = operators.find((candidate) => token.includes(` ${candidate} `));
+      if (!op) return;
+
+      const [left, ...rightParts] = token.split(` ${op} `);
+      const questionId = left.trim();
+      const value = rightParts.join(` ${op} `).trim();
+
+      if (!questionId) return;
+
+      plainResults.push({
+        questionId,
+        value: value || "(empty)",
+        operator: op,
+      });
+    });
+
+    return plainResults;
+  };
+
+  try {
+    const parsed = JSON.parse(rawCondition);
+
+    const walk = (node: unknown) => {
+      if (!node || typeof node !== "object") return;
+
+      const record = node as {
+        operator?: unknown;
+        type?: unknown;
+        primaryField?: { type?: unknown; value?: unknown };
+        secondaryField?: { value?: unknown };
+        items?: unknown;
+        comparisons?: unknown;
+      };
+
+      if (
+        record.primaryField
+        && typeof record.primaryField === "object"
+        && record.primaryField.type === "VARIABLE"
+        && typeof record.primaryField.value === "string"
+      ) {
+        const secondaryValue = record.secondaryField && typeof record.secondaryField === "object"
+          ? (record.secondaryField as { value?: unknown }).value
+          : undefined;
+        results.push({
+          questionId: record.primaryField.value,
+          value: typeof secondaryValue === "string" || typeof secondaryValue === "number" || typeof secondaryValue === "boolean"
+            ? String(secondaryValue)
+            : secondaryValue == null
+            ? "(empty)"
+            : JSON.stringify(secondaryValue),
+          operator: typeof record.operator === "string" ? record.operator : "",
+        });
+      }
+
+      const collections: unknown[] = [];
+      if (Array.isArray(record.items)) collections.push(record.items);
+      if (Array.isArray(record.comparisons)) collections.push(record.comparisons);
+
+      collections.forEach((collection) => {
+        (collection as unknown[]).forEach((item) => walk(item));
+      });
+    };
+
+    walk(parsed);
+  } catch {
+    return addDeduped(parsePlainTextReferences(rawCondition));
+  }
+
+  return addDeduped(results);
+};
 
 // ── Helper function to get default column widths ────────────────────────────
 function getDefaultEditColumnWidths(): Record<string, number> {
@@ -155,6 +283,12 @@ const EMPTY_ROW: Omit<FlowMetadata, "id"> = {
 
 const EMPTY_TAG: Omit<FlowTag, "id"> = { workflow: "", tagName: "", tagConditions: "" };
 const EMPTY_LOGIC: Omit<FlowLogicCondition, "id"> = { workflow: "", scope: "", logicName: "", logicCondition: "" };
+const EMPTY_BLOCK_STRUCTURE: Omit<FlowBlockStructure, "id"> = {
+  workflow: "",
+  block: "",
+  nextBlocks: [],
+  milestone: "",
+};
 
 export function FlowsMetadataConfigPage() {
   // ── Metadata state ─────────────────────────────────────────────────────────
@@ -216,6 +350,23 @@ export function FlowsMetadataConfigPage() {
   const [logicImportName, setLogicImportName] = useState("");
   const [logicImportCondition, setLogicImportCondition] = useState("");
   const [logicImportError, setLogicImportError] = useState<string | null>(null);
+
+  // ── Block structure state ─────────────────────────────────────────────────
+  const [blockStructures, setBlockStructures] = useState<FlowBlockStructure[]>([]);
+  const [blockStructureUpdatedAt, setBlockStructureUpdatedAt] = useState<string | null>(null);
+  const [blockStructureHasChanges, setBlockStructureHasChanges] = useState(false);
+  const [selectedBlockStructureRows, setSelectedBlockStructureRows] = useState<Set<string>>(new Set());
+  const [blockStructureSearchText, setBlockStructureSearchText] = useState("");
+  const [isBlockStructureLoading, setIsBlockStructureLoading] = useState(false);
+  const [isBlockStructureSaving, setIsBlockStructureSaving] = useState(false);
+  const [blockStructureWorkflow, setBlockStructureWorkflow] = useState("");
+  const [blockStructureBlocks, setBlockStructureBlocks] = useState<string[]>([]);
+  const [blockStructureNextBlocks, setBlockStructureNextBlocks] = useState<string[]>([]);
+  const [blockStructureMilestone, setBlockStructureMilestone] = useState("");
+  const [blockStructureError, setBlockStructureError] = useState<string | null>(null);
+  const [isNextBlocksModalOpen, setIsNextBlocksModalOpen] = useState(false);
+  const [isBlocksModalOpen, setIsBlocksModalOpen] = useState(false);
+  const [isBlockStructureFormOpen, setIsBlockStructureFormOpen] = useState(false);
 
   // ── Column widths state ───────────────────────────────────────────────────
   const [editColumnWidths, setEditColumnWidths] = useState<Record<string, number>>(() => {
@@ -280,6 +431,18 @@ export function FlowsMetadataConfigPage() {
       }
     } else {
       void loadLogicCSVData(true);
+    }
+
+    const storedBlockStructure = localStorage.getItem(BLOCK_STRUCTURE_LS_KEY);
+    if (storedBlockStructure) {
+      try {
+        setBlockStructures(JSON.parse(storedBlockStructure) as FlowBlockStructure[]);
+        setBlockStructureUpdatedAt(new Date().toLocaleString());
+      } catch {
+        void loadBlockStructureCSVData();
+      }
+    } else {
+      void loadBlockStructureCSVData();
     }
   }, []);
 
@@ -393,6 +556,625 @@ export function FlowsMetadataConfigPage() {
       });
     return result;
   }, [data, logicImportWorkflow]);
+
+  const blockOptionsByWorkflow = useMemo(() => {
+    const byWorkflow = new Map<string, string[]>();
+    const push = (workflow: string, blockLabel: string) => {
+      if (!workflow || !blockLabel) return;
+      const current = byWorkflow.get(workflow) ?? [];
+      if (!current.includes(blockLabel)) current.push(blockLabel);
+      byWorkflow.set(workflow, current);
+    };
+
+    data.forEach((record) => {
+      const workflow = record.workflow.trim();
+      const blockName = record.blockName.trim();
+      if (!workflow || !blockName) return;
+      const blockLabel = record.blockType?.trim() ? `${blockName} (${record.blockType.trim()})` : blockName;
+      push(workflow, blockLabel);
+    });
+
+    blockStructures.forEach((row) => {
+      const workflow = row.workflow.trim();
+      if (!workflow) return;
+      push(workflow, row.block.trim());
+      row.nextBlocks.forEach((nextBlock) => push(workflow, nextBlock.trim()));
+      if (row.milestone?.trim()) {
+        push(workflow, `Milestone: ${row.milestone.trim()}`);
+      }
+    });
+
+    byWorkflow.forEach((values, key) => {
+      byWorkflow.set(key, values.sort((left, right) => left.localeCompare(right)));
+    });
+
+    return byWorkflow;
+  }, [blockStructures, data]);
+
+  const blockStructureBlockOptions = useMemo(
+    () => (blockStructureWorkflow ? blockOptionsByWorkflow.get(blockStructureWorkflow) ?? [] : []),
+    [blockOptionsByWorkflow, blockStructureWorkflow],
+  );
+
+  const blockStructureNextBlockOptions = useMemo(
+    () => blockStructureBlockOptions.filter((option) => !blockStructureBlocks.includes(option)),
+    [blockStructureBlockOptions, blockStructureBlocks],
+  );
+
+  const blockMilestoneOptions = useMemo(
+    () => Array.from(new Set(blockStructures.map((row) => (row.milestone ?? "").trim()).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+    [blockStructures],
+  );
+
+  const hasMilestoneInput = blockStructureMilestone.trim().length > 0;
+
+  const visibleBlockStructures = useMemo(() => {
+    if (!blockStructureSearchText.trim()) return blockStructures;
+    const search = blockStructureSearchText.toLowerCase();
+    return blockStructures.filter((row) =>
+      [
+        row.workflow,
+        row.block,
+        row.nextBlocks.join(" "),
+        row.milestone ?? "",
+        row.milestoneReference ?? "",
+      ].some((value) => value.toLowerCase().includes(search)),
+    );
+  }, [blockStructures, blockStructureSearchText]);
+
+  const blockDetailsByLabel = useMemo(() => {
+    const map = new Map<string, {
+      assignees: Set<string>;
+      questionIds: Set<string>;
+      formQuestionIds: Map<string, Set<string>>;
+    }>();
+
+    const ensureEntry = (workflow: string, label: string) => {
+      const key = getActorLookupKey(workflow, label);
+      const existing = map.get(key);
+      if (existing) return existing;
+      const created = {
+        assignees: new Set<string>(),
+        questionIds: new Set<string>(),
+        formQuestionIds: new Map<string, Set<string>>(),
+      };
+      map.set(key, created);
+      return created;
+    };
+
+    const push = (
+      workflow: string,
+      label: string,
+      assignees: string[],
+      formName: string,
+      questionId: string,
+    ) => {
+      if (!label) return;
+      const labels = [label, normalizeActorLookupLabel(label)];
+      labels.forEach((value) => {
+        const entry = ensureEntry(workflow, value);
+        assignees.forEach((assignee) => entry.assignees.add(assignee));
+        if (questionId) entry.questionIds.add(questionId);
+        if (formName) {
+          const current = entry.formQuestionIds.get(formName) ?? new Set<string>();
+          if (questionId) current.add(questionId);
+          entry.formQuestionIds.set(formName, current);
+        }
+      });
+    };
+
+    data.forEach((record) => {
+      const workflow = record.workflow.trim();
+      const blockName = record.blockName.trim();
+      if (!workflow || !blockName) return;
+
+      const blockType = record.blockType.trim();
+      const blockLabel = blockType ? `${blockName} (${blockType})` : blockName;
+      const assignees = record.assignees
+        .split(/[|,;\/\n]/)
+        .map((value) => value.trim())
+        .filter(Boolean);
+      const formName = record.formName.trim();
+      const questionId = record.questionId.trim();
+
+      push(workflow, blockName, assignees, formName, questionId);
+      push(workflow, blockLabel, assignees, formName, questionId);
+    });
+
+    return map;
+  }, [data]);
+
+  const blockAssigneesByLabel = useMemo(() => {
+    const map = new Map<string, string[]>();
+    blockDetailsByLabel.forEach((value, key) => {
+      map.set(key, Array.from(value.assignees).sort((left, right) => left.localeCompare(right)));
+    });
+    return map;
+  }, [blockDetailsByLabel]);
+
+  const getBlockDetailsForLabel = (workflow: string, blockLabel: string) => {
+    const keys = [
+      getActorLookupKey(workflow, blockLabel),
+      getActorLookupKey(workflow, normalizeActorLookupLabel(blockLabel)),
+    ];
+
+    for (const key of keys) {
+      const details = blockDetailsByLabel.get(key);
+      if (!details) continue;
+      return {
+        assignees: Array.from(details.assignees).sort((left, right) => left.localeCompare(right)),
+        questionIds: Array.from(details.questionIds).sort((left, right) => left.localeCompare(right)),
+        formQuestionIds: Object.fromEntries(
+          Array.from(details.formQuestionIds.entries()).map(([form, questionIds]) => [
+            form,
+            Array.from(questionIds).sort((left, right) => left.localeCompare(right)),
+          ]),
+        ) as Record<string, string[]>,
+      };
+    }
+
+    return {
+      assignees: [] as string[],
+      questionIds: [] as string[],
+      formQuestionIds: {} as Record<string, string[]>,
+    };
+  };
+
+  const groupedVisibleBlockStructures = useMemo(() => {
+    const groups = new Map<string, {
+      workflow: string;
+      rowIndices: number[];
+      blocks: string[];
+      fromActors: Set<string>;
+      questionIds: Set<string>;
+      nextBlockQuestionIds: Set<string>;
+      rowFormQuestionIds: Map<string, Set<string>>;
+      blockDetailsByBlock: Map<string, {
+        assignees: string[];
+        questionIds: string[];
+        formQuestionIds: Record<string, string[]>;
+      }>;
+      nextBlocks: string[];
+      nextActorsByBlock: Map<string, Set<string>>;
+      nextBlockDetailsByBlock: Map<string, {
+        questionIds: Set<string>;
+        formQuestionIds: Map<string, Set<string>>;
+      }>;
+      milestones: Set<string>;
+      milestoneReferences: Set<string>;
+      firstRowIndex: number;
+    }>();
+
+    const getActorsForBlock = (workflow: string, blockLabel: string) => {
+      const exactMatch = blockAssigneesByLabel.get(getActorLookupKey(workflow, blockLabel));
+      if (exactMatch && exactMatch.length > 0) return exactMatch;
+      return blockAssigneesByLabel.get(getActorLookupKey(workflow, normalizeActorLookupLabel(blockLabel))) ?? [];
+    };
+
+    visibleBlockStructures.forEach((row) => {
+      const rowIndex = blockStructures.indexOf(row);
+      const normalizedWorkflow = row.workflow.trim().toLowerCase();
+      const groupKey = row.nextBlocks.length === 1
+        ? `${normalizedWorkflow}::${row.nextBlocks[0].trim().toLowerCase()}`
+        : `row-${rowIndex}`;
+
+      const existing = groups.get(groupKey);
+      if (!existing) {
+        const nextActorsByBlock = new Map<string, Set<string>>();
+        const nextBlockDetailsByBlock = new Map<string, {
+          questionIds: Set<string>;
+          formQuestionIds: Map<string, Set<string>>;
+        }>();
+        row.nextBlocks.forEach((nextBlock) => {
+          const nextDetails = getBlockDetailsForLabel(row.workflow, nextBlock);
+          nextActorsByBlock.set(nextBlock, new Set(nextDetails.assignees));
+          const formQuestionIds = new Map<string, Set<string>>();
+          Object.entries(nextDetails.formQuestionIds).forEach(([form, questionIds]) => {
+            formQuestionIds.set(form, new Set(questionIds));
+          });
+          nextBlockDetailsByBlock.set(nextBlock, {
+            questionIds: new Set(nextDetails.questionIds),
+            formQuestionIds,
+          });
+        });
+
+        const sourceDetails = getBlockDetailsForLabel(row.workflow, row.block);
+        const rowFormQuestionIds = new Map<string, Set<string>>();
+        Object.entries(sourceDetails.formQuestionIds).forEach(([form, questionIds]) => {
+          rowFormQuestionIds.set(form, new Set(questionIds));
+        });
+
+        groups.set(groupKey, {
+          workflow: row.workflow,
+          rowIndices: [rowIndex],
+          blocks: [row.block],
+          fromActors: new Set(sourceDetails.assignees),
+          questionIds: new Set(sourceDetails.questionIds),
+          nextBlockQuestionIds: new Set(row.nextBlocks.flatMap((nextBlock) => getBlockDetailsForLabel(row.workflow, nextBlock).questionIds)),
+          rowFormQuestionIds,
+          blockDetailsByBlock: new Map([[row.block, {
+            assignees: sourceDetails.assignees,
+            questionIds: sourceDetails.questionIds,
+            formQuestionIds: sourceDetails.formQuestionIds,
+          }]]),
+          nextBlocks: [...row.nextBlocks],
+          nextActorsByBlock,
+          nextBlockDetailsByBlock,
+          milestones: new Set((row.milestone ?? "").trim() ? [(row.milestone ?? "").trim()] : []),
+          milestoneReferences: new Set((row.milestoneReference ?? "").trim() ? [(row.milestoneReference ?? "").trim()] : []),
+          firstRowIndex: rowIndex,
+        });
+        return;
+      }
+
+      existing.rowIndices.push(rowIndex);
+      if (!existing.blocks.includes(row.block)) existing.blocks.push(row.block);
+      const sourceDetails = getBlockDetailsForLabel(row.workflow, row.block);
+      sourceDetails.assignees.forEach((actor) => existing.fromActors.add(actor));
+      sourceDetails.questionIds.forEach((questionId) => existing.questionIds.add(questionId));
+      if (!existing.blockDetailsByBlock.has(row.block)) {
+        existing.blockDetailsByBlock.set(row.block, {
+          assignees: sourceDetails.assignees,
+          questionIds: sourceDetails.questionIds,
+          formQuestionIds: sourceDetails.formQuestionIds,
+        });
+      } else {
+        const currentBlockDetails = existing.blockDetailsByBlock.get(row.block);
+        if (currentBlockDetails) {
+          currentBlockDetails.assignees = Array.from(new Set([...currentBlockDetails.assignees, ...sourceDetails.assignees]))
+            .sort((left, right) => left.localeCompare(right));
+          currentBlockDetails.questionIds = Array.from(new Set([...currentBlockDetails.questionIds, ...sourceDetails.questionIds]))
+            .sort((left, right) => left.localeCompare(right));
+          const mergedForms: Record<string, string[]> = { ...currentBlockDetails.formQuestionIds };
+          Object.entries(sourceDetails.formQuestionIds).forEach(([form, questionIds]) => {
+            mergedForms[form] = Array.from(new Set([...(mergedForms[form] ?? []), ...questionIds]))
+              .sort((left, right) => left.localeCompare(right));
+          });
+          currentBlockDetails.formQuestionIds = mergedForms;
+        }
+      }
+      Object.entries(sourceDetails.formQuestionIds).forEach(([form, questionIds]) => {
+        const current = existing.rowFormQuestionIds.get(form) ?? new Set<string>();
+        questionIds.forEach((questionId) => current.add(questionId));
+        existing.rowFormQuestionIds.set(form, current);
+      });
+
+      row.nextBlocks.forEach((nextBlock) => {
+        if (!existing.nextBlocks.includes(nextBlock)) existing.nextBlocks.push(nextBlock);
+        const currentActors = existing.nextActorsByBlock.get(nextBlock) ?? new Set<string>();
+        const nextDetails = getBlockDetailsForLabel(row.workflow, nextBlock);
+        nextDetails.assignees.forEach((actor) => currentActors.add(actor));
+        nextDetails.questionIds.forEach((questionId) => existing.nextBlockQuestionIds.add(questionId));
+        existing.nextActorsByBlock.set(nextBlock, currentActors);
+
+        const currentDetails = existing.nextBlockDetailsByBlock.get(nextBlock) ?? {
+          questionIds: new Set<string>(),
+          formQuestionIds: new Map<string, Set<string>>(),
+        };
+        nextDetails.questionIds.forEach((questionId) => currentDetails.questionIds.add(questionId));
+        Object.entries(nextDetails.formQuestionIds).forEach(([form, questionIds]) => {
+          const currentQuestionIds = currentDetails.formQuestionIds.get(form) ?? new Set<string>();
+          questionIds.forEach((questionId) => currentQuestionIds.add(questionId));
+          currentDetails.formQuestionIds.set(form, currentQuestionIds);
+        });
+        existing.nextBlockDetailsByBlock.set(nextBlock, currentDetails);
+      });
+
+      const milestone = (row.milestone ?? "").trim();
+      const milestoneReference = (row.milestoneReference ?? "").trim();
+      if (milestone) existing.milestones.add(milestone);
+      if (milestoneReference) existing.milestoneReferences.add(milestoneReference);
+    });
+
+    return Array.from(groups.values())
+      .sort((left, right) => left.firstRowIndex - right.firstRowIndex)
+      .map((group) => ({
+        workflow: group.workflow,
+        rowIndices: group.rowIndices,
+        blocks: group.blocks,
+        fromActors: Array.from(group.fromActors).sort((left, right) => left.localeCompare(right)),
+        questionIds: Array.from(group.questionIds).sort((left, right) => left.localeCompare(right)),
+        nextBlockQuestionIds: Array.from(group.nextBlockQuestionIds).sort((left, right) => left.localeCompare(right)),
+        rowFormQuestionIds: Object.fromEntries(
+          Array.from(group.rowFormQuestionIds.entries()).map(([form, questionIds]) => [
+            form,
+            Array.from(questionIds).sort((left, right) => left.localeCompare(right)),
+          ]),
+        ) as Record<string, string[]>,
+        blockDetailsByBlock: Object.fromEntries(Array.from(group.blockDetailsByBlock.entries())),
+        nextBlocks: group.nextBlocks,
+        nextActorsByBlock: Object.fromEntries(
+          Array.from(group.nextActorsByBlock.entries()).map(([block, actors]) => [block, Array.from(actors).sort((left, right) => left.localeCompare(right))]),
+        ),
+        nextBlockDetailsByBlock: Object.fromEntries(
+          Array.from(group.nextBlockDetailsByBlock.entries()).map(([block, details]) => [
+            block,
+            {
+              questionIds: Array.from(details.questionIds).sort((left, right) => left.localeCompare(right)),
+              formQuestionIds: Object.fromEntries(
+                Array.from(details.formQuestionIds.entries()).map(([form, questionIds]) => [
+                  form,
+                  Array.from(questionIds).sort((left, right) => left.localeCompare(right)),
+                ]),
+              ) as Record<string, string[]>,
+            },
+          ]),
+        ) as Record<string, { questionIds: string[]; formQuestionIds: Record<string, string[]> }>,
+        milestone: group.milestones.size === 0 ? "" : group.milestones.size === 1 ? Array.from(group.milestones)[0] : "Multiple",
+        milestoneReference: group.milestoneReferences.size === 0 ? "" : group.milestoneReferences.size === 1 ? Array.from(group.milestoneReferences)[0] : "Multiple",
+      }));
+  }, [visibleBlockStructures, blockStructures, blockAssigneesByLabel, blockDetailsByLabel]);
+
+  const workflowTagsWithDetails = useMemo(() => {
+    const workflowQuestions = new Map<string, Map<string, { forms: Set<string>; titles: Set<string> }>>();
+    data.forEach((record) => {
+      const workflow = record.workflow.trim().toLowerCase();
+      const questionId = record.questionId.trim();
+      if (!workflow || !questionId) return;
+      const formName = record.formName.trim() || "(No form)";
+      const questionTitle = record.questionTitle.trim();
+      const current = workflowQuestions.get(workflow) ?? new Map<string, { forms: Set<string>; titles: Set<string> }>();
+      const questionMeta = current.get(questionId) ?? { forms: new Set<string>(), titles: new Set<string>() };
+      const forms = questionMeta.forms;
+      forms.add(formName);
+      if (questionTitle) questionMeta.titles.add(questionTitle);
+      current.set(questionId, questionMeta);
+      workflowQuestions.set(workflow, current);
+    });
+
+    const map = new Map<string, Array<{
+      tagName: string;
+      references: Array<{ questionId: string; value: string; operator: string; forms: string[]; questionTitles: string[] }>;
+    }>>();
+    tags.forEach((tag) => {
+      const workflow = tag.workflow.trim().toLowerCase();
+      if (!workflow) return;
+      const questionMeta = workflowQuestions.get(workflow) ?? new Map<string, { forms: Set<string>; titles: Set<string> }>();
+      const references = extractTagConditionReferences(tag.tagConditions)
+        .filter((reference) => questionMeta.has(reference.questionId))
+        .map((reference) => ({
+          ...reference,
+          forms: Array.from(questionMeta.get(reference.questionId)?.forms ?? []).sort((left, right) => left.localeCompare(right)),
+          questionTitles: Array.from(questionMeta.get(reference.questionId)?.titles ?? []).sort((left, right) => left.localeCompare(right)),
+        }));
+      const current = map.get(workflow) ?? [];
+      current.push({
+        tagName: tag.tagName,
+        references,
+      });
+      map.set(workflow, current);
+    });
+
+    return map;
+  }, [data, tags]);
+
+  const completedFromBlockKeys = useMemo(() => {
+    const blockToRowIndices = new Map<string, Set<string>>();
+
+    groupedVisibleBlockStructures.forEach((row) => {
+      row.blocks.forEach((block) => {
+        const key = `${row.workflow.trim().toLowerCase()}::${block.trim().toLowerCase()}`;
+        const indices = blockToRowIndices.get(key) ?? new Set<string>();
+        row.rowIndices.forEach((rowIndex) => indices.add(String(rowIndex)));
+        blockToRowIndices.set(key, indices);
+      });
+    });
+
+    const completed = new Set<string>();
+    blockToRowIndices.forEach((indices, key) => {
+      if (Array.from(indices).every((rowIndex) => selectedBlockStructureRows.has(rowIndex))) {
+        completed.add(key);
+      }
+    });
+
+    return completed;
+  }, [groupedVisibleBlockStructures, selectedBlockStructureRows]);
+
+  const blockSequenceTransitions = useMemo(() => {
+    const transitions: Array<{
+      rowIndex: number;
+      workflow: string;
+      fromBlock: string;
+      toBlock: string;
+      fromActors: string[];
+      toActors: string[];
+      milestone: string;
+      milestoneReference: string;
+    }> = [];
+
+    visibleBlockStructures.forEach((row) => {
+      const rowIndex = blockStructures.indexOf(row);
+      const getActorsForBlock = (blockLabel: string) => {
+        const exactMatch = blockAssigneesByLabel.get(getActorLookupKey(row.workflow, blockLabel));
+        if (exactMatch && exactMatch.length > 0) return exactMatch;
+        return blockAssigneesByLabel.get(getActorLookupKey(row.workflow, normalizeActorLookupLabel(blockLabel))) ?? [];
+      };
+
+      const fromActors = getActorsForBlock(row.block);
+      row.nextBlocks.forEach((toBlock) => {
+        transitions.push({
+          rowIndex,
+          workflow: row.workflow,
+          fromBlock: row.block,
+          toBlock,
+          fromActors,
+          toActors: getActorsForBlock(toBlock),
+          milestone: (row.milestone ?? "").trim(),
+          milestoneReference: (row.milestoneReference ?? "").trim(),
+        });
+      });
+    });
+
+    return transitions;
+  }, [blockAssigneesByLabel, blockStructures, visibleBlockStructures]);
+
+  const blockSequenceActors = useMemo(() => {
+    const actors = new Set<string>();
+    blockSequenceTransitions.forEach((transition) => {
+      const fromCandidates = transition.fromActors.length > 0 ? transition.fromActors : ["Unassigned"];
+      const toIsMilestone = transition.toBlock.toLowerCase().startsWith("milestone:");
+      const toCandidates = transition.toActors.length > 0 ? transition.toActors : (toIsMilestone ? fromCandidates : ["Unassigned"]);
+      fromCandidates.forEach((actor) => actors.add(actor));
+      toCandidates.forEach((actor) => actors.add(actor));
+    });
+    return Array.from(actors);
+  }, [blockSequenceTransitions]);
+
+  const blockSequenceMessages = useMemo(() => {
+    return blockSequenceTransitions.flatMap((transition) => {
+      const toIsMilestone = transition.toBlock.toLowerCase().startsWith("milestone:");
+      const fromCandidates = transition.fromActors.length > 0 ? transition.fromActors : ["Unassigned"];
+      const toCandidates = transition.toActors.length > 0
+        ? transition.toActors
+        : (toIsMilestone ? fromCandidates : ["Unassigned"]);
+
+      const pairCount = Math.max(fromCandidates.length, toCandidates.length);
+      const label = `${transition.fromBlock} -> ${transition.toBlock}`;
+
+      return Array.from({ length: pairCount }, (_, idx) => {
+        const fromActor = fromCandidates[Math.min(idx, fromCandidates.length - 1)] ?? "Unassigned";
+        const toActor = toCandidates[Math.min(idx, toCandidates.length - 1)] ?? fromActor;
+        return {
+          ...transition,
+          fromActor,
+          toActor,
+          label,
+        };
+      });
+    });
+  }, [blockSequenceTransitions]);
+
+  const blockJourneyRows = useMemo(() => {
+    const grouped = new Map<string, {
+      rowIndex: number;
+      workflow: string;
+      fromBlock: string;
+      fromActors: string[];
+      milestone: string;
+      destinations: Array<{ toBlock: string; toActors: string[] }>;
+    }>();
+
+    blockSequenceTransitions.forEach((transition) => {
+      const key = `${transition.rowIndex}::${transition.workflow}::${transition.fromBlock}`;
+      const existing = grouped.get(key);
+      if (!existing) {
+        grouped.set(key, {
+          rowIndex: transition.rowIndex,
+          workflow: transition.workflow,
+          fromBlock: transition.fromBlock,
+          fromActors: transition.fromActors,
+          milestone: transition.milestone,
+          destinations: [{ toBlock: transition.toBlock, toActors: transition.toActors }],
+        });
+        return;
+      }
+
+      existing.destinations.push({ toBlock: transition.toBlock, toActors: transition.toActors });
+    });
+
+    return Array.from(grouped.values()).sort((left, right) => {
+      if (left.workflow !== right.workflow) return left.workflow.localeCompare(right.workflow);
+      return left.fromBlock.localeCompare(right.fromBlock);
+    });
+  }, [blockSequenceTransitions]);
+
+  const blockJourneyWorkflows = useMemo(() => {
+    const workflowMap = new Map<string, typeof blockJourneyRows>();
+
+    blockJourneyRows.forEach((row) => {
+      const current = workflowMap.get(row.workflow) ?? [];
+      current.push(row);
+      workflowMap.set(row.workflow, current);
+    });
+
+    return Array.from(workflowMap.entries()).map(([workflow, workflowRows]) => {
+      const adjacency = new Map<string, Set<string>>();
+      const indegree = new Map<string, number>();
+      const actorsByBlock = new Map<string, Set<string>>();
+
+      const ensureBlock = (block: string, actors: string[]) => {
+        if (!actorsByBlock.has(block)) actorsByBlock.set(block, new Set());
+        actors.forEach((actor) => actorsByBlock.get(block)?.add(actor));
+        if (!indegree.has(block)) indegree.set(block, 0);
+      };
+
+      workflowRows.forEach((row) => {
+        ensureBlock(row.fromBlock, row.fromActors);
+        row.destinations.forEach((destination) => {
+          ensureBlock(destination.toBlock, destination.toActors);
+          if (!adjacency.has(row.fromBlock)) adjacency.set(row.fromBlock, new Set());
+          const outgoing = adjacency.get(row.fromBlock);
+          if (!outgoing?.has(destination.toBlock)) {
+            outgoing?.add(destination.toBlock);
+            indegree.set(destination.toBlock, (indegree.get(destination.toBlock) ?? 0) + 1);
+          }
+        });
+      });
+
+      const allBlocks = Array.from(actorsByBlock.keys()).sort((left, right) => left.localeCompare(right));
+      const roots = allBlocks.filter((block) => (indegree.get(block) ?? 0) === 0);
+      const visited = new Set<string>();
+      const levels: Array<Array<{ block: string; actors: string[]; isMilestone: boolean }>> = [];
+
+      let frontier = roots.length > 0 ? roots : [...allBlocks];
+      while (frontier.length > 0) {
+        const currentLevel = Array.from(new Set(frontier)).filter((block) => !visited.has(block));
+        if (currentLevel.length === 0) break;
+
+        levels.push(
+          currentLevel.map((block) => ({
+            block,
+            actors: Array.from(actorsByBlock.get(block) ?? []).sort((left, right) => left.localeCompare(right)),
+            isMilestone: block.toLowerCase().startsWith("milestone:"),
+          })),
+        );
+
+        currentLevel.forEach((block) => visited.add(block));
+        const nextFrontier = new Set<string>();
+        currentLevel.forEach((block) => {
+          (adjacency.get(block) ?? new Set()).forEach((nextBlock) => {
+            if (!visited.has(nextBlock)) nextFrontier.add(nextBlock);
+          });
+        });
+        frontier = Array.from(nextFrontier).sort((left, right) => left.localeCompare(right));
+      }
+
+      const remaining = allBlocks.filter((block) => !visited.has(block));
+      if (remaining.length > 0) {
+        levels.push(
+          remaining.map((block) => ({
+            block,
+            actors: Array.from(actorsByBlock.get(block) ?? []).sort((left, right) => left.localeCompare(right)),
+            isMilestone: block.toLowerCase().startsWith("milestone:"),
+          })),
+        );
+      }
+
+      return {
+        workflow,
+        rowIndices: Array.from(new Set(workflowRows.map((row) => row.rowIndex))),
+        levels,
+      };
+    });
+  }, [blockJourneyRows]);
+
+  useEffect(() => {
+    if (!blockStructureWorkflow && workflowOptions.length > 0) {
+      setBlockStructureWorkflow(workflowOptions[0]);
+    }
+  }, [blockStructureWorkflow, workflowOptions]);
+
+  useEffect(() => {
+    setBlockStructureBlocks([]);
+    setBlockStructureNextBlocks([]);
+    setSelectedBlockStructureRows(new Set());
+  }, [blockStructureWorkflow]);
+
+  useEffect(() => {
+    if (!hasMilestoneInput) return;
+    setBlockStructureNextBlocks([]);
+    setIsNextBlocksModalOpen(false);
+  }, [hasMilestoneInput]);
 
   const visibleData = useMemo(() => {
     if (!searchText) return data;
@@ -584,6 +1366,168 @@ export function FlowsMetadataConfigPage() {
       }
     } finally {
       setIsLogicLoading(false);
+    }
+  }
+
+  async function loadBlockStructureCSVData() {
+    try {
+      setIsBlockStructureLoading(true);
+      setError(null);
+
+      const response = await fetch(BLOCK_STRUCTURE_CSV_PATH);
+      if (!response.ok) {
+        // Treat missing file as empty state.
+        setBlockStructures([]);
+        localStorage.setItem(BLOCK_STRUCTURE_LS_KEY, JSON.stringify([]));
+        setBlockStructureUpdatedAt(new Date().toLocaleString());
+        setBlockStructureHasChanges(false);
+        setSelectedBlockStructureRows(new Set());
+        return;
+      }
+
+      const content = await response.text();
+      const parsedRows = parseFlowBlockStructureCSV(content);
+      setBlockStructures(parsedRows);
+      localStorage.setItem(BLOCK_STRUCTURE_LS_KEY, JSON.stringify(parsedRows));
+      setBlockStructureUpdatedAt(new Date().toLocaleString());
+      setBlockStructureHasChanges(false);
+      setSelectedBlockStructureRows(new Set());
+    } catch (loadError) {
+      setError(`Failed to load block structure CSV: ${loadError instanceof Error ? loadError.message : "Unknown error"}`);
+    } finally {
+      setIsBlockStructureLoading(false);
+    }
+  }
+
+  function handleToggleBlockStructureNextBlock(option: string) {
+    if (blockStructureMilestone.trim()) return;
+    setBlockStructureNextBlocks((current) => {
+      if (current.includes(option)) {
+        return current.filter((value) => value !== option);
+      }
+      return [...current, option].sort((left, right) => left.localeCompare(right));
+    });
+  }
+
+  function handleToggleBlockStructureSourceBlock(option: string) {
+    setBlockStructureBlocks((current) => {
+      if (current.includes(option)) {
+        return current.filter((value) => value !== option);
+      }
+      return [...current, option].sort((left, right) => left.localeCompare(right));
+    });
+    setBlockStructureNextBlocks((current) => current.filter((entry) => entry !== option));
+    setBlockStructureError(null);
+  }
+
+  function handleAddBlockStructure() {
+    const workflow = blockStructureWorkflow.trim();
+    const sourceBlocks = Array.from(new Set(blockStructureBlocks.map((value) => value.trim()).filter(Boolean)));
+    const nextBlocks = Array.from(new Set(blockStructureNextBlocks.map((value) => value.trim()).filter(Boolean))).filter((value) => !sourceBlocks.includes(value));
+    const milestone = blockStructureMilestone.trim();
+    const milestoneBlock = milestone ? `Milestone: ${milestone}` : "";
+    const effectiveNextBlocks = milestoneBlock ? [milestoneBlock] : nextBlocks;
+
+    if (!workflow) {
+      setBlockStructureError("Workflow is required.");
+      return;
+    }
+    if (sourceBlocks.length === 0) {
+      setBlockStructureError("Select at least one source block.");
+      return;
+    }
+    if (effectiveNextBlocks.length === 0) {
+      setBlockStructureError("Select at least one Next Block or add a Milestone.");
+      return;
+    }
+    if (sourceBlocks.length > 1 && !milestone && effectiveNextBlocks.length > 1) {
+      setBlockStructureError("When multiple source blocks are selected, choose a single next block or use a milestone.");
+      return;
+    }
+
+    const existingBlocks = sourceBlocks.filter((block) => blockStructures.some((row) => row.workflow === workflow && row.block === block));
+    const blocksToCreate = sourceBlocks.filter((block) => !existingBlocks.includes(block));
+
+    if (blocksToCreate.length === 0) {
+      setBlockStructureError("All selected workflow/block mappings already exist. Delete them first if you want to recreate them.");
+      return;
+    }
+
+    setBlockStructures((current) => [
+      ...current,
+      ...blocksToCreate.map((block, index) => ({
+        id: `block-structure-${Date.now()}-${index}`,
+        workflow,
+        block,
+        nextBlocks: effectiveNextBlocks,
+        milestone,
+        milestoneReference: milestone ? generateMilestoneReference(workflow, block, milestone) : "",
+      })),
+    ]);
+    setBlockStructureHasChanges(true);
+    setBlockStructureError(
+      existingBlocks.length > 0
+        ? `Added ${blocksToCreate.length} mapping(s). Skipped existing: ${existingBlocks.join(", ")}.`
+        : null,
+    );
+    setBlockStructureBlocks([]);
+    setBlockStructureNextBlocks([]);
+    setBlockStructureMilestone("");
+    if (existingBlocks.length === 0) {
+      setIsBlockStructureFormOpen(false);
+    }
+  }
+
+  function handleDeleteBlockStructureRows() {
+    setBlockStructures((current) => current.filter((_, index) => !selectedBlockStructureRows.has(String(index))));
+    setSelectedBlockStructureRows(new Set());
+    setBlockStructureHasChanges(true);
+  }
+
+  function toggleBlockStructureRow(index: number) {
+    const key = String(index);
+    setSelectedBlockStructureRows((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  function toggleBlockStructureRows(indices: number[]) {
+    const keys = indices.map((value) => String(value));
+    setSelectedBlockStructureRows((current) => {
+      const next = new Set(current);
+      const allSelected = keys.every((key) => next.has(key));
+      keys.forEach((key) => {
+        if (allSelected) next.delete(key);
+        else next.add(key);
+      });
+      return next;
+    });
+  }
+
+  function toggleAllBlockStructureRows(checked: boolean) {
+    if (!checked) {
+      setSelectedBlockStructureRows(new Set());
+      return;
+    }
+    setSelectedBlockStructureRows(new Set(visibleBlockStructures.map((row) => String(blockStructures.indexOf(row)))));
+  }
+
+  async function handleSaveBlockStructureChanges() {
+    try {
+      setIsBlockStructureSaving(true);
+      setError(null);
+      const csvContent = exportFlowBlockStructureToCSV(blockStructures);
+      await saveCSVToWorkspace(BLOCK_STRUCTURE_CSV_FILENAME, csvContent);
+      localStorage.setItem(BLOCK_STRUCTURE_LS_KEY, JSON.stringify(blockStructures));
+      setBlockStructureUpdatedAt(new Date().toLocaleString());
+      setBlockStructureHasChanges(false);
+    } catch (saveError) {
+      setError(`Failed to save block structure: ${saveError instanceof Error ? saveError.message : "Unknown error"}`);
+    } finally {
+      setIsBlockStructureSaving(false);
     }
   }
 
@@ -1101,10 +2045,11 @@ export function FlowsMetadataConfigPage() {
         ) : null}
 
           <Tabs className="flex flex-col gap-3" defaultValue="flow">
-            <TabsList className="grid w-full max-w-[480px] grid-cols-3 border border-slate-200 bg-white">
+            <TabsList className="grid w-full max-w-[640px] grid-cols-4 border border-slate-200 bg-white">
               <TabsTrigger className="text-xs" value="flow">Flow</TabsTrigger>
               <TabsTrigger className="text-xs" value="tags">Tags</TabsTrigger>
               <TabsTrigger className="text-xs" value="logic">Logic and Condition</TabsTrigger>
+              <TabsTrigger className="text-xs" value="block">Block</TabsTrigger>
             </TabsList>
 
             <TabsContent className="mt-0 space-y-3" value="flow">
@@ -1532,7 +2477,598 @@ export function FlowsMetadataConfigPage() {
                 </CardContent>
               </Card>
             </TabsContent>
+
+            <TabsContent className="mt-0 space-y-3" value="block">
+              <Card className="border-slate-200 bg-white shadow-sm">
+                <CardContent className="grid gap-2 p-3 md:grid-cols-[minmax(220px,1.4fr)_repeat(5,max-content)] md:items-end">
+                  <div className="space-y-1">
+                    <FilterLabel label="Block Structure Search" />
+                    <Input
+                      className="h-8 border-slate-200 text-xs placeholder:text-slate-400"
+                      placeholder="Search workflow, block, milestone..."
+                      value={blockStructureSearchText}
+                      onChange={(event) => setBlockStructureSearchText(event.target.value)}
+                    />
+                  </div>
+                  <ActionButton
+                    icon={<RefreshCw className="h-3.5 w-3.5" />}
+                    label={isBlockStructureLoading ? "Loading..." : "Reload CSV"}
+                    onClick={() => {
+                      localStorage.removeItem(BLOCK_STRUCTURE_LS_KEY);
+                      void loadBlockStructureCSVData();
+                    }}
+                    disabled={isBlockStructureLoading || isBlockStructureSaving}
+                  />
+                  <ActionButton
+                    icon={<Plus className="h-3.5 w-3.5" />}
+                    label="Add Row"
+                    onClick={() => {
+                      setIsBlockStructureFormOpen(true);
+                      setBlockStructureError(null);
+                    }}
+                    disabled={isBlockStructureSaving}
+                  />
+                  <ActionButton
+                    icon={<Trash2 className="h-3.5 w-3.5" />}
+                    label={`Delete ${selectedBlockStructureRows.size || ""}`.trim()}
+                    onClick={handleDeleteBlockStructureRows}
+                    disabled={selectedBlockStructureRows.size === 0 || isBlockStructureSaving}
+                    destructive
+                  />
+                  <ActionButton
+                    icon={<Save className="h-3.5 w-3.5" />}
+                    label={isBlockStructureSaving ? "Saving..." : "Save Block"}
+                    onClick={() => void handleSaveBlockStructureChanges()}
+                    disabled={!blockStructureHasChanges || isBlockStructureSaving}
+                    primary
+                  />
+                  <ActionButton
+                    icon={<Download className="h-3.5 w-3.5" />}
+                    label="Export CSV"
+                    onClick={() => downloadCSV(exportFlowBlockStructureToCSV(blockStructures), BLOCK_STRUCTURE_CSV_FILENAME)}
+                    disabled={isBlockStructureSaving}
+                  />
+                </CardContent>
+              </Card>
+
+              <div className="flex min-h-8 flex-wrap items-center gap-1.5 px-1 text-[11px] text-slate-500">
+                {blockStructureHasChanges ? (
+                  <Badge className="h-6 rounded-md bg-amber-50 px-2 text-[11px] font-medium text-amber-700" variant="secondary">
+                    Unsaved block structure changes
+                  </Badge>
+                ) : null}
+                {blockStructureUpdatedAt ? <span>Last updated: {blockStructureUpdatedAt}</span> : null}
+                {blockStructureSearchText ? (
+                  <Badge
+                    className="h-6 cursor-pointer rounded-md bg-blue-50 px-2 text-[11px] font-medium text-blue-700 hover:bg-blue-100"
+                    variant="secondary"
+                    onClick={() => setBlockStructureSearchText("")}
+                  >
+                    Search: {blockStructureSearchText}
+                    <X className="ml-1 h-3 w-3" />
+                  </Badge>
+                ) : null}
+              </div>
+
+              {isBlockStructureFormOpen ? (
+                <Card className="border-slate-200 bg-white shadow-sm">
+                  <div className="flex items-center justify-between border-b border-slate-200 px-4 py-2">
+                    <div>
+                      <h2 className="text-sm font-semibold text-slate-900">Add Block Structure</h2>
+                      <p className="text-[11px] text-slate-500">Configure workflow, source blocks, milestone, and next blocks.</p>
+                    </div>
+                    <Button
+                      className="h-7 px-2 text-[11px]"
+                      size="sm"
+                      type="button"
+                      variant="outline"
+                      onClick={() => setIsBlockStructureFormOpen(false)}
+                    >
+                      Close
+                    </Button>
+                  </div>
+
+                  <CardContent className="grid gap-3 p-4 md:grid-cols-2">
+                    <FlowField label="Workflow" required>
+                      <SelectOrCreateField
+                        allowCustom={false}
+                        compact
+                        onChange={(value) => {
+                          setBlockStructureWorkflow(value);
+                          setBlockStructureError(null);
+                        }}
+                        options={workflowOptions}
+                        placeholder="Select workflow"
+                        value={blockStructureWorkflow}
+                      />
+                    </FlowField>
+
+                    <div className="md:col-span-2 grid gap-1.5">
+                      <FilterLabel label="Source Blocks *" />
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          className="h-8 border-slate-200 text-xs"
+                          onClick={() => setIsBlocksModalOpen(true)}
+                          disabled={!blockStructureWorkflow || blockStructureBlockOptions.length === 0}
+                        >
+                          Select Source Blocks
+                        </Button>
+                        <span className="text-[11px] text-slate-500">
+                          {blockStructureBlocks.length > 0 ? `${blockStructureBlocks.length} selected` : "No source blocks selected"}
+                        </span>
+                      </div>
+                      {blockStructureBlocks.length > 0 ? (
+                        <div className="flex flex-wrap gap-1.5">
+                          {blockStructureBlocks.map((value) => (
+                            <Badge key={`source-${value}`} className="rounded-md bg-sky-50 px-2 text-[11px] font-medium text-sky-700" variant="secondary">
+                              {value}
+                            </Badge>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-[11px] text-slate-500">Choose one or more source blocks in the modal.</p>
+                      )}
+                    </div>
+
+                    <FlowField label="Milestone">
+                      <SelectOrCreateField
+                        compact
+                        onChange={(value) => {
+                          setBlockStructureMilestone(value);
+                          setBlockStructureError(null);
+                        }}
+                        options={blockMilestoneOptions}
+                        placeholder="Select or create milestone"
+                        value={blockStructureMilestone}
+                      />
+                    </FlowField>
+
+                    <div className="md:col-span-2 grid gap-1.5">
+                      <FilterLabel label={hasMilestoneInput ? "Next Blocks (disabled while milestone is set)" : "Next Blocks (multiple) *"} />
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          className="h-8 border-slate-200 text-xs"
+                          onClick={() => setIsNextBlocksModalOpen(true)}
+                          disabled={!blockStructureWorkflow || blockStructureBlocks.length === 0 || blockStructureNextBlockOptions.length === 0 || hasMilestoneInput}
+                        >
+                          Select Next Blocks
+                        </Button>
+                        <span className="text-[11px] text-slate-500">
+                          {hasMilestoneInput
+                            ? "Milestone selected: next blocks are locked"
+                            : blockStructureNextBlocks.length > 0
+                            ? `${blockStructureNextBlocks.length} selected`
+                            : "No next blocks selected"}
+                        </span>
+                      </div>
+                      {blockStructureNextBlocks.length > 0 ? (
+                        <div className="flex flex-wrap gap-1.5">
+                          {blockStructureNextBlocks.map((value) => (
+                            <Badge key={`next-${value}`} className="rounded-md bg-indigo-50 px-2 text-[11px] font-medium text-indigo-700" variant="secondary">
+                              {value}
+                            </Badge>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-[11px] text-slate-500">
+                          {hasMilestoneInput ? "Clear milestone if you want to select downstream blocks." : "Choose the downstream blocks in the modal."}
+                        </p>
+                      )}
+                    </div>
+
+                    {blockStructureError ? (
+                      <Alert className="md:col-span-2" variant="destructive">
+                        <AlertCircle className="h-4 w-4" />
+                        <AlertDescription>{blockStructureError}</AlertDescription>
+                      </Alert>
+                    ) : null}
+
+                    <div className="md:col-span-2 flex justify-end gap-2">
+                      <Button className="h-8 text-xs" variant="outline" onClick={() => setIsBlockStructureFormOpen(false)}>
+                        Cancel
+                      </Button>
+                      <Button className="h-8 text-xs" onClick={handleAddBlockStructure}>
+                        Add Block Structure
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
+              ) : null}
+
+              <Card className="border-slate-200 bg-white shadow-sm">
+                <CardContent className="flex h-full min-h-0 flex-col p-0">
+                  <div className="flex items-center justify-between border-b border-slate-200 px-3 py-2">
+                    <div>
+                      <h2 className="text-sm font-semibold text-slate-900">Block Structure Table</h2>
+                      <p className="text-[11px] text-slate-500">Table view of source blocks, next blocks, and matching tags.</p>
+                    </div>
+                    <div className="text-[11px] text-slate-500">
+                      Showing <span className="font-semibold text-slate-700">{groupedVisibleBlockStructures.length}</span> rows
+                    </div>
+                  </div>
+
+                  <ScrollArea className="h-[460px]">
+                    <table className="w-full border-collapse text-[11px] text-slate-700">
+                      <thead className="sticky top-0 z-10 bg-slate-50 text-left text-[10px] uppercase tracking-wide text-slate-500">
+                        <tr>
+                          <th className="w-10 border-b border-slate-200 px-2 py-2">
+                            <input
+                              type="checkbox"
+                              checked={groupedVisibleBlockStructures.length > 0 && groupedVisibleBlockStructures.every((row) => row.rowIndices.every((rowIndex) => selectedBlockStructureRows.has(String(rowIndex))))}
+                              onChange={(event) => toggleAllBlockStructureRows(event.target.checked)}
+                            />
+                          </th>
+                          <th className="border-b border-slate-200 px-2 py-2">Workflow</th>
+                          <th className="border-b border-slate-200 px-2 py-2">From Block</th>
+                          <th className="border-b border-slate-200 px-2 py-2">Next Blocks</th>
+                          <th className="border-b border-slate-200 px-2 py-2">Tags</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {groupedVisibleBlockStructures.length === 0 ? (
+                          <tr>
+                            <td className="px-2 py-8 text-center text-xs text-slate-500" colSpan={5}>
+                              No block structures found.
+                            </td>
+                          </tr>
+                        ) : (
+                          groupedVisibleBlockStructures.map((row) => {
+                            const isSelected = row.rowIndices.some((rowIndex) => selectedBlockStructureRows.has(String(rowIndex)));
+                            const allSelected = row.rowIndices.every((rowIndex) => selectedBlockStructureRows.has(String(rowIndex)));
+                            const workflowTags = workflowTagsWithDetails.get(row.workflow.trim().toLowerCase()) ?? [];
+                            const tagGroupsByBlockAndForm = row.blocks
+                              .map((block) => {
+                                const blockDetails = row.blockDetailsByBlock[block] ?? { questionIds: [], formQuestionIds: {} };
+                                const formGroups = Object.entries(blockDetails.formQuestionIds)
+                                  .map(([form, questionIds]) => {
+                                    const tagsForForm = workflowTags
+                                      .map((tag) => ({
+                                        tagName: tag.tagName,
+                                        references: tag.references.filter((reference) => questionIds.includes(reference.questionId)),
+                                      }))
+                                      .filter((tag) => tag.references.length > 0);
+
+                                    return {
+                                      form,
+                                      tags: tagsForForm,
+                                    };
+                                  })
+                                  .filter((formGroup) => formGroup.tags.length > 0);
+
+                                return {
+                                  block,
+                                  forms: formGroups,
+                                };
+                              })
+                              .filter((blockGroup) => blockGroup.forms.length > 0);
+
+                            return (
+                              <tr key={`block-structure-row-${row.rowIndices.join("-")}`} className={isSelected ? "bg-cyan-50/70" : "bg-white"}>
+                                <td className="border-b border-slate-200 px-2 py-2 align-top">
+                                  <input checked={allSelected} onChange={() => toggleBlockStructureRows(row.rowIndices)} type="checkbox" />
+                                </td>
+                                <td className="border-b border-slate-200 px-2 py-2 align-top text-slate-700">{row.workflow}</td>
+                                <td className="border-b border-slate-200 px-2 py-2 align-top">
+                                  <div className="space-y-2">
+                                    {row.blocks.map((block) => {
+                                      const fromBlockKey = `${row.workflow.trim().toLowerCase()}::${block.trim().toLowerCase()}`;
+                                      const isCompletedFromBlock = completedFromBlockKeys.has(fromBlockKey);
+
+                                      return (
+                                      <div
+                                        className={`rounded-md border p-2 ${isCompletedFromBlock ? "border-red-300 border-l-4 border-l-red-600 bg-red-50/60" : "border-slate-200 bg-slate-50/50"}`}
+                                        key={`block-source-${row.rowIndices.join("-")}-${block}`}
+                                      >
+                                        <HoverCard closeDelay={120} openDelay={140}>
+                                          <HoverCardTrigger asChild>
+                                            <Badge className="cursor-help rounded-md bg-slate-100 px-2 text-[10px] font-medium text-slate-700" variant="secondary">
+                                              {block}
+                                            </Badge>
+                                          </HoverCardTrigger>
+                                          <HoverCardContent align="start" className="w-[360px] border-slate-200 bg-white p-3" side="top" sideOffset={8}>
+                                            <div className="space-y-2 text-[11px]">
+                                              <div className="font-semibold text-slate-800">{block}</div>
+                                              <div>
+                                                <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Forms</div>
+                                                <div className="flex flex-wrap gap-1">
+                                                  {Object.keys(row.blockDetailsByBlock[block]?.formQuestionIds ?? {}).length > 0
+                                                    ? Object.keys(row.blockDetailsByBlock[block].formQuestionIds).map((form) => (
+                                                      <Badge className="rounded-md bg-indigo-50 px-2 text-[10px] font-medium text-indigo-700" key={`block-form-${row.rowIndices.join("-")}-${block}-${form}`} variant="secondary">
+                                                        {form}
+                                                      </Badge>
+                                                    ))
+                                                    : <span className="text-slate-500">No forms</span>}
+                                                </div>
+                                              </div>
+                                              <div>
+                                                <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Question IDs</div>
+                                                <div className="flex max-h-24 flex-wrap gap-1 overflow-y-auto">
+                                                  {(row.blockDetailsByBlock[block]?.questionIds ?? []).length > 0
+                                                    ? row.blockDetailsByBlock[block].questionIds.map((questionId) => (
+                                                      <Badge className="rounded-md bg-emerald-50 px-2 text-[10px] font-medium text-emerald-700" key={`block-qid-${row.rowIndices.join("-")}-${block}-${questionId}`} variant="secondary">
+                                                        {questionId}
+                                                      </Badge>
+                                                    ))
+                                                    : <span className="text-slate-500">No question IDs</span>}
+                                                </div>
+                                              </div>
+                                            </div>
+                                          </HoverCardContent>
+                                        </HoverCard>
+                                        <div className="mt-1 flex flex-wrap gap-1">
+                                          {Object.keys(row.blockDetailsByBlock[block]?.formQuestionIds ?? {}).length > 0
+                                            ? Object.keys(row.blockDetailsByBlock[block].formQuestionIds).map((form) => (
+                                              <Badge className="rounded-md bg-indigo-50 px-2 text-[10px] font-medium text-indigo-700" key={`block-form-inline-${row.rowIndices.join("-")}-${block}-${form}`} variant="secondary">
+                                                {form}
+                                              </Badge>
+                                            ))
+                                            : <span className="text-[10px] text-slate-500">No forms</span>}
+                                        </div>
+                                        <div className="mt-1 flex flex-wrap gap-1">
+                                          {(row.blockDetailsByBlock[block]?.assignees?.length > 0 ? row.blockDetailsByBlock[block].assignees : ["Unassigned"]).map((assignee) => (
+                                            <Badge key={`block-assignee-${row.rowIndices.join("-")}-${block}-${assignee}`} className="rounded-md bg-sky-50 px-2 text-[10px] font-medium text-sky-700" variant="secondary">
+                                              {assignee}
+                                            </Badge>
+                                          ))}
+                                        </div>
+                                        {isCompletedFromBlock ? (
+                                          <div className="mt-1 text-[10px] font-medium uppercase tracking-wide text-red-700">
+                                            All next blocks selected
+                                          </div>
+                                        ) : null}
+                                      </div>
+                                    );
+                                    })}
+                                  </div>
+                                </td>
+                                <td className="border-b border-slate-200 px-2 py-2 align-top">
+                                  <div className="space-y-2">
+                                    {row.nextBlocks.map((nextBlock) => {
+                                      const nextActors = row.nextActorsByBlock[nextBlock] ?? [];
+                                      const nextBlockDetails = row.nextBlockDetailsByBlock[nextBlock] ?? { questionIds: [], formQuestionIds: {} };
+                                      const isMilestone = nextBlock.toLowerCase().startsWith("milestone:");
+                                      return (
+                                        <div key={`block-next-${row.rowIndices.join("-")}-${nextBlock}`} className={`rounded-md border px-2 py-2 ${isMilestone ? "border-amber-200 bg-amber-50/60" : "border-emerald-200 bg-emerald-50/60"}`}>
+                                          <div className="flex items-center justify-between gap-2">
+                                            <div className="text-[11px] font-medium text-slate-800">{nextBlock}</div>
+                                          </div>
+                                          <div className="mt-1 flex flex-wrap gap-1">
+                                            {Object.keys(nextBlockDetails.formQuestionIds).length > 0
+                                              ? Object.keys(nextBlockDetails.formQuestionIds).map((form) => (
+                                                <Badge className="rounded-md bg-indigo-50 px-2 text-[10px] font-medium text-indigo-700" key={`next-form-inline-${row.rowIndices.join("-")}-${nextBlock}-${form}`} variant="secondary">
+                                                  {form}
+                                                </Badge>
+                                              ))
+                                              : <span className="text-[10px] text-slate-500">No forms</span>}
+                                          </div>
+                                          <div className="mt-1 flex flex-wrap gap-1">
+                                            {(nextActors.length > 0 ? nextActors : ["Unassigned"]).map((actor) => (
+                                              <Badge key={`block-next-actor-${row.rowIndices.join("-")}-${nextBlock}-${actor}`} className={`rounded-md bg-white px-2 text-[10px] font-medium ${isMilestone ? "text-amber-700" : "text-emerald-700"}`} variant="secondary">
+                                                {actor}
+                                              </Badge>
+                                            ))}
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </td>
+                                <td className="border-b border-slate-200 px-2 py-2 align-top">
+                                  {tagGroupsByBlockAndForm.length === 0 ? (
+                                    <span className="text-slate-500">-</span>
+                                  ) : (
+                                    <div className="space-y-2">
+                                      {tagGroupsByBlockAndForm.map((blockGroup) => (
+                                        <div key={`row-tag-block-${row.rowIndices.join("-")}-${blockGroup.block}`} className="rounded-md border border-slate-200 bg-slate-50/60 p-2">
+                                          <Badge className="rounded-md bg-slate-100 px-2 text-[10px] font-medium text-slate-700" variant="secondary">
+                                            {blockGroup.block}
+                                          </Badge>
+                                          <div className="mt-1.5 space-y-1.5">
+                                            {blockGroup.forms.map((formGroup) => (
+                                              <div key={`row-tag-form-${row.rowIndices.join("-")}-${blockGroup.block}-${formGroup.form}`} className="rounded border border-indigo-100 bg-white px-2 py-1.5">
+                                                <div className="mb-1">
+                                                  <Badge className="rounded-md bg-indigo-50 px-2 text-[10px] font-medium text-indigo-700" variant="secondary">
+                                                    {formGroup.form}
+                                                  </Badge>
+                                                </div>
+                                                <div className="flex flex-wrap gap-1">
+                                                  {formGroup.tags.map((tag) => (
+                                                    <HoverCard closeDelay={120} key={`row-tag-${row.rowIndices.join("-")}-${blockGroup.block}-${formGroup.form}-${tag.tagName}`} openDelay={140}>
+                                                      <HoverCardTrigger asChild>
+                                                        <Badge className="cursor-help rounded-md bg-violet-50 px-2 text-[10px] font-medium text-violet-700" variant="secondary">
+                                                          {tag.tagName}
+                                                        </Badge>
+                                                      </HoverCardTrigger>
+                                                      <HoverCardContent align="start" className="w-[480px] border-slate-200 bg-white p-3" side="top" sideOffset={8}>
+                                                        <div className="space-y-2 text-[11px]">
+                                                          <div className="font-semibold text-slate-800">{tag.tagName}</div>
+                                                          <div className="text-[11px] text-slate-700">
+                                                            Question IDs: {Array.from(new Set(tag.references.map((reference) => reference.questionId))).join(", ") || "-"}
+                                                          </div>
+                                                          <div className="text-[11px] text-slate-700">
+                                                            Questions: {Array.from(new Set(tag.references.map((reference) => {
+                                                              const title = reference.questionTitles.find((entry) => entry.trim() && entry.trim() !== "?" && entry.trim() !== "-");
+                                                              return title || reference.questionId;
+                                                            }))).join(" | ") || "-"}
+                                                          </div>
+                                                          <div className="text-[10px] uppercase tracking-wide text-slate-500">Tag references (matched via FROM Block + Form)</div>
+                                                          <div className="max-h-40 overflow-y-auto rounded border border-slate-200">
+                                                            <table className="w-full border-collapse text-[10px]">
+                                                              <thead className="bg-slate-50 text-slate-500">
+                                                                <tr>
+                                                                  <th className="border-b border-slate-200 px-2 py-1 text-left">Form</th>
+                                                                  <th className="border-b border-slate-200 px-2 py-1 text-left">Question ID</th>
+                                                                  <th className="border-b border-slate-200 px-2 py-1 text-left">Question</th>
+                                                                  <th className="border-b border-slate-200 px-2 py-1 text-left">Operator</th>
+                                                                  <th className="border-b border-slate-200 px-2 py-1 text-left">Value</th>
+                                                                </tr>
+                                                              </thead>
+                                                              <tbody>
+                                                                {tag.references.map((reference, referenceIndex) => (
+                                                                  <tr key={`row-tag-ref-${row.rowIndices.join("-")}-${blockGroup.block}-${formGroup.form}-${tag.tagName}-${reference.questionId}-${referenceIndex}`}>
+                                                                    <td className="border-b border-slate-100 px-2 py-1 align-top text-slate-700">{formGroup.form}</td>
+                                                                    <td className="border-b border-slate-100 px-2 py-1 align-top font-medium text-slate-800">{reference.questionId}</td>
+                                                                    <td className="border-b border-slate-100 px-2 py-1 align-top text-slate-700">{reference.questionTitles.find((entry) => entry.trim() && entry.trim() !== "?" && entry.trim() !== "-") || reference.questionId}</td>
+                                                                    <td className="border-b border-slate-100 px-2 py-1 align-top text-slate-700">{reference.operator || "-"}</td>
+                                                                    <td className="border-b border-slate-100 px-2 py-1 align-top text-slate-700">{reference.value}</td>
+                                                                  </tr>
+                                                                ))}
+                                                              </tbody>
+                                                            </table>
+                                                          </div>
+                                                        </div>
+                                                      </HoverCardContent>
+                                                    </HoverCard>
+                                                  ))}
+                                                </div>
+                                              </div>
+                                            ))}
+                                          </div>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </td>
+                              </tr>
+                            );
+                          })
+                        )}
+                      </tbody>
+                    </table>
+                    <ScrollBar orientation="horizontal" />
+                  </ScrollArea>
+                </CardContent>
+              </Card>
+            </TabsContent>
           </Tabs>
+
+          <Dialog open={isBlocksModalOpen} onOpenChange={setIsBlocksModalOpen}>
+            <DialogContent className="max-w-2xl border-slate-200 bg-white">
+              <DialogHeader>
+                <DialogTitle className="text-base text-slate-900">Select Source Blocks</DialogTitle>
+                <DialogDescription>
+                  Choose one or more source blocks. The same next target will be applied to each selected source block.
+                </DialogDescription>
+              </DialogHeader>
+
+              <div className="grid gap-3">
+                <div className="text-xs text-slate-600">
+                  <span className="font-semibold">Workflow:</span> {blockStructureWorkflow || "-"}
+                </div>
+
+                {blockStructureBlockOptions.length === 0 ? (
+                  <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-4 text-sm text-slate-500">
+                    No blocks available. Select a workflow first.
+                  </div>
+                ) : (
+                  <ScrollArea className="h-[300px] rounded-md border border-slate-200 bg-slate-50 p-2">
+                    <div className="flex flex-wrap gap-1.5">
+                      {blockStructureBlockOptions.map((option) => {
+                        const active = blockStructureBlocks.includes(option);
+                        return (
+                          <button
+                            key={`modal-source-${option}`}
+                            type="button"
+                            onClick={() => handleToggleBlockStructureSourceBlock(option)}
+                            className={`rounded-md border px-2 py-1 text-[11px] ${active ? "border-sky-300 bg-sky-50 text-sky-700" : "border-slate-200 bg-white text-slate-700 hover:bg-slate-100"}`}
+                          >
+                            {active ? <Check className="mr-1 inline h-3 w-3" /> : null}
+                            {option}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <ScrollBar orientation="horizontal" />
+                  </ScrollArea>
+                )}
+
+                <div className="flex flex-wrap gap-1.5">
+                  {blockStructureBlocks.length === 0 ? (
+                    <span className="text-xs text-slate-500">No source blocks selected</span>
+                  ) : (
+                    blockStructureBlocks.map((value) => (
+                      <Badge key={`selected-source-${value}`} className="rounded-md bg-sky-50 px-2 text-[11px] font-medium text-sky-700" variant="secondary">
+                        {value}
+                      </Badge>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setIsBlocksModalOpen(false)}>Done</Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+
+          <Dialog open={isNextBlocksModalOpen} onOpenChange={setIsNextBlocksModalOpen}>
+            <DialogContent className="max-w-2xl border-slate-200 bg-white">
+              <DialogHeader>
+                <DialogTitle className="text-base text-slate-900">Select Next Blocks</DialogTitle>
+                <DialogDescription>
+                  Choose downstream blocks for the selected block. This is disabled whenever a milestone is set.
+                </DialogDescription>
+              </DialogHeader>
+
+              <div className="grid gap-3">
+                <div className="text-xs text-slate-600">
+                  <span className="font-semibold">Workflow:</span> {blockStructureWorkflow || "-"}
+                  <span className="mx-2">•</span>
+                  <span className="font-semibold">Source Blocks:</span> {blockStructureBlocks.length > 0 ? blockStructureBlocks.join(", ") : "-"}
+                </div>
+
+                {hasMilestoneInput ? (
+                  <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-4 text-sm text-amber-700">
+                    Next block selection is disabled because Milestone is set. Clear milestone to choose downstream blocks.
+                  </div>
+                ) : blockStructureNextBlockOptions.length === 0 ? (
+                  <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-4 text-sm text-slate-500">
+                    No next blocks available. Select a workflow and block first.
+                  </div>
+                ) : (
+                  <ScrollArea className="h-[300px] rounded-md border border-slate-200 bg-slate-50 p-2">
+                    <div className="flex flex-wrap gap-1.5">
+                      {blockStructureNextBlockOptions.map((option) => {
+                        const active = blockStructureNextBlocks.includes(option);
+                        return (
+                          <button
+                            key={`modal-next-${option}`}
+                            type="button"
+                            onClick={() => handleToggleBlockStructureNextBlock(option)}
+                            className={`rounded-md border px-2 py-1 text-[11px] ${active ? "border-indigo-300 bg-indigo-50 text-indigo-700" : "border-slate-200 bg-white text-slate-700 hover:bg-slate-100"}`}
+                          >
+                            {active ? <Check className="mr-1 inline h-3 w-3" /> : null}
+                            {option}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <ScrollBar orientation="horizontal" />
+                  </ScrollArea>
+                )}
+
+                <div className="flex flex-wrap gap-1.5">
+                  {blockStructureNextBlocks.length === 0 ? (
+                    <span className="text-xs text-slate-500">No next blocks selected</span>
+                  ) : (
+                    blockStructureNextBlocks.map((value) => (
+                      <Badge key={`selected-next-${value}`} className="rounded-md bg-indigo-50 px-2 text-[11px] font-medium text-indigo-700" variant="secondary">
+                        {value}
+                      </Badge>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setIsNextBlocksModalOpen(false)}>Done</Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
 
           <Dialog open={isAddFlowDialogOpen} onOpenChange={handleCloseAddFlowDialog}>
             <DialogContent className="max-w-3xl border-slate-200 bg-white">

@@ -46,21 +46,34 @@ const OmneaAPIResponseSection: React.FC<OmneaAPIResponseSectionProps> = ({
     return <div className="p-4 text-gray-400">No response yet.</div>;
   }
 
+  const getRawRows = (): Record<string, unknown>[] => {
+    if (!response) return [];
+    if (Array.isArray(response)) return response as Record<string, unknown>[];
+    if (typeof response === "object") return [response as Record<string, unknown>];
+    return [{ value: response as unknown }];
+  };
+
+  const getTabularRows = (): Record<string, unknown>[] => {
+    if (!response) return [];
+
+    // Handle paginated envelope responses like { data: [...], nextCursor: "..." }
+    if (typeof response === "object" && !Array.isArray(response)) {
+      const envelope = response as Record<string, unknown>;
+      if (Array.isArray(envelope.data)) {
+        return envelope.data as Record<string, unknown>[];
+      }
+      if (envelope.data && typeof envelope.data === "object") {
+        return [envelope.data as Record<string, unknown>];
+      }
+    }
+
+    return getRawRows();
+  };
+
   // Helper to convert response data to table rows
   const getTableData = (): { headers: string[]; rows: Record<string, unknown>[] } => {
     if (!response) return { headers: [], rows: [] };
-    let dataArray: Record<string, unknown>[] = [];
-    if (Array.isArray(response)) {
-      dataArray = response;
-    } else if (response.data) {
-      if (Array.isArray(response.data)) {
-        dataArray = response.data;
-      } else if (typeof response.data === "object") {
-        dataArray = [response.data as Record<string, unknown>];
-      }
-    } else if (typeof response === "object") {
-      dataArray = [response];
-    }
+    const dataArray = getTabularRows();
     if (dataArray.length === 0) return { headers: [], rows: [] };
     const allHeaders = Array.from(new Set(dataArray.flatMap((row) => Object.keys(row))));
     const headers = allHeaders.sort((a, b) => {
@@ -113,16 +126,7 @@ const OmneaAPIResponseSection: React.FC<OmneaAPIResponseSectionProps> = ({
   const handleExportCSV = (selectedColumns: string[]) => {
     setIsExporting(true);
     try {
-      let dataArray: any[] = [];
-      if (Array.isArray(response)) {
-        dataArray = response;
-      } else if (response.data && Array.isArray(response.data)) {
-        dataArray = response.data;
-      } else if (response.data && typeof response.data === "object") {
-        dataArray = [response.data];
-      } else if (typeof response === "object") {
-        dataArray = [response];
-      }
+      const dataArray = getTabularRows();
 
       if (dataArray.length > 0) {
         const csv = convertToCSV(dataArray, selectedColumns);
@@ -137,15 +141,7 @@ const OmneaAPIResponseSection: React.FC<OmneaAPIResponseSectionProps> = ({
   };
 
   const { headers: tableHeaders } = getTableData();
-  const columns = extractColumns(
-    Array.isArray(response)
-      ? response
-      : response.data
-      ? Array.isArray(response.data)
-        ? response.data
-        : [response.data]
-      : [response]
-  );
+  const columns = extractColumns(getTabularRows());
 
   return (
     <>

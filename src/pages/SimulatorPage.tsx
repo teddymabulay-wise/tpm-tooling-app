@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, Fragment } from 'react';
+import { useState, useRef, useCallback, useEffect, Fragment } from 'react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -6,6 +6,7 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
+import { Input } from '@/components/ui/input';
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from '@/components/ui/table';
@@ -88,6 +89,7 @@ interface SimRow {
   bank_currency_code?: string;
   bank_iban?: string;
   bank_sort_code?: string;
+  bank_remote_id?: string;
   bank_is_primary?: string;
   bank_address_street1?: string;
   bank_address_city?: string;
@@ -113,11 +115,12 @@ interface SimRow {
   error_step?: number;       // index (0-5) of the step that failed
   error_raw?: string;        // raw API response body, JSON-stringified
   warnings: string[];
+  blockers?: string[];
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-type ColSpec = { name: string; required: boolean; mapsTo: string };
+type ColSpec = { name: string; required: boolean; mapsTo: string; bcField: string };
 type ColGroup = { label: string; endpoint: string; columns: ColSpec[] };
 
 const COLUMN_GROUPS: ColGroup[] = [
@@ -125,77 +128,96 @@ const COLUMN_GROUPS: ColGroup[] = [
     label: 'Supplier',
     endpoint: 'POST /v1/suppliers/batch',
     columns: [
-      { name: 'legal_name',            required: true,  mapsTo: 'suppliers[].name' },
-      { name: 'bc_vendor_no',          required: true,  mapsTo: 'remoteId (PATCH handshake → Step 4a)' },
-      { name: 'legal_name_registered', required: false, mapsTo: 'suppliers[].legalName' },
-      { name: 'tax_number',            required: false, mapsTo: 'suppliers[].taxNumber' },
-      { name: 'entity_type',           required: false, mapsTo: 'suppliers[].entityType (company | individual)' },
-      { name: 'description',           required: false, mapsTo: 'suppliers[].description' },
-      { name: 'website',               required: false, mapsTo: 'suppliers[].website' },
-      { name: 'is_preferred',          required: false, mapsTo: 'suppliers[].isPreferred' },
-      { name: 'is_reseller',           required: false, mapsTo: 'suppliers[].isReseller' },
+      { name: 'legal_name',            required: true,  mapsTo: 'suppliers[].name', bcField: 'Name' },
+      { name: 'bc_vendor_no',          required: true,  mapsTo: 'supplier.remoteId + profile.remoteId (PATCH)', bcField: 'Vendor No.' },
+      { name: 'legal_name_registered', required: false, mapsTo: 'suppliers[].legalName', bcField: 'Vendor Name 2 / Legal Name' },
+      { name: 'tax_number',            required: false, mapsTo: 'suppliers[].taxNumber', bcField: 'VAT Registration No.' },
+      { name: 'entity_type',           required: false, mapsTo: 'suppliers[].entityType (company | individual)', bcField: 'Vendor Type (derived)' },
+      { name: 'description',           required: false, mapsTo: 'suppliers[].description', bcField: 'Search Name / Description' },
+      { name: 'website',               required: false, mapsTo: 'suppliers[].website', bcField: 'Home Page' },
+      { name: 'is_preferred',          required: false, mapsTo: 'suppliers[].isPreferred', bcField: 'Preferred Vendor (derived)' },
+      { name: 'is_reseller',           required: false, mapsTo: 'suppliers[].isReseller', bcField: 'Reseller Flag (derived)' },
     ],
   },
   {
     label: 'Address',
     endpoint: 'POST /v1/suppliers/batch → address',
     columns: [
-      { name: 'country_iso2',    required: true,  mapsTo: 'address.country (ISO-2)' },
-      { name: 'address_street1', required: false, mapsTo: 'address.street1' },
-      { name: 'address_street2', required: false, mapsTo: 'address.street2' },
-      { name: 'city',            required: false, mapsTo: 'address.city' },
-      { name: 'state_province',  required: false, mapsTo: 'address.state (US suppliers only)' },
-      { name: 'post_code',       required: false, mapsTo: 'address.zipCode' },
+      { name: 'country_iso2',    required: true,  mapsTo: 'address.country (ISO-2)', bcField: 'Country/Region Code' },
+      { name: 'address_street1', required: false, mapsTo: 'address.street1', bcField: 'Address' },
+      { name: 'address_street2', required: false, mapsTo: 'address.street2', bcField: 'Address 2' },
+      { name: 'city',            required: false, mapsTo: 'address.city', bcField: 'City' },
+      { name: 'state_province',  required: false, mapsTo: 'address.state', bcField: 'County / State' },
+      { name: 'post_code',       required: false, mapsTo: 'address.zipCode', bcField: 'Post Code' },
     ],
   },
   {
     label: 'Custom Fields',
     endpoint: 'POST /v1/suppliers/batch → customFields',
     columns: [
-      { name: 'brn',                     required: false, mapsTo: "customFields['corporate-registration-number']" },
-      { name: 'materiality_level',        required: false, mapsTo: "customFields['materiality-level']" },
-      { name: 'infosec_criticality_tier', required: false, mapsTo: "customFields['infosec-criticality-tier']" },
-      { name: 'infosec_sensitivity_tier', required: false, mapsTo: "customFields['infosec-sensitivity-tier']" },
-      { name: 'entity_type_cf',           required: false, mapsTo: "customFields['entity-type']" },
-      { name: 'supports_cif',             required: false, mapsTo: "customFields['supports-cif-1']" },
-      { name: 'name_of_parent_entity',    required: false, mapsTo: "customFields['name-of-parent-entity']" },
+      { name: 'brn',                     required: false, mapsTo: "customFields['corporate-registration-number'].value", bcField: 'Registration No.' },
+      { name: 'materiality_level',        required: false, mapsTo: "customFields['materiality-level'].value", bcField: 'Materiality (source field)' },
+      { name: 'infosec_criticality_tier', required: false, mapsTo: "customFields['infosec-criticality-tier'].value", bcField: 'InfoSec Criticality (source field)' },
+      { name: 'infosec_sensitivity_tier', required: false, mapsTo: "customFields['infosec-sensitivity-tier'].value", bcField: 'InfoSec Sensitivity (source field)' },
+      { name: 'entity_type_cf',           required: false, mapsTo: "customFields['entity-type'].value", bcField: 'Entity Type (custom field source)' },
+      { name: 'supports_cif',             required: false, mapsTo: "customFields['supports-cif-1'].value", bcField: 'Supports CIF (source field)' },
+      { name: 'name_of_parent_entity',    required: false, mapsTo: "customFields['name-of-parent-entity'].value", bcField: 'Parent Company' },
     ],
   },
   {
     label: 'Supplier Profile',
     endpoint: 'POST /v1/suppliers/:id/profiles',
     columns: [
-      { name: 'subsidiary_name',                  required: true,  mapsTo: 'subsidiary.name (fallback lookup)' },
-      { name: 'profile_subsidiary_id',            required: false, mapsTo: 'subsidiary.id' },
-      { name: 'profile_subsidiary_name',          required: false, mapsTo: 'subsidiary.name (display)' },
-      { name: 'profile_state',                    required: false, mapsTo: 'state (active | archived | inactive)' },
-      { name: 'profile_payment_method_id',        required: false, mapsTo: 'paymentMethod.id' },
-      { name: 'profile_payment_terms_id',         required: false, mapsTo: 'paymentTerms.id' },
-      { name: 'profile_relationship_owner_email', required: false, mapsTo: "customFields['supplierProfileRelationshipOwner']" },
+      { name: 'subsidiary_name',                  required: true,  mapsTo: 'profiles[].subsidiary.name (fallback)', bcField: 'Company / Subsidiary Name' },
+      { name: 'profile_subsidiary_id',            required: false, mapsTo: 'profiles[].subsidiary.id', bcField: 'Subsidiary Id (lookup key)' },
+      { name: 'profile_subsidiary_name',          required: false, mapsTo: 'profiles[].subsidiary.name', bcField: 'Subsidiary Name (display)' },
+      { name: 'profile_state',                    required: false, mapsTo: 'profiles[].state', bcField: 'Status / Blocked (derived)' },
+      { name: 'profile_payment_method_id',        required: false, mapsTo: 'profiles[].paymentMethod.id', bcField: 'Payment Method Code (mapped to Omnea ID)' },
+      { name: 'profile_payment_terms_id',         required: false, mapsTo: 'profiles[].paymentTerms.id', bcField: 'Payment Terms Code (mapped to Omnea ID)' },
+      { name: 'profile_relationship_owner_email', required: false, mapsTo: "profiles[].customFields['supplierProfileRelationshipOwner'].value.email", bcField: 'Purchaser / Owner Email' },
     ],
   },
   {
     label: 'Bank Account',
     endpoint: 'POST /v1/suppliers/:id/profiles/:id/bank-accounts',
     columns: [
-      { name: 'bank_name',             required: true,  mapsTo: 'bankName' },
-      { name: 'bank_account_no',       required: true,  mapsTo: 'accountNumber' },
-      { name: 'bank_swift_code',       required: true,  mapsTo: 'swiftCode' },
-      { name: 'bank_country_iso2',     required: true,  mapsTo: 'address.country' },
-      { name: 'bank_account_name',     required: false, mapsTo: 'accountName' },
-      { name: 'bank_currency_code',    required: false, mapsTo: 'currency.code' },
-      { name: 'bank_iban',             required: false, mapsTo: 'iban' },
-      { name: 'bank_sort_code',        required: false, mapsTo: 'sortCode' },
-      { name: 'bank_is_primary',       required: false, mapsTo: 'isPrimary (default: true)' },
-      { name: 'bank_address_street1',  required: false, mapsTo: 'address.street1' },
-      { name: 'bank_address_city',     required: false, mapsTo: 'address.city' },
-      { name: 'bank_address_zip_code', required: false, mapsTo: 'address.zipCode' },
+      { name: 'bank_name',             required: true,  mapsTo: 'bankAccounts[].bankName', bcField: 'Bank Name' },
+      { name: 'bank_account_no',       required: true,  mapsTo: 'bankAccounts[].accountNumber', bcField: 'Bank Account No.' },
+      { name: 'bank_swift_code',       required: true,  mapsTo: 'bankAccounts[].swiftCode', bcField: 'SWIFT / BIC' },
+      { name: 'bank_country_iso2',     required: true,  mapsTo: 'bankAccounts[].address.country', bcField: 'Bank Country/Region Code' },
+      { name: 'bank_account_name',     required: false, mapsTo: 'bankAccounts[].accountName', bcField: 'Bank Account Name' },
+      { name: 'bank_remote_id',        required: false, mapsTo: 'bankAccounts[].remoteId (fallback: bank_iban > account_no)', bcField: 'External Bank Id (if available)' },
+      { name: 'bank_currency_code',    required: false, mapsTo: 'bankAccounts[].currency.id (resolved from code)', bcField: 'Currency Code' },
+      { name: 'bank_iban',             required: false, mapsTo: 'bankAccounts[].iban', bcField: 'IBAN' },
+      { name: 'bank_sort_code',        required: false, mapsTo: 'bankAccounts[].sortCode', bcField: 'Sort Code' },
+      { name: 'bank_is_primary',       required: false, mapsTo: 'bankAccounts[].isPrimary', bcField: 'Primary Bank (derived)' },
+      { name: 'bank_address_street1',  required: false, mapsTo: 'bankAccounts[].address.street1', bcField: 'Bank Address' },
+      { name: 'bank_address_city',     required: false, mapsTo: 'bankAccounts[].address.city', bcField: 'Bank City' },
+      { name: 'bank_address_zip_code', required: false, mapsTo: 'bankAccounts[].address.zipCode', bcField: 'Bank Post Code' },
     ],
   },
 ];
 
 // Derived flat lists used by the parser and validator
 const REQUIRED_COLS = COLUMN_GROUPS.flatMap(g => g.columns).filter(c => c.required).map(c => c.name);
+const MAPPING_STORAGE_KEY = 'simulator-column-mapping-v1';
+
+type MappingOverride = {
+  omneaPath: string;
+  bcField: string;
+};
+
+const DEFAULT_MAPPING_BY_COLUMN: Record<string, MappingOverride> = Object.fromEntries(
+  COLUMN_GROUPS.flatMap(group =>
+    group.columns.map(col => [
+      col.name,
+      {
+        omneaPath: col.mapsTo,
+        bcField: col.bcField,
+      },
+    ])
+  )
+);
 
 const STEP_LABELS = [
   'Create supplier', 'Create profile', 'Create bank',
@@ -288,7 +310,7 @@ function downloadCSVTemplate() {
     'profile_subsidiary_id', 'profile_subsidiary_name', 'profile_state',
     'profile_payment_method_id', 'profile_payment_terms_id', 'profile_relationship_owner_email',
     // Bank optional (8)
-    'bank_account_name', 'bank_currency_code', 'bank_iban', 'bank_sort_code',
+    'bank_account_name', 'bank_remote_id', 'bank_currency_code', 'bank_iban', 'bank_sort_code',
     'bank_is_primary', 'bank_address_street1', 'bank_address_city', 'bank_address_zip_code',
   ];
   const example = [
@@ -330,6 +352,7 @@ function downloadCSVTemplate() {
     'martha.akullo@wise.com',
     // Bank optional (8)
     'Beta Supplies Ltd',
+    'V0002-GB-EE82WEST12345698765432',
     'GBP',
     'GB82WEST12345698765432',
     '40-47-84',
@@ -431,6 +454,7 @@ function buildSimRow(raw: Record<string, string>): SimRow {
     steps_completed: 0,
     step_statuses: Array<StepStatus>(6).fill('idle'),
     warnings,
+    blockers: [],
   };
 }
 
@@ -515,23 +539,23 @@ async function executeSimRow(
     const hasAddr = row.address_street1 || row.address_street2 || row.city || row.post_code || row.country_code;
     if (hasAddr) {
       supplierPayload.address = {
-        ...(row.address_street1 && { street1: row.address_street1 }),
-        ...(row.address_street2 && { street2: row.address_street2 }),
-        ...(row.city && { city: row.city }),
-        ...(row.post_code && { zipCode: row.post_code }),
-        ...(row.country_code && { country: row.country_code }),
-        ...(row.state_province && { state: row.state_province }),
+        street1: row.address_street1 || '',
+        street2: row.address_street2 || '',
+        city: row.city || '',
+        state: row.state_province || '',
+        zipCode: row.post_code || '',
+        country: row.country_code || '',
       };
     }
 
-    const customFields: Record<string, string> = {};
-    if (row.registration_no) customFields['corporate-registration-number'] = row.registration_no;
-    if (row.materiality_level) customFields['materiality-level'] = row.materiality_level;
-    if (row.infosec_criticality_tier) customFields['infosec-criticality-tier'] = row.infosec_criticality_tier;
-    if (row.infosec_sensitivity_tier) customFields['infosec-sensitivity-tier'] = row.infosec_sensitivity_tier;
-    if (row.entity_type_cf) customFields['entity-type'] = row.entity_type_cf;
-    if (row.supports_cif) customFields['supports-cif-1'] = row.supports_cif;
-    if (row.name_of_parent_entity) customFields['name-of-parent-entity'] = row.name_of_parent_entity;
+    const customFields: Record<string, { value: unknown }> = {};
+    if (row.registration_no) customFields['corporate-registration-number'] = { value: row.registration_no };
+    if (row.materiality_level) customFields['materiality-level'] = { value: row.materiality_level };
+    if (row.infosec_criticality_tier) customFields['infosec-criticality-tier'] = { value: row.infosec_criticality_tier };
+    if (row.infosec_sensitivity_tier) customFields['infosec-sensitivity-tier'] = { value: row.infosec_sensitivity_tier };
+    if (row.entity_type_cf) customFields['entity-type'] = { value: row.entity_type_cf };
+    if (row.supports_cif) customFields['supports-cif-1'] = { value: row.supports_cif };
+    if (row.name_of_parent_entity) customFields['name-of-parent-entity'] = { value: row.name_of_parent_entity };
     if (Object.keys(customFields).length > 0) supplierPayload.customFields = customFields;
 
     const createRes = await makeOmneaRequest<unknown>(`${base}/v1/suppliers/batch`, {
@@ -577,7 +601,13 @@ async function executeSimRow(
     if (row.profile_payment_method_id) profileEntry.paymentMethod = { id: row.profile_payment_method_id };
     if (row.profile_payment_terms_id) profileEntry.paymentTerms = { id: row.profile_payment_terms_id };
     if (row.profile_relationship_owner_email) {
-      profileEntry.customFields = { supplierProfileRelationshipOwner: row.profile_relationship_owner_email };
+      profileEntry.customFields = {
+        supplierProfileRelationshipOwner: {
+          value: {
+            email: row.profile_relationship_owner_email,
+          },
+        },
+      };
     }
 
     const profileRes = await makeOmneaRequest<unknown>(
@@ -625,6 +655,11 @@ async function executeSimRow(
 
   // ── Step 2: Create bank account directly at profile level (creates + links in one call) ──
   let omnea_bank_id = '';
+  const resolvedBankRemoteId =
+    row.bank_remote_id ||
+    row.bank_iban ||
+    row.iban ||
+    row.account_number;
 
   if (row.bankIntent === 'SKIP' && row.preflightBankId) {
     omnea_bank_id = row.preflightBankId;
@@ -635,7 +670,7 @@ async function executeSimRow(
     push();
 
     const bankEntry: Record<string, unknown> = {
-      remoteId: row.account_number,
+      remoteId: resolvedBankRemoteId,
       isPrimary: row.bank_is_primary?.toLowerCase() !== 'false',
       accountName: row.bank_account_name || row.legal_name,
       accountNumber: row.account_number,
@@ -643,6 +678,8 @@ async function executeSimRow(
         country: row.bank_country || '',
         city: row.bank_address_city || '',
         street1: row.bank_address_street1 || '',
+        street2: '',
+        state: '',
         zipCode: row.bank_address_zip_code || '',
       },
     };
@@ -742,25 +779,38 @@ async function executeSimRow(
   const remoteLink = `https://businesscentral.dynamics.com/?company=${encodeURIComponent(row.wise_entity)}&page=26&filter=${encodeURIComponent(`No. IS ${row.bc_vendor_no}`)}`;
   const patchProfBody: Record<string, unknown> = { remoteId: row.bc_vendor_no, remoteLink };
   if (row['profile_remote_id']) patchProfBody.remoteId = row['profile_remote_id'];
-  const patchProfRes = await makeOmneaRequest<unknown>(
-    `${base}/v1/suppliers/${omnea_supplier_id}/profiles/${subsidiary_id}`,
-    { method: 'PATCH', body: patchProfBody },
+  const profilePatchTargets = [omnea_profile_id, subsidiary_id].filter(
+    (value, index, arr): value is string => Boolean(value) && arr.indexOf(value) === index,
   );
-  setStep(4, patchProfRes.error ? 'skipped' : 'done');
+
+  let patchProfRes: Awaited<ReturnType<typeof makeOmneaRequest<unknown>>> | null = null;
+  for (const targetId of profilePatchTargets) {
+    const attempt = await makeOmneaRequest<unknown>(
+      `${base}/v1/suppliers/${omnea_supplier_id}/profiles/${targetId}`,
+      { method: 'PATCH', body: patchProfBody },
+    );
+    patchProfRes = attempt;
+    if (!attempt.error) break;
+  }
+
+  setStep(4, patchProfRes?.error ? 'skipped' : 'done');
   push({ steps_completed: 5 });
 
   // Step 5: PATCH bank account
   setStep(5, 'running');
   push();
-  const patchBankBody: Record<string, unknown> = { remoteId: row.account_number };
-  if (row['bank_remote_id']) patchBankBody.remoteId = row['bank_remote_id'];
+  const patchBankBody: Record<string, unknown> = { remoteId: resolvedBankRemoteId };
   const patchBankRes = await makeOmneaRequest<unknown>(
     `${base}/v1/suppliers/${omnea_supplier_id}/bank-accounts/${omnea_bank_id}`,
     { method: 'PATCH', body: patchBankBody },
   );
   setStep(5, patchBankRes.error ? 'skipped' : 'done');
+  const allCreateStepsSkipped =
+    steps[0] === 'skipped' &&
+    steps[1] === 'skipped' &&
+    steps[2] === 'skipped';
   push({
-    status: 'created',
+    status: allCreateStepsSkipped ? 'skipped' : 'created',
     steps_completed: 6,
     omnea_supplier_id,
     omnea_profile_id,
@@ -844,6 +894,31 @@ function StepDots({ statuses }: { statuses: StepStatus[] }) {
         />
       ))}
     </div>
+  );
+}
+
+function StepStatusChip({ label, status }: { label: string; status: StepStatus }) {
+  const statusText: Record<StepStatus, string> = {
+    idle: 'Pending',
+    running: 'Running',
+    done: 'Done',
+    error: 'Error',
+    skipped: 'Skipped',
+  };
+
+  const statusClass: Record<StepStatus, string> = {
+    idle: 'border-muted-foreground/30 text-muted-foreground',
+    running: 'border-blue-300 text-blue-700 dark:text-blue-400',
+    done: 'border-green-300 text-green-700 dark:text-green-400',
+    error: 'border-red-300 text-red-700 dark:text-red-400',
+    skipped: 'border-amber-300 text-amber-700 dark:text-amber-400',
+  };
+
+  return (
+    <span className={cn('inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[10px]', statusClass[status])}>
+      <span className="font-medium">{label}</span>
+      <span>{statusText[status]}</span>
+    </span>
   );
 }
 
@@ -955,6 +1030,12 @@ function RowStatusCard({
             <span className="text-[10px] text-muted-foreground/60 hidden sm:block">
               {STEP_LABELS.join(' · ')}
             </span>
+          </div>
+
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <StepStatusChip label="Supplier" status={row.step_statuses[0] ?? 'idle'} />
+            <StepStatusChip label="Profile" status={row.step_statuses[1] ?? 'idle'} />
+            <StepStatusChip label="Bank" status={row.step_statuses[2] ?? 'idle'} />
           </div>
         </div>
       </div>
@@ -1082,9 +1163,94 @@ function Step1Upload({
   onParsed: (rows: SimRow[], rawCount: number) => void;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const mappingInputRef = useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [errors, setErrors] = useState<string[]>([]);
   const [specOpen, setSpecOpen] = useState(false);
+  const [mappingError, setMappingError] = useState<string | null>(null);
+  const [mappingByColumn, setMappingByColumn] = useState<Record<string, MappingOverride>>(() => {
+    try {
+      const raw = window.localStorage.getItem(MAPPING_STORAGE_KEY);
+      if (!raw) return DEFAULT_MAPPING_BY_COLUMN;
+      const parsed = JSON.parse(raw) as Record<string, MappingOverride>;
+      return {
+        ...DEFAULT_MAPPING_BY_COLUMN,
+        ...parsed,
+      };
+    } catch {
+      return DEFAULT_MAPPING_BY_COLUMN;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(MAPPING_STORAGE_KEY, JSON.stringify(mappingByColumn));
+    } catch {
+      // Ignore storage failures.
+    }
+  }, [mappingByColumn]);
+
+  const setColumnMapping = (columnName: string, patch: Partial<MappingOverride>) => {
+    setMappingByColumn(prev => ({
+      ...prev,
+      [columnName]: {
+        ...(prev[columnName] ?? DEFAULT_MAPPING_BY_COLUMN[columnName] ?? { omneaPath: '', bcField: '' }),
+        ...patch,
+      },
+    }));
+  };
+
+  const handleExportMappingCsv = () => {
+    const header = ['column_name', 'omnea_mapping', 'bc_field'];
+    const rows = COLUMN_GROUPS.flatMap(group =>
+      group.columns.map(col => {
+        const mapping = mappingByColumn[col.name] ?? DEFAULT_MAPPING_BY_COLUMN[col.name];
+        return [col.name, mapping?.omneaPath ?? col.mapsTo, mapping?.bcField ?? col.bcField]
+          .map(v => `"${String(v ?? '').replace(/"/g, '""')}"`)
+          .join(',');
+      })
+    );
+
+    const blob = new Blob([[header.join(','), ...rows].join('\n')], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'simulator-column-mapping.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportMappingCsv = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = event => {
+      const text = (event.target?.result as string) ?? '';
+      const rows = parseCSVRFC4180(text);
+      if (rows.length === 0) {
+        setMappingError('Mapping CSV is empty or invalid.');
+        return;
+      }
+
+      const next: Record<string, MappingOverride> = { ...DEFAULT_MAPPING_BY_COLUMN };
+      rows.forEach((row) => {
+        const colName = (row.column_name ?? '').trim();
+        if (!colName || !DEFAULT_MAPPING_BY_COLUMN[colName]) return;
+        next[colName] = {
+          omneaPath: (row.omnea_mapping ?? '').trim() || DEFAULT_MAPPING_BY_COLUMN[colName].omneaPath,
+          bcField: (row.bc_field ?? '').trim() || DEFAULT_MAPPING_BY_COLUMN[colName].bcField,
+        };
+      });
+
+      setMappingByColumn(next);
+      setMappingError(null);
+      toast.success('Column mapping imported.');
+    };
+    reader.readAsText(file);
+  };
+
+  const handleResetMappingDefaults = () => {
+    setMappingByColumn(DEFAULT_MAPPING_BY_COLUMN);
+    setMappingError(null);
+  };
 
   const processFile = useCallback((file: File) => {
     if (!file.name.endsWith('.csv')) {
@@ -1113,7 +1279,7 @@ function Step1Upload({
   }, [onParsed]);
 
   return (
-    <div className="max-w-2xl space-y-6">
+    <div className="w-full max-w-none space-y-6">
       <div>
         <h2 className="text-lg font-semibold mb-1">Upload vendor CSV</h2>
         <p className="text-sm text-muted-foreground">
@@ -1185,13 +1351,45 @@ function Step1Upload({
             </Button>
           </CollapsibleTrigger>
           <CollapsibleContent>
-            <div className="mt-3 rounded-lg border overflow-hidden text-xs">
-              <Table>
+            <div className="mt-3 mb-3 flex items-center gap-2 flex-wrap">
+              <Button variant="outline" size="sm" onClick={handleExportMappingCsv} className="gap-1.5">
+                <Download className="h-3.5 w-3.5" /> Export mapping CSV
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => mappingInputRef.current?.click()}
+                className="gap-1.5"
+              >
+                <Upload className="h-3.5 w-3.5" /> Import mapping CSV
+              </Button>
+              <Button variant="ghost" size="sm" onClick={handleResetMappingDefaults}>
+                Reset defaults
+              </Button>
+              <input
+                ref={mappingInputRef}
+                type="file"
+                accept=".csv"
+                className="hidden"
+                onChange={e => {
+                  const file = e.target.files?.[0];
+                  if (file) handleImportMappingCsv(file);
+                  e.currentTarget.value = '';
+                }}
+              />
+              {mappingError && (
+                <span className="text-xs text-destructive">{mappingError}</span>
+              )}
+            </div>
+
+            <div className="mt-3 rounded-lg border overflow-x-auto text-xs">
+              <Table className="min-w-[1120px]">
                 <TableHeader>
                   <TableRow>
                     <TableHead className="w-6"></TableHead>
                     <TableHead>Column name</TableHead>
-                    <TableHead>Maps to</TableHead>
+                    <TableHead className="w-[360px]">Omnea mapping</TableHead>
+                    <TableHead className="w-[280px]">BC field mapping</TableHead>
                     <TableHead>Required?</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -1199,7 +1397,7 @@ function Step1Upload({
                   {COLUMN_GROUPS.map(group => (
                     <Fragment key={group.label}>
                       <TableRow className="bg-muted/60 hover:bg-muted/60">
-                        <TableCell colSpan={4} className="py-1.5 px-3">
+                        <TableCell colSpan={5} className="py-1.5 px-3">
                           <span className="font-semibold text-foreground">{group.label}</span>
                           <span className="ml-2 font-mono text-muted-foreground/70">{group.endpoint}</span>
                         </TableCell>
@@ -1213,7 +1411,20 @@ function Step1Upload({
                             )} />
                           </TableCell>
                           <TableCell className="font-mono">{col.name}</TableCell>
-                          <TableCell className="font-mono text-muted-foreground whitespace-normal break-words max-w-[200px]">{col.mapsTo}</TableCell>
+                          <TableCell>
+                            <Input
+                              value={(mappingByColumn[col.name] ?? DEFAULT_MAPPING_BY_COLUMN[col.name])?.omneaPath ?? ''}
+                              onChange={e => setColumnMapping(col.name, { omneaPath: e.target.value })}
+                              className="h-9 min-w-[320px] text-sm font-mono"
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <Input
+                              value={(mappingByColumn[col.name] ?? DEFAULT_MAPPING_BY_COLUMN[col.name])?.bcField ?? ''}
+                              onChange={e => setColumnMapping(col.name, { bcField: e.target.value })}
+                              className="h-9 min-w-[240px] text-sm"
+                            />
+                          </TableCell>
                           <TableCell className={col.required ? 'text-red-600 font-medium' : 'text-muted-foreground'}>
                             {col.required ? 'Required' : 'Optional'}
                           </TableCell>
@@ -1261,7 +1472,7 @@ function SupplierReviewCard({ row, index }: { row: SimRow; index: number }) {
   const address = [row.address_street1, row.city, row.country_iso2].filter(Boolean).join(', ');
   return (
     <Card>
-      <CardContent className="pt-4 pb-4 space-y-4">
+      <CardContent className="pt-2 pb-2 space-y-2">
         {/* Header */}
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-xs text-muted-foreground font-mono shrink-0">#{index + 1}</span>
@@ -1275,7 +1486,7 @@ function SupplierReviewCard({ row, index }: { row: SimRow; index: number }) {
           )}
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           {/* Supplier section */}
           <div className="space-y-1.5">
             <div className="flex items-center gap-1.5 mb-2">
@@ -1287,10 +1498,6 @@ function SupplierReviewCard({ row, index }: { row: SimRow; index: number }) {
             </div>
             <ReviewRow label="Tax Number"    value={row.tax_number} />
             <ReviewRow label="Entity Type"   value={row.entity_type} />
-            <ReviewRow label="BRN"           value={row.brn} />
-            <ReviewRow label="Materiality"   value={row.materiality_level} />
-            <ReviewRow label="InfoSec Crit." value={row.infosec_criticality_tier} />
-            <ReviewRow label="InfoSec Sens." value={row.infosec_sensitivity_tier} />
             {address && <ReviewRow label="Address" value={address} />}
           </div>
 
@@ -1302,9 +1509,6 @@ function SupplierReviewCard({ row, index }: { row: SimRow; index: number }) {
             </div>
             <ReviewRow label="Subsidiary"      value={row.profile_subsidiary_name || row.subsidiary_name || row.wise_entity} />
             <ReviewRow label="State"           value={row.profile_state || 'active'} />
-            <ReviewRow label="Payment Method"  value={row.profile_payment_method_id} />
-            <ReviewRow label="Payment Terms"   value={row.profile_payment_terms_id} />
-            <ReviewRow label="Owner Email"     value={row.profile_relationship_owner_email} />
           </div>
 
           {/* Bank section */}
@@ -1316,10 +1520,7 @@ function SupplierReviewCard({ row, index }: { row: SimRow; index: number }) {
             <ReviewRow label="Account Name"  value={row.bank_account_name || row.legal_name} />
             <ReviewRow label="Bank Name"     value={row.bank_name} />
             <ReviewRow label="Account No"    value={row.account_number} />
-            <ReviewRow label="Swift Code"    value={row.swift_code} />
             <ReviewRow label="IBAN"          value={row.iban} />
-            <ReviewRow label="Sort Code"     value={row.sort_code} />
-            <ReviewRow label="Currency"      value={row.bank_currency_code} />
             <ReviewRow label="Country"       value={row.bank_country_iso2 || row.bank_country} />
           </div>
         </div>
@@ -1331,6 +1532,17 @@ function SupplierReviewCard({ row, index }: { row: SimRow; index: number }) {
               <div key={i} className="flex items-start gap-1 text-xs text-amber-700 dark:text-amber-400">
                 <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0" />
                 <span>{w}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {row.blockers && row.blockers.length > 0 && (
+          <div className="rounded bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-800 px-3 py-2 space-y-1">
+            {row.blockers.map((b, i) => (
+              <div key={i} className="flex items-start gap-1 text-xs text-red-700 dark:text-red-400">
+                <XCircle className="h-3 w-3 mt-0.5 shrink-0" />
+                <span>{b}</span>
               </div>
             ))}
           </div>
@@ -1355,6 +1567,7 @@ function Step2Preflight({
 }) {
   const [checking, setChecking] = useState(false);
   const [checkError, setCheckError] = useState<string | null>(null);
+  const [showBlockedOnly, setShowBlockedOnly] = useState(false);
   const done = rows.some(r => r.preflightDone);
 
   const toList = (d: unknown): Record<string, unknown>[] => {
@@ -1379,6 +1592,10 @@ function Step2Preflight({
     setCheckError(null);
     const config = getOmneaEnvironmentConfig();
     const base = config.apiBaseUrl;
+    const normalizeText = (value: unknown) =>
+      typeof value === 'string'
+        ? value.trim().toLowerCase().replace(/\s+/g, ' ')
+        : '';
 
     // 1. Fetch all existing suppliers (paginated, API max = 100)
     const existingSuppliers: Record<string, unknown>[] = [];
@@ -1398,13 +1615,59 @@ function Step2Preflight({
       offset += 100;
     }
 
-    // 2. For each row: match supplier, then check profile if supplier exists
-    const normalizeText = (value: unknown) =>
-      typeof value === 'string'
-        ? value.trim().toLowerCase().replace(/\s+/g, ' ')
-        : '';
+    // 2. Build intra-CSV blocker indexes
+    const profileGroups = new Map<string, number[]>();
+    const bankGroups = new Map<string, number[]>();
 
-    const updated = await Promise.all(rows.map(async (row): Promise<SimRow> => {
+    rows.forEach((row, index) => {
+      const supplierKey = normalizeText(row.legal_name);
+      const profileKeyPart = normalizeText(row.profile_subsidiary_id || row.profile_subsidiary_name || row.subsidiary_name || row.wise_entity);
+      const profileKey = `${supplierKey}::${profileKeyPart}`;
+
+      const bankIdentity = [
+        normalizeText(row.bank_name),
+        normalizeText(row.account_number),
+        normalizeText(row.iban),
+        normalizeText(row.swift_code),
+        normalizeText(row.bank_country_iso2 || row.bank_country),
+      ].join('::');
+
+      const profileEntry = profileGroups.get(profileKey) ?? [];
+      profileEntry.push(index);
+      profileGroups.set(profileKey, profileEntry);
+
+      const bankKey = `${profileKey}::${bankIdentity}`;
+      const bankEntry = bankGroups.get(bankKey) ?? [];
+      bankEntry.push(index);
+      bankGroups.set(bankKey, bankEntry);
+    });
+
+    const duplicateProfileRowIndexes = new Set<number>();
+    profileGroups.forEach((indexes) => {
+      if (indexes.length > 1) {
+        indexes.forEach((i) => duplicateProfileRowIndexes.add(i));
+      }
+    });
+
+    const duplicateBankRowIndexes = new Set<number>();
+    bankGroups.forEach((indexes) => {
+      if (indexes.length > 1) {
+        indexes.forEach((i) => duplicateBankRowIndexes.add(i));
+      }
+    });
+
+    // 3. For each row: match supplier, then check profile if supplier exists
+    const updated = await Promise.all(rows.map(async (row, index): Promise<SimRow> => {
+      const blockers: string[] = [];
+
+      if (duplicateProfileRowIndexes.has(index)) {
+        blockers.push('Blocker: duplicate supplier profile in CSV for the same supplier/subsidiary. Keep one row per supplier profile.');
+      }
+
+      if (duplicateBankRowIndexes.has(index)) {
+        blockers.push('Blocker: duplicate bank details in CSV for the same supplier profile. Remove duplicate bank rows.');
+      }
+
       const nameLower = row.legal_name.trim().toLowerCase();
       const matchedSupplier = existingSuppliers.find(
         s => typeof s.name === 'string' && s.name.trim().toLowerCase() === nameLower,
@@ -1429,7 +1692,10 @@ function Step2Preflight({
           if (!profRes.error && profRes.data) {
             const profRecord = toSingle(profRes.data);
             if (profRecord) {
-              resolvedProfileId = row.profile_subsidiary_id;
+              resolvedProfileId =
+                typeof profRecord.id === 'string'
+                  ? profRecord.id
+                  : row.profile_subsidiary_id;
             }
           }
         }
@@ -1457,9 +1723,13 @@ function Step2Preflight({
             });
 
             if (matchedProfile) {
-              const subsidiary = matchedProfile.subsidiary as Record<string, unknown> | undefined;
-              if (subsidiary && typeof subsidiary.id === 'string') {
-                resolvedProfileId = subsidiary.id;
+              if (typeof matchedProfile.id === 'string') {
+                resolvedProfileId = matchedProfile.id;
+              } else {
+                const subsidiary = matchedProfile.subsidiary as Record<string, unknown> | undefined;
+                if (subsidiary && typeof subsidiary.id === 'string') {
+                  resolvedProfileId = subsidiary.id;
+                }
               }
             }
           }
@@ -1495,6 +1765,42 @@ function Step2Preflight({
               preflightBankId = matchedBank.id;
             }
           }
+
+          // Extra check: bank exists elsewhere on this supplier but not linked to target profile.
+          const supplierBankListRes = await makeOmneaRequest<unknown>(
+            `${base}/v1/suppliers/${supplierId}/bank-accounts?limit=100`,
+          );
+          if (!supplierBankListRes.error && supplierBankListRes.data) {
+            const supplierBanks = toList(supplierBankListRes.data);
+            const normalizedAccountNumber = normalizeText(row.account_number);
+            const normalizedIban = normalizeText(row.iban);
+            const normalizedRemoteId = normalizeText(row.bank_remote_id || row.account_number);
+
+            const existingUnlinked = supplierBanks.find((bank) => {
+              const bankAccountNumber = normalizeText(bank.accountNumber);
+              const bankIban = normalizeText(bank.iban);
+              const bankRemoteId = normalizeText(bank.remoteId);
+              const bankProfile = bank.profile;
+              const bankProfileId =
+                bankProfile && typeof bankProfile === 'object' &&
+                typeof (bankProfile as Record<string, unknown>).id === 'string'
+                  ? normalizeText((bankProfile as Record<string, unknown>).id)
+                  : '';
+
+              const matchesIdentity =
+                (normalizedRemoteId && bankRemoteId && bankRemoteId === normalizedRemoteId) ||
+                (normalizedIban && bankIban && bankIban === normalizedIban) ||
+                (normalizedAccountNumber && bankAccountNumber && bankAccountNumber === normalizedAccountNumber);
+
+              if (!matchesIdentity) return false;
+              if (!bankProfileId) return false;
+              return bankProfileId !== normalizeText(resolvedProfileId);
+            });
+
+            if (existingUnlinked) {
+              blockers.push('Blocker: bank already exists on this supplier but is linked to a different profile. Use a different bank identity or relink/delete existing bank first.');
+            }
+          }
         }
       }
 
@@ -1507,6 +1813,7 @@ function Step2Preflight({
         preflightSupplierId: supplierId,
         preflightProfileSubsidiaryId,
         preflightBankId,
+        blockers,
       };
     }));
 
@@ -1517,6 +1824,11 @@ function Step2Preflight({
   const toCreate = rows.filter(r => r.supplierIntent === 'CREATE').length;
   const toSkip = rows.filter(r => r.supplierIntent === 'SKIP').length;
   const warnCount = rows.filter(r => r.warnings.length > 0).length;
+  const blockerCount = rows.filter(r => (r.blockers?.length ?? 0) > 0).length;
+  const hasBlockers = blockerCount > 0;
+  const filteredRows = showBlockedOnly
+    ? rows.filter(r => (r.blockers?.length ?? 0) > 0)
+    : rows;
 
   return (
     <div className="space-y-5">
@@ -1551,7 +1863,7 @@ function Step2Preflight({
                 {checking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
                 Re-check
               </Button>
-              <Button onClick={onProceed} className="gap-1.5">
+              <Button onClick={onProceed} className="gap-1.5" disabled={hasBlockers}>
                 Run Simulation <ArrowRight className="h-4 w-4" />
               </Button>
             </>
@@ -1561,23 +1873,49 @@ function Step2Preflight({
 
       {/* Summary counts (shown after check) */}
       {done && (
-        <div className="flex gap-3 flex-wrap">
-          {toCreate > 0 && (
-            <div className="rounded-lg border border-green-200 bg-green-50 dark:bg-green-950/20 dark:border-green-800 px-4 py-3 min-w-[100px] text-center">
-              <p className="text-2xl font-bold text-green-600 dark:text-green-400">{toCreate}</p>
-              <p className="text-xs text-muted-foreground mt-0.5">to create</p>
+        <div className="flex items-start justify-between gap-3 flex-wrap">
+          <div className="flex gap-3 flex-wrap">
+            {toCreate > 0 && (
+              <div className="rounded-lg border border-green-200 bg-green-50 dark:bg-green-950/20 dark:border-green-800 px-4 py-3 min-w-[100px] text-center">
+                <p className="text-2xl font-bold text-green-600 dark:text-green-400">{toCreate}</p>
+                <p className="text-xs text-muted-foreground mt-0.5">to create</p>
+              </div>
+            )}
+            {toSkip > 0 && (
+              <div className="rounded-lg border border-amber-200 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 px-4 py-3 min-w-[100px] text-center">
+                <p className="text-2xl font-bold text-amber-600 dark:text-amber-400">{toSkip}</p>
+                <p className="text-xs text-muted-foreground mt-0.5">already in Omnea</p>
+              </div>
+            )}
+            <div className="rounded-lg border px-4 py-3 min-w-[100px] text-center">
+              <p className="text-2xl font-bold text-primary">{rows.length}</p>
+              <p className="text-xs text-muted-foreground mt-0.5">total</p>
             </div>
-          )}
-          {toSkip > 0 && (
-            <div className="rounded-lg border border-amber-200 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 px-4 py-3 min-w-[100px] text-center">
-              <p className="text-2xl font-bold text-amber-600 dark:text-amber-400">{toSkip}</p>
-              <p className="text-xs text-muted-foreground mt-0.5">already in Omnea</p>
-            </div>
-          )}
-          <div className="rounded-lg border px-4 py-3 min-w-[100px] text-center">
-            <p className="text-2xl font-bold text-primary">{rows.length}</p>
-            <p className="text-xs text-muted-foreground mt-0.5">total</p>
+            {blockerCount > 0 && (
+              <div className="rounded-lg border border-red-200 bg-red-50 dark:bg-red-950/20 dark:border-red-800 px-4 py-3 min-w-[120px] text-center">
+                <p className="text-2xl font-bold text-red-600 dark:text-red-400">{blockerCount}</p>
+                <p className="text-xs text-muted-foreground mt-0.5">blocked rows</p>
+              </div>
+            )}
           </div>
+
+          <Button
+            variant={showBlockedOnly ? 'default' : 'outline'}
+            size="sm"
+            onClick={() => setShowBlockedOnly(prev => !prev)}
+            disabled={!hasBlockers}
+            className="gap-1.5"
+          >
+            {showBlockedOnly ? 'Showing blocked only' : 'Show blocked only'}
+          </Button>
+        </div>
+      )}
+
+      {done && hasBlockers && (
+        <div className="rounded-lg border border-red-300 bg-red-50 dark:bg-red-950/20 p-4">
+          <p className="text-sm text-red-700 dark:text-red-400 font-medium">
+            Simulation is blocked. Resolve pre-flight blockers shown on affected rows, then run pre-flight again.
+          </p>
         </div>
       )}
 
@@ -1590,9 +1928,14 @@ function Step2Preflight({
 
       <ScrollArea className="h-[480px]">
         <div className="space-y-3 pr-2">
-          {rows.map((row, i) => (
+          {filteredRows.map((row, i) => (
             <SupplierReviewCard key={row._id} row={row} index={i} />
           ))}
+          {filteredRows.length === 0 && showBlockedOnly && (
+            <div className="rounded-lg border px-4 py-8 text-center text-sm text-muted-foreground">
+              No blocked rows found.
+            </div>
+          )}
         </div>
       </ScrollArea>
     </div>
@@ -1631,6 +1974,7 @@ function Step3Execute({
   const createdCount = rows.filter(r => r.status === 'created').length;
   const errorCount = rows.filter(r => r.status === 'error').length;
   const dupCount = rows.filter(r => r.status === 'duplicate').length;
+  const skippedCount = rows.filter(r => r.status === 'skipped').length;
 
   return (
     <div className="space-y-5">
@@ -1696,6 +2040,7 @@ function Step3Execute({
           <span className="flex gap-3">
             {createdCount > 0 && <span className="text-green-600">{createdCount} created</span>}
             {dupCount > 0 && <span className="text-amber-600">{dupCount} duplicate{dupCount !== 1 ? 's' : ''}</span>}
+            {skippedCount > 0 && <span className="text-muted-foreground">{skippedCount} skipped</span>}
             {errorCount > 0 && <span className="text-red-600">{errorCount} error{errorCount !== 1 ? 's' : ''}</span>}
           </span>
         </div>
@@ -1741,6 +2086,15 @@ function Step4Results({
   const created = rows.filter(r => r.status === 'created');
   const duplicates = rows.filter(r => r.status === 'duplicate');
   const errors = rows.filter(r => r.status === 'error');
+  const skipped = rows.filter(r => r.status === 'skipped');
+
+  const buildSkippedReason = (row: SimRow) => {
+    const reasons: string[] = [];
+    if (row.supplierIntent === 'SKIP') reasons.push('supplier exists');
+    if (row.profileIntent === 'SKIP') reasons.push('profile exists');
+    if (row.bankIntent === 'SKIP') reasons.push('bank exists');
+    return reasons.length > 0 ? reasons.join(', ') : 'skipped by simulator';
+  };
 
   const summaryTable = (subset: SimRow[], cols: { label: string; render: (r: SimRow) => React.ReactNode }[]) => (
     <ScrollArea className="h-64 rounded-lg border">
@@ -1790,9 +2144,10 @@ function Step4Results({
       </div>
 
       {/* Metric cards */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
         <MetricCard label="Created" value={created.length} color="green" />
         <MetricCard label="Duplicates" value={duplicates.length} color="amber" />
+        <MetricCard label="Skipped" value={skipped.length} color="blue" />
         <MetricCard label="Errors" value={errors.length} color="red" />
         <MetricCard label="Total" value={rows.length} color="blue" />
       </div>
@@ -1810,6 +2165,12 @@ function Step4Results({
             Duplicates
             {duplicates.length > 0 && (
               <Badge variant="secondary" className="h-4 px-1 text-[10px]">{duplicates.length}</Badge>
+            )}
+          </TabsTrigger>
+          <TabsTrigger value="skipped" className="gap-1.5">
+            Skipped
+            {skipped.length > 0 && (
+              <Badge variant="outline" className="h-4 px-1 text-[10px]">{skipped.length}</Badge>
             )}
           </TabsTrigger>
           <TabsTrigger value="created" className="gap-1.5">
@@ -1835,6 +2196,15 @@ function Step4Results({
             { label: 'Legal Name', render: r => r.legal_name },
             { label: 'Wise Entity', render: r => r.wise_entity },
             { label: 'Existing Omnea ID', render: r => <code className="font-mono text-amber-700 dark:text-amber-400">{r.existing_omnea_id ?? '—'}</code> },
+          ])}
+        </TabsContent>
+
+        <TabsContent value="skipped" className="mt-4">
+          {summaryTable(skipped, [
+            { label: 'BC Vendor No', render: r => <code className="font-mono">{r.bc_vendor_no}</code> },
+            { label: 'Legal Name', render: r => r.legal_name },
+            { label: 'Wise Entity', render: r => r.wise_entity },
+            { label: 'Reason', render: r => buildSkippedReason(r) },
           ])}
         </TabsContent>
 

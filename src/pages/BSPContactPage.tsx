@@ -180,6 +180,116 @@ const downloadCsv = (content: string, filename: string) => {
   URL.revokeObjectURL(url);
 };
 
+const sanitizeFilePart = (value: string) =>
+  value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "item";
+
+const buildUserRowCsv = (
+  scope: "BSP" | "Non-BSP",
+  user: { userId: string; name: string; email?: string },
+  suppliers: Array<{ supplierId: string; supplierName: string; role?: string }>
+) => {
+  const header = [
+    "Scope",
+    "Omnea User ID",
+    "Omnea User",
+    "Email",
+    "Supplier ID",
+    "Supplier Name",
+    "Internal Contact Role",
+  ];
+
+  const rows = suppliers.map((supplier) => [
+    scope,
+    user.userId,
+    user.name,
+    user.email ?? "",
+    supplier.supplierId,
+    supplier.supplierName,
+    supplier.role ? formatContactRoleLabel(supplier.role) : "Role not set",
+  ]);
+
+  return [header, ...rows]
+    .map((row) => row.map((value) => escapeCsvField(value)).join(","))
+    .join("\n");
+};
+
+const buildSupplierRowCsv = (
+  scope: "BSP" | "Non-BSP",
+  supplier: { supplierId: string; supplierName: string; supplierEntityType?: string },
+  users: Array<{ userId: string; name: string; email?: string; role?: string }>
+) => {
+  const header = [
+    "Scope",
+    "Supplier ID",
+    "Supplier Name",
+    "Supplier Type",
+    "Omnea User ID",
+    "Omnea User",
+    "Email",
+    "Internal Contact Role",
+  ];
+
+  const rows = users.map((user) => [
+    scope,
+    supplier.supplierId,
+    supplier.supplierName,
+    supplier.supplierEntityType ?? "",
+    user.userId,
+    user.name,
+    user.email ?? "",
+    user.role ? formatContactRoleLabel(user.role) : "Role not set",
+  ]);
+
+  return [header, ...rows]
+    .map((row) => row.map((value) => escapeCsvField(value)).join(","))
+    .join("\n");
+};
+
+const buildRoleRowCsv = (
+  scope: "BSP" | "Non-BSP",
+  role: string,
+  contacts: Array<{
+    supplierId: string;
+    supplierName: string;
+    supplierEntityType?: string;
+    userId: string;
+    name: string;
+    email?: string;
+    role?: string;
+  }>
+) => {
+  const header = [
+    "Scope",
+    "Internal Contact Role",
+    "Omnea User ID",
+    "Omnea User",
+    "Email",
+    "Supplier ID",
+    "Supplier Name",
+    "Supplier Type",
+  ];
+
+  const roleLabel = role ? formatContactRoleLabel(role) : "Unspecified";
+  const rows = contacts.map((contact) => [
+    scope,
+    roleLabel,
+    contact.userId,
+    contact.name,
+    contact.email ?? "",
+    contact.supplierId,
+    contact.supplierName,
+    contact.supplierEntityType ?? "",
+  ]);
+
+  return [header, ...rows]
+    .map((row) => row.map((value) => escapeCsvField(value)).join(","))
+    .join("\n");
+};
+
 type SupplierAssignFailure = {
   supplierId: string;
   supplierName: string;
@@ -1516,6 +1626,65 @@ const BSPContactPage = () => {
     [nonBspInternalContacts]
   );
 
+  const exportUserRow = (
+    scope: "bsp" | "non-bsp",
+    user: { userId: string; name: string; email?: string }
+  ) => {
+    const suppliers =
+      scope === "bsp"
+        ? userScopedSupplierDetails.get(user.userId)?.bsp ?? []
+        : userScopedSupplierDetails.get(user.userId)?.nonBsp ?? [];
+    if (!suppliers.length) return;
+
+    const csv = buildUserRowCsv(scope === "bsp" ? "BSP" : "Non-BSP", user, suppliers);
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    downloadCsv(
+      csv,
+      `internal-contacts-${scope}-user-${sanitizeFilePart(user.name || user.userId)}-${dateStamp}.csv`
+    );
+  };
+
+  const exportSupplierRow = (
+    scope: "bsp" | "non-bsp",
+    supplier: {
+      supplierId: string;
+      supplierName: string;
+      supplierEntityType?: string;
+      users: Array<{ userId: string; name: string; email?: string; role?: string }>;
+    }
+  ) => {
+    if (!supplier.users.length) return;
+
+    const csv = buildSupplierRowCsv(
+      scope === "bsp" ? "BSP" : "Non-BSP",
+      {
+        supplierId: supplier.supplierId,
+        supplierName: supplier.supplierName,
+        supplierEntityType: supplier.supplierEntityType,
+      },
+      supplier.users
+    );
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    downloadCsv(
+      csv,
+      `internal-contacts-${scope}-supplier-${sanitizeFilePart(supplier.supplierName || supplier.supplierId)}-${dateStamp}.csv`
+    );
+  };
+
+  const exportRoleRow = (scope: "bsp" | "non-bsp", role: string) => {
+    const scopedContacts = (scope === "bsp" ? bspInternalContacts : nonBspInternalContacts).filter(
+      (contact) => (contact.role?.trim() || "Unspecified") === role
+    );
+    if (!scopedContacts.length) return;
+
+    const csv = buildRoleRowCsv(scope === "bsp" ? "BSP" : "Non-BSP", role, scopedContacts);
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    downloadCsv(
+      csv,
+      `internal-contacts-${scope}-role-${sanitizeFilePart(role || "unspecified")}-${dateStamp}.csv`
+    );
+  };
+
   const handleDownloadTableCsv = (scope: "bsp" | "non-bsp") => {
     const csvContent = buildInternalContactsCsv(scope === "bsp" ? bspInternalContacts : nonBspInternalContacts);
     const dateStamp = new Date().toISOString().slice(0, 10);
@@ -1902,12 +2071,14 @@ const BSPContactPage = () => {
                     <TableHead className="w-[260px]">Supplier</TableHead>
                     <TableHead className="w-[160px]">Entity Type</TableHead>
                     <TableHead>Assigned Users</TableHead>
+                    <TableHead className="w-[120px]">Actions</TableHead>
                   </TableRow>
                 ) : (
                   <TableRow>
                     <TableHead className="w-[220px]">Internal Role</TableHead>
                     <TableHead>Assigned Users</TableHead>
                     <TableHead>Suppliers</TableHead>
+                    <TableHead className="w-[120px]">Actions</TableHead>
                   </TableRow>
                 )}
               </TableHeader>
@@ -1956,6 +2127,15 @@ const BSPContactPage = () => {
                           <Plus className="h-3 w-3 mr-1" />
                           Add
                         </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-6 text-[11px] px-2 mt-1"
+                          onClick={() => exportUserRow("bsp", { userId: u.userId, name: u.name, email: u.email })}
+                        >
+                          <Download className="h-3 w-3 mr-1" />
+                          Export
+                        </Button>
                       </TableCell>
                           </>
                         );
@@ -1989,6 +2169,17 @@ const BSPContactPage = () => {
                             </Badge>
                           ))}
                         </div>
+                      </TableCell>
+                      <TableCell>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-6 text-[11px] px-2"
+                          onClick={() => exportSupplierRow("bsp", supplier)}
+                        >
+                          <Download className="h-3 w-3 mr-1" />
+                          Export
+                        </Button>
                       </TableCell>
                     </TableRow>
                   ))
@@ -2029,11 +2220,22 @@ const BSPContactPage = () => {
                           ))}
                         </div>
                       </TableCell>
+                      <TableCell>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-6 text-[11px] px-2"
+                          onClick={() => exportRoleRow("bsp", roleGroup.role)}
+                        >
+                          <Download className="h-3 w-3 mr-1" />
+                          Export
+                        </Button>
+                      </TableCell>
                     </TableRow>
                   ))
                 ) : hasLoadedOmneaContacts ? (
                   <TableRow>
-                    <TableCell colSpan={3}>
+                    <TableCell colSpan={assignmentTableView === "users" ? 3 : 4}>
                       <p className="text-sm text-muted-foreground">
                         {assignmentTableView === "users"
                           ? "Data loaded, but no BSP assignments were found for users with internal contacts."
@@ -2045,7 +2247,7 @@ const BSPContactPage = () => {
                   </TableRow>
                 ) : (
                   <TableRow>
-                    <TableCell colSpan={3}>
+                    <TableCell colSpan={assignmentTableView === "users" ? 3 : 4}>
                       <p className="text-sm text-muted-foreground">No data loaded. Click "Load Omnea internal contacts" to fetch user assignments.</p>
                     </TableCell>
                   </TableRow>
@@ -2111,12 +2313,14 @@ const BSPContactPage = () => {
                     <TableHead className="w-[260px]">Supplier</TableHead>
                     <TableHead className="w-[160px]">Entity Type</TableHead>
                     <TableHead>Assigned Users</TableHead>
+                    <TableHead className="w-[120px]">Actions</TableHead>
                   </TableRow>
                 ) : (
                   <TableRow>
                     <TableHead className="w-[220px]">Internal Role</TableHead>
                     <TableHead>Assigned Users</TableHead>
                     <TableHead>Suppliers</TableHead>
+                    <TableHead className="w-[120px]">Actions</TableHead>
                   </TableRow>
                 )}
               </TableHeader>
@@ -2165,6 +2369,15 @@ const BSPContactPage = () => {
                           <Plus className="h-3 w-3 mr-1" />
                           Add
                         </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-6 text-[11px] px-2 mt-1"
+                          onClick={() => exportUserRow("non-bsp", { userId: u.userId, name: u.name, email: u.email })}
+                        >
+                          <Download className="h-3 w-3 mr-1" />
+                          Export
+                        </Button>
                       </TableCell>
                           </>
                         );
@@ -2198,6 +2411,17 @@ const BSPContactPage = () => {
                             </Badge>
                           ))}
                         </div>
+                      </TableCell>
+                      <TableCell>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-6 text-[11px] px-2"
+                          onClick={() => exportSupplierRow("non-bsp", supplier)}
+                        >
+                          <Download className="h-3 w-3 mr-1" />
+                          Export
+                        </Button>
                       </TableCell>
                     </TableRow>
                   ))
@@ -2238,11 +2462,22 @@ const BSPContactPage = () => {
                           ))}
                         </div>
                       </TableCell>
+                      <TableCell>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-6 text-[11px] px-2"
+                          onClick={() => exportRoleRow("non-bsp", roleGroup.role)}
+                        >
+                          <Download className="h-3 w-3 mr-1" />
+                          Export
+                        </Button>
+                      </TableCell>
                     </TableRow>
                   ))
                 ) : (
                   <TableRow>
-                    <TableCell colSpan={3}>
+                    <TableCell colSpan={assignmentTableView === "users" ? 3 : 4}>
                       <p className="text-sm text-muted-foreground">
                         {hasLoadedOmneaContacts
                           ? assignmentTableView === "users"

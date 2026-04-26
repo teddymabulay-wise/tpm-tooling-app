@@ -97,11 +97,24 @@ export interface FetchAllPagesOptions {
  * Make an authenticated request to Omnea API.
  * Pass `authEnvironment` to force a specific environment's credentials
  * regardless of the global environment switcher.
+ *
+ * When VITE_USE_WORKATO_PROXY=true all calls are routed through the Workato
+ * proxy instead of hitting Omnea directly. The OAuth2 code below is kept for
+ * local development (where the flag is false). In production the Omnea
+ * credentials are absent from the build so this path is unreachable anyway.
  */
 export async function makeOmneaRequest<T = unknown>(
   path: string,
   options: RequestOptions = {}
 ): Promise<ApiResponse<T>> {
+  if (import.meta.env.VITE_USE_WORKATO_PROXY === "true") {
+    const { makeWorkatoRequest } = await import("@/lib/workato-api-utils");
+    const { getOmneaEnvironment } = await import("@/lib/omnea-environment");
+    const env = options.authEnvironment ?? getOmneaEnvironment();
+    const strippedPath = path.replace(/^https?:\/\/[^/]+/, "");
+    return makeWorkatoRequest<T>(env, strippedPath, options);
+  }
+
   const {
     method = "GET",
     body,

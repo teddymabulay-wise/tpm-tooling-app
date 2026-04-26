@@ -17,6 +17,7 @@ const collections = [
   "Supplier Profile",
   "Bank Account",
   "Subsidiaries",
+  "Currencies",
   "Departments",
   "Custom Data",
   "Request",

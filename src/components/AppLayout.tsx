@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { AppSidebar } from "@/components/AppSidebar";
 import { useOmneaEnvironment } from "@/components/use-omnea-environment";
+import { useLocation } from "react-router-dom";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -20,8 +21,10 @@ import { Outlet } from "react-router-dom";
 export const AppLayout = () => {
   const { environment, label, setEnvironment } = useOmneaEnvironment();
   const [pendingEnvironment, setPendingEnvironment] = useState<"qa" | "production" | null>(null);
+  const { pathname } = useLocation();
 
   const isProduction = environment === "production";
+  const hideEnvToggle = pathname === "/tools/qa-cleanup";
 
   const handleEnvironmentToggle = (checked: boolean) => {
     setPendingEnvironment(checked ? "production" : "qa");
@@ -72,15 +75,17 @@ export const AppLayout = () => {
                 >
                   {label}
                 </Badge>
-                <div className="flex items-center gap-2 text-xs">
-                  <span className={cn(!isProduction ? "font-semibold text-sky-900" : "text-muted-foreground")}>
-                    QA
-                  </span>
-                  <Switch checked={isProduction} onCheckedChange={handleEnvironmentToggle} />
-                  <span className={cn(isProduction ? "font-semibold text-amber-900" : "text-muted-foreground")}>
-                    Production
-                  </span>
-                </div>
+                {!hideEnvToggle && (
+                  <div className="flex items-center gap-2 text-xs">
+                    <span className={cn(!isProduction ? "font-semibold text-sky-900" : "text-muted-foreground")}>
+                      QA
+                    </span>
+                    <Switch checked={isProduction} onCheckedChange={handleEnvironmentToggle} />
+                    <span className={cn(isProduction ? "font-semibold text-amber-900" : "text-muted-foreground")}>
+                      Production
+                    </span>
+                  </div>
+                )}
               </div>
             </div>
           </header>

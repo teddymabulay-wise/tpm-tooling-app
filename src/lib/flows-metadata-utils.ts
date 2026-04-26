@@ -2,7 +2,7 @@
  * Utilities for parsing and managing Omnea Flows Metadata CSV
  */
 
-import type { FlowLogicCondition, FlowMetadata, FlowTag, FlowsMetadataState, MetadataMetrics } from "./flows-metadata-types";
+import type { FlowBlockStructure, FlowLogicCondition, FlowMetadata, FlowTag, FlowsMetadataState, MetadataMetrics } from "./flows-metadata-types";
 
 export interface ParsedFlowTagImport {
   workflow: string;
@@ -164,6 +164,46 @@ export function parseFlowLogicConditionsCSV(csvContent: string): FlowLogicCondit
       scope: getValue(values, scopeIdx),
       logicName: getValue(values, logicNameIdx),
       logicCondition: getValue(values, logicConditionIdx),
+    });
+  }
+
+  return rows;
+}
+
+/** Parse a Block Structure CSV (Workflow Name, Block, Next Blocks, Milestone, Milestone Reference). */
+export function parseFlowBlockStructureCSV(csvContent: string): FlowBlockStructure[] {
+  const lines = csvContent.split("\n");
+  if (lines.length < 2) return [];
+  const header = parseCSVLine(lines[0]);
+  const nh = header.map((h) => h.toLowerCase().trim());
+  const workflowIdx = nh.findIndex((h) => h.includes("workflow"));
+  const blockIdx = nh.findIndex((h) => h === "block" || (h.includes("block") && !h.includes("next")));
+  const nextBlocksIdx = nh.findIndex((h) => h.includes("next") && h.includes("block"));
+  const milestoneIdx = nh.findIndex((h) => h === "milestone" || h.includes("milestone name"));
+  const milestoneRefIdx = nh.findIndex((h) => h.includes("milestone") && h.includes("reference"));
+
+  const rows: FlowBlockStructure[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const values = parseCSVLine(line);
+    const workflow = getValue(values, workflowIdx);
+    const block = getValue(values, blockIdx);
+    if (!workflow.trim() || !block.trim()) continue;
+
+    const nextBlocksRaw = getValue(values, nextBlocksIdx);
+    const nextBlocks = nextBlocksRaw
+      .split(";")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+
+    rows.push({
+      id: `block-structure-${i}`,
+      workflow,
+      block,
+      nextBlocks,
+      milestone: getValue(values, milestoneIdx),
+      milestoneReference: getValue(values, milestoneRefIdx),
     });
   }
 
@@ -485,6 +525,18 @@ export function exportFlowLogicConditionsToCSV(rows: FlowLogicCondition[]): stri
     escapeCSVField(row.scope),
     escapeCSVField(row.logicName),
     escapeCSVField(row.logicCondition),
+  ]);
+  return [headers.join(","), ...dataRows.map((row) => row.join(","))].join("\n");
+}
+
+export function exportFlowBlockStructureToCSV(rows: FlowBlockStructure[]): string {
+  const headers = ["Workflow Name", "Block", "Next Blocks", "Milestone", "Milestone Reference"];
+  const dataRows = rows.map((row) => [
+    escapeCSVField(row.workflow),
+    escapeCSVField(row.block),
+    escapeCSVField((row.nextBlocks ?? []).join("; ")),
+    escapeCSVField(row.milestone ?? ""),
+    escapeCSVField(row.milestoneReference ?? ""),
   ]);
   return [headers.join(","), ...dataRows.map((row) => row.join(","))].join("\n");
 }

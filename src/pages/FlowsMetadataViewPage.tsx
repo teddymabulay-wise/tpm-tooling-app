@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Check, Copy, TrendingUp, X, Search, Settings } from "lucide-react";
+import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
+import { Check, Copy, Loader2, Search, Settings, TrendingUp, X, ZoomIn } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 
 import { Badge } from "@/components/ui/badge";
@@ -9,6 +9,8 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { CollapsibleSection } from "@/components/CollapsibleSection";
 import type { FlowMetadata, FlowTag } from "@/lib/flows-metadata-types";
 import { parseFlowTagsCSV, parseFlowsMetadataCSV } from "@/lib/flows-metadata-utils";
@@ -78,6 +80,126 @@ const FILTER_CARD_HEIGHT = "";
 const FILTER_CARD_MAX_VISIBLE_ROWS = 5;
 const FILTER_CARD_ROW_HEIGHT = 64;
 
+type TagConditionReference = { questionId: string; value: string; operator: string; connector?: "AND" | "OR" };
+
+function extractTagConditionReferences(rawCondition: string): Array<TagConditionReference> {
+  const results: Array<TagConditionReference> = [];
+
+  const dedupe = (entries: Array<TagConditionReference>) => {
+    const map = new Map<string, TagConditionReference>();
+    entries.forEach((entry) => {
+      const key = `${entry.questionId}::${entry.value}::${entry.operator}`;
+      if (!map.has(key)) map.set(key, entry);
+    });
+    return Array.from(map.values());
+  };
+
+  const parsePlainTextReferences = (condition: string) => {
+    const operators = [
+      "LESS_THAN_OR_EQUAL_TO",
+      "GREATER_THAN_OR_EQUAL_TO",
+      "NOT_CONTAINS",
+      "NOT_EQUAL",
+      "LESS_THAN",
+      "GREATER_THAN",
+      "CONTAINS",
+      "EQUAL",
+    ];
+
+    const cleaned = condition.replace(/[()]/g, " ").replace(/\s+/g, " ").trim();
+    if (!cleaned) return [] as Array<TagConditionReference>;
+
+    // Split capturing the AND/OR separators so we can thread them through
+    const parts = cleaned.split(/\s+(AND|OR)\s+/i);
+    const plainResults: Array<TagConditionReference> = [];
+
+    // parts = [seg0, 'AND'|'OR', seg1, 'AND'|'OR', seg2, ...]
+    let segmentIndex = 0;
+    for (let i = 0; i < parts.length; i++) {
+      if (i % 2 === 1) continue; // odd indices are connectors, handled below
+      const token = parts[i].trim();
+      if (!token) { segmentIndex++; continue; }
+
+      const connector = segmentIndex > 0
+        ? (parts[i - 1].toUpperCase() as "AND" | "OR")
+        : undefined;
+
+      const op = operators.find((candidate) => token.includes(` ${candidate} `));
+      if (!op) { segmentIndex++; continue; }
+
+      const [left, ...rightParts] = token.split(` ${op} `);
+      const questionId = left.trim();
+      const value = rightParts.join(` ${op} `).trim();
+
+      if (!questionId) { segmentIndex++; continue; }
+
+      plainResults.push({ questionId, value: value || "(empty)", operator: op, connector });
+      segmentIndex++;
+    }
+
+    return plainResults;
+  };
+
+  try {
+    const parsed = JSON.parse(rawCondition);
+
+    // Walk JSON condition tree; propagate the parent group type (AND/OR) as connector
+    const walk = (node: unknown, connector?: "AND" | "OR") => {
+      if (!node || typeof node !== "object") return;
+
+      const record = node as {
+        type?: unknown;
+        operator?: unknown;
+        primaryField?: Record<string, unknown>;
+        secondaryField?: { value?: unknown };
+        items?: unknown;
+        comparisons?: unknown;
+      };
+
+      if (record.primaryField && typeof record.primaryField === "object" && record.operator) {
+        const pf = record.primaryField;
+        // Support { questionId }, { value } (VARIABLE type), or any other identifier field
+        const questionId = typeof pf.questionId === "string" ? pf.questionId
+          : typeof pf.value === "string" ? pf.value
+          : typeof pf.source === "string" ? pf.source
+          : JSON.stringify(pf);
+
+        const secondaryValue = record.secondaryField && typeof record.secondaryField === "object"
+          ? record.secondaryField.value
+          : undefined;
+
+        results.push({
+          questionId,
+          value: typeof secondaryValue === "string" || typeof secondaryValue === "number" || typeof secondaryValue === "boolean"
+            ? String(secondaryValue)
+            : secondaryValue == null
+            ? "(empty)"
+            : JSON.stringify(secondaryValue),
+          operator: typeof record.operator === "string" ? record.operator : "",
+          connector,
+        });
+        return;
+      }
+
+      const groupType = typeof record.type === "string" && ["AND", "OR"].includes(record.type.toUpperCase())
+        ? (record.type.toUpperCase() as "AND" | "OR")
+        : connector;
+
+      const collections: unknown[] = [];
+      if (Array.isArray(record.items)) collections.push(...record.items as unknown[]);
+      if (Array.isArray(record.comparisons)) collections.push(...record.comparisons as unknown[]);
+
+      collections.forEach((item, idx) => walk(item, idx === 0 ? undefined : groupType));
+    };
+
+    walk(parsed);
+  } catch {
+    return dedupe(parsePlainTextReferences(rawCondition));
+  }
+
+  return dedupe(results);
+}
+
 const TOOLBAR_FIELDS: Array<{ field: ToolbarField; label: string }> = [
   { field: "workflow", label: "Workflow" },
   { field: "blockType", label: "Block" },
@@ -143,8 +265,21 @@ function FlowsMetadataViewPage() {
   const [loading, setLoading] = useState(true);
   const [filters, setFilters] = useState<Partial<Record<FilterField, string>>>({});
   const [searchText, setSearchText] = useState("");
+  const [questionIdMultiFilter, setQuestionIdMultiFilter] = useState<string[]>([]);
+  const [activeTagFilterKey, setActiveTagFilterKey] = useState<string | null>(null);
+  const [activeLogicFilterKey, setActiveLogicFilterKey] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [logicModal, setLogicModal] = useState<{
+    title: string;
+    groupLabel: string;
+    workflow: string;
+    expression: string;
+    rawLogic: string;
+    parsed: unknown;
+    details: { pairs: Array<{ question: string; value: string }>; questions: string[]; values: string[] };
+    tagReferences?: Array<{ questionId: string; value: string; operator: string; form: string; questionTitle: string }>;
+  } | null>(null);
 
   useEffect(() => {
     const load = async () => {
@@ -181,6 +316,13 @@ function FlowsMetadataViewPage() {
         }
       }
 
+      if (questionIdMultiFilter.length > 0) {
+        const recId = getFieldValue(record, "questionId");
+        if (!questionIdMultiFilter.includes(recId)) {
+          return false;
+        }
+      }
+
       if (!searchText.trim()) {
         return true;
       }
@@ -207,7 +349,38 @@ function FlowsMetadataViewPage() {
         record.coreDataSource,
       ].some((value) => normalizeString(value).toLowerCase().includes(search));
     });
+  }, [data, filters, searchText, questionIdMultiFilter]);
+
+  // Card option lists should not collapse when questionIdMultiFilter is active —
+  // use data filtered by all criteria except the multi-filter.
+  const filteredDataForCards = useMemo(() => {
+    return data.filter((record) => {
+      for (const [field, value] of Object.entries(filters) as Array<[FilterField, string]>) {
+        if (!matchesField(record, field, value)) {
+          return false;
+        }
+      }
+      if (!searchText.trim()) return true;
+      const search = searchText.toLowerCase();
+      return [
+        record.workflow, record.blockType, record.blockName, record.blockDuration,
+        record.assignees, record.blockLogicName, record.blockLogicCondition,
+        record.formName, record.formSection, record.formSectionLogicName,
+        record.formSectionLogicCondition, record.questionType, record.questionId,
+        record.questionTitle, record.description, record.questionLogicName,
+        record.questionLogicCondition, record.coreDataSource,
+      ].some((value) => normalizeString(value).toLowerCase().includes(search));
+    });
   }, [data, filters, searchText]);
+
+  // For Block/Question Logic Condition cards: apply questionIdMultiFilter when any card-level filter is active.
+  const filteredDataForLogicCards = useMemo(() => {
+    if ((!activeTagFilterKey && !activeLogicFilterKey) || questionIdMultiFilter.length === 0) return filteredDataForCards;
+    return filteredDataForCards.filter((record) => {
+      const recId = getFieldValue(record, "questionId");
+      return questionIdMultiFilter.includes(recId);
+    });
+  }, [filteredDataForCards, activeTagFilterKey, activeLogicFilterKey, questionIdMultiFilter]);
 
   const toolbarOptions = useMemo(() => {
     const buildOptions = (field: ToolbarField) => {
@@ -351,6 +524,34 @@ function FlowsMetadataViewPage() {
     [coreDataWithSource, filteredData],
   );
 
+  const questionTitleMap = useMemo(() => {
+    const map = new Map<string, string>();
+    data.forEach((record) => {
+      const id = normalizeValue(record.questionId);
+      const title = normalizeValue(record.questionTitle);
+      if (id !== EMPTY_VALUE && title !== EMPTY_VALUE && !map.has(id)) {
+        map.set(id, title);
+      }
+    });
+    return map;
+  }, [data]);
+
+  const questionDescriptionMap = useMemo(() => {
+    const map = new Map<string, string>();
+    data.forEach((record) => {
+      const id = normalizeValue(record.questionId);
+      const description = normalizeValue(record.description);
+      const title = normalizeValue(record.questionTitle);
+      if (id === EMPTY_VALUE || map.has(id)) return;
+
+      const helpText = description !== EMPTY_VALUE ? description : title;
+      if (helpText !== EMPTY_VALUE) {
+        map.set(id, helpText);
+      }
+    });
+    return map;
+  }, [data]);
+
   const tagCardRows = useMemo(() => {
     const workflowFilter = filters.workflow;
     const scoped = workflowFilter ? tagData.filter((tag) => normalizeValue(tag.workflow) === workflowFilter) : tagData;
@@ -366,7 +567,7 @@ function FlowsMetadataViewPage() {
     });
   }, [filters.workflow, tagData]);
 
-  const activeFilterCount = Object.keys(filters).length + (searchText ? 1 : 0);
+  const activeFilterCount = Object.keys(filters).length + (searchText ? 1 : 0) + (questionIdMultiFilter.length > 0 ? 1 : 0);
   const blockCount = new Set(filteredData.map((record) => normalizeValue(record.blockName)).filter((value) => value !== EMPTY_VALUE)).size;
   const formCount = new Set(filteredData.map((record) => normalizeValue(record.formName)).filter((value) => value !== EMPTY_VALUE)).size;
   const questionCount = new Set(filteredData.map((record) => normalizeValue(record.questionId)).filter((value) => value !== EMPTY_VALUE)).size;
@@ -396,6 +597,174 @@ function FlowsMetadataViewPage() {
   const clearFilters = () => {
     setFilters({});
     setSearchText("");
+    setQuestionIdMultiFilter([]);
+    setActiveTagFilterKey(null);
+    setActiveLogicFilterKey(null);
+  };
+
+  const renderCardEmptyState = () => {
+    if (loading) {
+      return (
+        <div className="inline-flex items-center gap-1.5 text-[10px] text-slate-400">
+          <Loader2 className="h-3 w-3 animate-spin" />
+          Loading...
+        </div>
+      );
+    }
+
+    return <p className="text-[10px] text-slate-400">—</p>;
+  };
+
+  const tagGroupsForCard = useMemo(() => {
+    const workflowFilter = filters.workflow;
+    const scopedData = workflowFilter
+      ? filteredDataForCards.filter((record) => normalizeValue(record.workflow) === workflowFilter)
+      : filteredDataForCards;
+
+    const workflowBlocks = new Map<string, {
+      workflow: string;
+      blocks: Map<string, Map<string, Set<string>>>;
+    }>();
+
+    // Mirror Configuration TAGS column shape: workflow -> block -> form -> questionIds.
+    scopedData.forEach((record) => {
+      const workflow = normalizeString(record.workflow);
+      const workflowKey = workflow.toLowerCase();
+      const block = normalizeString(record.blockName) || "(No block)";
+      const form = normalizeString(record.formName) || "(No form)";
+      const questionId = normalizeString(record.questionId);
+      if (!workflow || !questionId) return;
+
+      const workflowEntry = workflowBlocks.get(workflowKey) ?? {
+        workflow,
+        blocks: new Map<string, Map<string, Set<string>>>(),
+      };
+
+      const formsMap = workflowEntry.blocks.get(block) ?? new Map<string, Set<string>>();
+      const ids = formsMap.get(form) ?? new Set<string>();
+      ids.add(questionId);
+      formsMap.set(form, ids);
+      workflowEntry.blocks.set(block, formsMap);
+      workflowBlocks.set(workflowKey, workflowEntry);
+    });
+
+    // Same structure used in Configuration page: workflow -> tag -> references, with form/title metadata per questionId.
+    const workflowQuestions = new Map<string, Map<string, { forms: Set<string>; titles: Set<string> }>>();
+    scopedData.forEach((record) => {
+      const workflow = normalizeString(record.workflow).toLowerCase();
+      const questionId = normalizeString(record.questionId);
+      if (!workflow || !questionId) return;
+
+      const formName = normalizeString(record.formName) || "(No form)";
+      const questionTitle = normalizeString(record.questionTitle);
+      const current = workflowQuestions.get(workflow) ?? new Map<string, { forms: Set<string>; titles: Set<string> }>();
+      const meta = current.get(questionId) ?? { forms: new Set<string>(), titles: new Set<string>() };
+      meta.forms.add(formName);
+      if (questionTitle) meta.titles.add(questionTitle);
+      current.set(questionId, meta);
+      workflowQuestions.set(workflow, current);
+    });
+
+    const workflowTagsWithDetails = new Map<string, Array<{
+      tagKey: string;
+      tagName: string;
+      references: Array<{ questionId: string; value: string; operator: string; forms: string[]; questionTitles: string[] }>;
+    }>>();
+
+    tagCardRows.forEach((tag) => {
+      const workflow = normalizeString(tag.workflow);
+      const workflowKey = workflow.toLowerCase();
+      if (!workflow) return;
+
+      const questionMeta = workflowQuestions.get(workflowKey) ?? new Map<string, { forms: Set<string>; titles: Set<string> }>();
+      const references = extractTagConditionReferences(tag.tagConditions)
+        .filter((reference) => questionMeta.has(reference.questionId))
+        .map((reference) => ({
+          ...reference,
+          forms: Array.from(questionMeta.get(reference.questionId)?.forms ?? []).sort((left, right) => left.localeCompare(right)),
+          questionTitles: Array.from(questionMeta.get(reference.questionId)?.titles ?? []).sort((left, right) => left.localeCompare(right)),
+        }));
+
+      const existing = workflowTagsWithDetails.get(workflowKey) ?? [];
+      existing.push({
+        tagKey: `${workflow}::${normalizeString(tag.tagName)}`,
+        tagName: normalizeString(tag.tagName) || "(No tag name)",
+        references,
+      });
+      workflowTagsWithDetails.set(workflowKey, existing);
+    });
+
+    return Array.from(workflowBlocks.entries())
+      .sort((left, right) => left[1].workflow.localeCompare(right[1].workflow))
+      .map(([workflowKey, workflowEntry]) => {
+        const workflowTags = workflowTagsWithDetails.get(workflowKey) ?? [];
+
+        return {
+          workflow: workflowEntry.workflow,
+          blocks: Array.from(workflowEntry.blocks.entries())
+            .sort((left, right) => left[0].localeCompare(right[0]))
+            .map(([block, formsMap]) => ({
+              block,
+              forms: Array.from(formsMap.entries())
+                .sort((left, right) => left[0].localeCompare(right[0]))
+                .map(([form, idsSet]) => {
+                  const questionIds = Array.from(idsSet);
+                  const tags = workflowTags
+                    .map((tag) => {
+                      const references = tag.references
+                        .filter((reference) => questionIds.includes(reference.questionId))
+                        .map((reference) => ({
+                          questionId: reference.questionId,
+                          value: reference.value,
+                          operator: reference.operator,
+                          connector: reference.connector,
+                          form,
+                          questionTitle: reference.questionTitles.find((entry) => {
+                            const value = entry.trim();
+                            return value && value !== "?" && value !== "-";
+                          }) || reference.questionId,
+                        }));
+
+                      return {
+                        tagKey: tag.tagKey,
+                        tagName: tag.tagName,
+                        references,
+                      };
+                    })
+                    .filter((tag) => tag.references.length > 0)
+                    .sort((left, right) => left.tagName.localeCompare(right.tagName));
+
+                  return {
+                    form,
+                    tags,
+                  };
+                })
+                .filter((formGroup) => formGroup.tags.length > 0),
+            }))
+            .filter((blockGroup) => blockGroup.forms.length > 0),
+        };
+      })
+      .filter((workflowGroup) => workflowGroup.blocks.length > 0);
+  }, [filteredDataForCards, filters.workflow, tagCardRows]);
+
+  const toggleTagCardFilter = (
+    tagKey: string,
+    workflow: string,
+    references: Array<{ questionId: string }>,
+  ) => {
+    if (activeTagFilterKey === tagKey) {
+      setActiveTagFilterKey(null);
+      setQuestionIdMultiFilter([]);
+      return;
+    }
+
+    setActiveLogicFilterKey(null);
+    setActiveTagFilterKey(tagKey);
+    setFilterValue("workflow", workflow);
+    setFilterValue("questionId", ALL_VALUE);
+
+    const questionIds = Array.from(new Set(references.map((reference) => normalizeString(reference.questionId)).filter(Boolean)));
+    setQuestionIdMultiFilter(questionIds);
   };
 
   const handleCopyFilteredOutput = async () => {
@@ -430,10 +799,9 @@ function FlowsMetadataViewPage() {
       if (formName && formName !== EMPTY_VALUE) {
         const blockType = normalizeValue(record.blockType);
         const workflow = normalizeValue(record.workflow);
-        const key = `${formName}||${blockType}||${workflow}`;
-
-        if (!seen.has(key)) {
-          seen.add(key);
+        // Select values must be unique; formName is used as the Select value.
+        if (!seen.has(formName)) {
+          seen.add(formName);
           options.push({
             formName,
             blockType: blockType !== EMPTY_VALUE ? blockType : "—",
@@ -448,25 +816,37 @@ function FlowsMetadataViewPage() {
 
   const extractLogicDetails = (logicJson: string | undefined) => {
     if (!logicJson || logicJson.toLowerCase() === "na") {
-      return { questions: [], values: [] };
+      return { pairs: [], questions: [], values: [] };
     }
 
     try {
       const parsed = JSON.parse(logicJson);
-      const questions = new Set<string>();
-      const values = new Set<string>();
+      const pairSet = new Set<string>();
+      const pairs: Array<{ question: string; value: string }> = [];
 
       const traverse = (node: any) => {
         if (!node || typeof node !== "object") return;
 
-        if (node.primaryField) {
-          const primaryValue = node.primaryField.value;
-          if (primaryValue) questions.add(primaryValue);
-        }
+        const primaryValue = normalizeValue(node?.primaryField?.value);
+        const secondaryValue = normalizeValue(
+          node?.secondaryField?.value
+          ?? node?.secondaryField?.id
+          ?? node?.secondaryField?.source
+          ?? node?.value,
+        );
 
-        if (node.secondaryField) {
-          const secondaryValue = node.secondaryField.value;
-          if (secondaryValue) values.add(String(secondaryValue));
+        if (primaryValue !== EMPTY_VALUE) {
+          const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+          if (!uuidPattern.test(primaryValue)) {
+            const pairKey = `${primaryValue}::${secondaryValue}`;
+            if (!pairSet.has(pairKey)) {
+              pairSet.add(pairKey);
+              pairs.push({
+                question: primaryValue,
+                value: secondaryValue,
+              });
+            }
+          }
         }
 
         if (Array.isArray(node.items)) {
@@ -479,47 +859,71 @@ function FlowsMetadataViewPage() {
       };
 
       traverse(parsed);
+      const sortedPairs = pairs.sort((left, right) => {
+        if (left.question !== right.question) return left.question.localeCompare(right.question);
+        return left.value.localeCompare(right.value);
+      });
+
       return {
-        questions: Array.from(questions),
-        values: Array.from(values),
+        pairs: sortedPairs,
+        questions: sortedPairs
+          .map((entry) => entry.question)
+          .filter((value, index, array) => array.indexOf(value) === index)
+          .sort((a, b) => a.localeCompare(b)),
+        values: sortedPairs
+          .map((entry) => entry.value)
+          .filter((value, index, array) => array.indexOf(value) === index)
+          .sort((a, b) => a.localeCompare(b)),
       };
     } catch {
-      return { questions: [], values: [] };
+      return { pairs: [], questions: [], values: [] };
     }
   };
 
-  const extractLogicPairs = (logicJson: string | undefined): string[] => {
+  const applyLogicCardFilter = (
+    _field: "blockLogicCondition" | "questionLogicCondition",
+    logicKey: string,
+    parsed: unknown,
+    fallbackQuestionId: string,
+    workflow: string,
+  ) => {
+    const active = activeLogicFilterKey === logicKey;
+    if (active) {
+      setActiveLogicFilterKey(null);
+      setQuestionIdMultiFilter([]);
+      return;
+    }
+
+    setActiveTagFilterKey(null);
+    setActiveLogicFilterKey(logicKey);
+    setFilterValue("workflow", workflow);
+    setFilterValue("questionId", ALL_VALUE);
+
+    const ids = Array.from(new Set(extractAllQuestionIds(parsed).map((value) => normalizeString(value)).filter(Boolean)));
+    if (ids.length > 0) {
+      setQuestionIdMultiFilter(ids);
+      return;
+    }
+
+    if (fallbackQuestionId !== EMPTY_VALUE) {
+      setQuestionIdMultiFilter([fallbackQuestionId]);
+      return;
+    }
+
+    setQuestionIdMultiFilter([]);
+  };
+
+  const extractLogicExpression = (logicJson: string | undefined): string => {
     if (!logicJson || logicJson.toLowerCase() === "na") {
-      return [];
+      return EMPTY_VALUE;
     }
 
     try {
       const parsed = JSON.parse(logicJson);
-      const pairs: string[] = [];
-
-      const traverse = (node: any) => {
-        if (!node || typeof node !== "object") return;
-
-        const primaryValue = node.primaryField?.value;
-        const secondaryValue = node.secondaryField?.value;
-
-        if (primaryValue && secondaryValue) {
-          pairs.push(`${primaryValue} = ${secondaryValue}`);
-        }
-
-        if (Array.isArray(node.items)) {
-          node.items.forEach(traverse);
-        }
-
-        if (Array.isArray(node.comparisons)) {
-          node.comparisons.forEach(traverse);
-        }
-      };
-
-      traverse(parsed);
-      return pairs;
+      const expression = formatLogicExpression(parsed);
+      return expression || EMPTY_VALUE;
     } catch {
-      return [];
+      return EMPTY_VALUE;
     }
   };
 
@@ -671,17 +1075,20 @@ function FlowsMetadataViewPage() {
           {(activeFilterCount > 0 || loading) && (
             <div className="flex min-h-8 flex-wrap items-center gap-1.5 px-1 text-[11px] text-slate-500 mt-3">
               {loading ? <span>Loading metadata...</span> : null}
-              {Object.entries(filters).map(([field, value]) => (
-                <Badge
-                  key={`${field}-${value}`}
-                  className="h-6 cursor-pointer rounded-md bg-slate-100 px-2 text-[11px] font-medium text-slate-700 hover:bg-slate-200"
-                  variant="secondary"
-                  onClick={() => setFilterValue(field as FilterField, ALL_VALUE)}
-                >
-                  {FIELD_LABELS[field as FilterField]}: {value}
-                  <X className="ml-1 h-3 w-3" />
-                </Badge>
-              ))}
+              {Object.entries(filters).map(([field, value]) => {
+                if (field === "blockLogicCondition" || field === "questionLogicCondition") return null;
+                return (
+                  <Badge
+                    key={`${field}-${value}`}
+                    className="h-6 cursor-pointer rounded-md bg-slate-100 px-2 text-[11px] font-medium text-slate-700 hover:bg-slate-200"
+                    variant="secondary"
+                    onClick={() => setFilterValue(field as FilterField, ALL_VALUE)}
+                  >
+                    {FIELD_LABELS[field as FilterField]}: {value}
+                    <X className="ml-1 h-3 w-3" />
+                  </Badge>
+                );
+              })}
               {searchText ? (
                 <Badge
                   className="h-6 cursor-pointer rounded-md bg-blue-50 px-2 text-[11px] font-medium text-blue-700 hover:bg-blue-100"
@@ -689,6 +1096,20 @@ function FlowsMetadataViewPage() {
                   onClick={() => setSearchText("")}
                 >
                   Search: {searchText}
+                  <X className="ml-1 h-3 w-3" />
+                </Badge>
+              ) : null}
+              {questionIdMultiFilter.length > 0 ? (
+                <Badge
+                  className="h-6 cursor-pointer rounded-md bg-indigo-50 px-2 text-[11px] font-medium text-indigo-700 hover:bg-indigo-100"
+                  variant="secondary"
+                  onClick={() => {
+                    setQuestionIdMultiFilter([]);
+                    setActiveTagFilterKey(null);
+                    setActiveLogicFilterKey(null);
+                  }}
+                >
+                  Logic filter: {questionIdMultiFilter.length} question{questionIdMultiFilter.length > 1 ? "s" : ""}
                   <X className="ml-1 h-3 w-3" />
                 </Badge>
               ) : null}
@@ -730,7 +1151,7 @@ function FlowsMetadataViewPage() {
                               }
                             });
                             return rows.length === 0 ? (
-                              <p className="text-[10px] text-slate-400">—</p>
+                              renderCardEmptyState()
                             ) : (
                               rows.sort().map((value, idx) => (
                                 <button
@@ -783,7 +1204,7 @@ function FlowsMetadataViewPage() {
                             });
 
                             if (grouped.size === 0) {
-                              return <p className="text-[10px] text-slate-400">—</p>;
+                              return renderCardEmptyState();
                             }
 
                             return Array.from(grouped.entries())
@@ -831,7 +1252,7 @@ function FlowsMetadataViewPage() {
                           {(() => {
                             const seen = new Set<string>();
                             const rows: string[] = [];
-                            filteredData.forEach(record => {
+                            filteredData.forEach((record) => {
                               const value = normalizeValue(record.blockDuration);
                               if (!seen.has(value) && value !== EMPTY_VALUE) {
                                 seen.add(value);
@@ -839,7 +1260,7 @@ function FlowsMetadataViewPage() {
                               }
                             });
                             return rows.length === 0 ? (
-                              <p className="text-[10px] text-slate-400">—</p>
+                              renderCardEmptyState()
                             ) : (
                               rows.sort().map((value, idx) => (
                                 <button
@@ -861,8 +1282,11 @@ function FlowsMetadataViewPage() {
                   {/* Assignees */}
                   <Card className={`border-slate-200 bg-white shadow-sm ${filters.assignees && filters.assignees !== ALL_VALUE ? "ring-2 ring-blue-200" : ""}`}>
                     <CardContent className="flex flex-col p-0">
-                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-center justify-between">
-                        <h4 className="text-xs font-semibold text-slate-900">Assignees</h4>
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-start justify-between gap-2">
+                        <div>
+                          <h4 className="text-xs font-semibold text-slate-900">Assignees</h4>
+                          <p className="text-[9px] text-slate-500">grouped by Block Name</p>
+                        </div>
                         {filters.assignees && filters.assignees !== ALL_VALUE && (
                           <button
                             onClick={() => setFilterValue("assignees", ALL_VALUE)}
@@ -874,31 +1298,43 @@ function FlowsMetadataViewPage() {
                         )}
                       </div>
                       <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
-                        <div className="flex flex-wrap gap-2">
+                        <div className="space-y-2">
                           {(() => {
-                            const seen = new Set<string>();
-                            const rows: string[] = [];
-                            filteredData.forEach(record => {
+                            const grouped = new Map<string, Set<string>>();
+                            filteredData.forEach((record) => {
+                              const blockName = normalizeValue(record.blockName) || "—";
                               const value = normalizeValue(record.assignees);
-                              if (!seen.has(value) && value !== EMPTY_VALUE) {
-                                seen.add(value);
-                                rows.push(value);
+                              if (value === EMPTY_VALUE) return;
+
+                              if (!grouped.has(blockName)) {
+                                grouped.set(blockName, new Set());
                               }
+                              grouped.get(blockName)!.add(value);
                             });
-                            return rows.length === 0 ? (
-                              <p className="text-[10px] text-slate-400">—</p>
-                            ) : (
-                              rows.sort().map((value, idx) => (
-                                <button
-                                  key={`as-${idx}`}
-                                  onClick={() => toggleFieldValue("assignees", value)}
-                                  className="block w-full text-left text-[11px] px-3 py-2 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
-                                  title={value}
-                                >
-                                  {value}
-                                </button>
-                              ))
-                            );
+
+                            if (grouped.size === 0) {
+                              return renderCardEmptyState();
+                            }
+
+                            return Array.from(grouped.entries())
+                              .sort((a, b) => a[0].localeCompare(b[0]))
+                              .map(([blockName, values]) => (
+                                <div key={`as-group-${blockName}`} className="border-l-2 border-slate-200 pl-2">
+                                  <p className="text-[10px] font-semibold text-slate-600 mb-1">{blockName}</p>
+                                  <div className="flex flex-wrap gap-1">
+                                    {Array.from(values).sort().map((value) => (
+                                      <button
+                                        key={`as-${blockName}-${value}`}
+                                        onClick={() => toggleFieldValue("assignees", value)}
+                                        className="block text-left text-[10px] px-2 py-1 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
+                                        title={value}
+                                      >
+                                        {value}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              ));
                           })()}
                         </div>
                       </div>
@@ -906,13 +1342,19 @@ function FlowsMetadataViewPage() {
                   </Card>
 
                   {/* Block Logic Condition */}
-                  <Card className={`border-slate-200 bg-white shadow-sm ${filters.blockLogicCondition && filters.blockLogicCondition !== ALL_VALUE ? "ring-2 ring-blue-200" : ""}`}>
+                  <Card className={`border-slate-200 bg-white shadow-sm ${activeLogicFilterKey?.startsWith("blockLogicCondition::") ? "ring-2 ring-blue-200" : ""}`}>
                     <CardContent className="flex flex-col p-0">
-                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-center justify-between">
-                        <h4 className="text-xs font-semibold text-slate-900">Block Logic Condition</h4>
-                        {filters.blockLogicCondition && filters.blockLogicCondition !== ALL_VALUE && (
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-start justify-between gap-2">
+                        <div>
+                          <h4 className="text-xs font-semibold text-slate-900">Block Logic Condition</h4>
+                          <p className="text-[9px] text-slate-500">grouped by Block Name</p>
+                        </div>
+                        {activeLogicFilterKey?.startsWith("blockLogicCondition::") && (
                           <button
-                            onClick={() => setFilterValue("blockLogicCondition", ALL_VALUE)}
+                            onClick={() => {
+                              setActiveLogicFilterKey(null);
+                              setQuestionIdMultiFilter([]);
+                            }}
                             className="p-0.5 hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors"
                             title="Reset filter"
                           >
@@ -921,36 +1363,128 @@ function FlowsMetadataViewPage() {
                         )}
                       </div>
                       <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
-                        <div className="flex flex-wrap gap-2">
+                        <div className="flex flex-col gap-3">
                           {(() => {
                             const seen = new Set<string>();
-                            const rows: string[] = [];
-                            filteredData.forEach(record => {
-                              const pairs = extractLogicPairs(record.blockLogicCondition);
-                              pairs.forEach(pair => {
-                                if (!seen.has(pair) && pair !== EMPTY_VALUE) {
-                                  seen.add(pair);
-                                  rows.push(pair);
-                                }
-                              });
+                            const grouped = new Map<string, Array<{
+                              expression: string;
+                              questionId: string;
+                              parsed: unknown;
+                              logicJson: string;
+                              logicKey: string;
+                              workflow: string;
+                              details: { pairs: Array<{ question: string; value: string }>; questions: string[]; values: string[] };
+                            }>>();
+                            filteredDataForLogicCards.forEach(record => {
+                              const expression = extractLogicExpression(record.blockLogicCondition);
+                              if (expression === EMPTY_VALUE) return;
+                              const blockName = normalizeValue(record.blockName) || "—";
+                              const questionId = extractQuestionIdFromLogic(record.blockLogicCondition);
+                              const workflow = normalizeValue(record.workflow) || "—";
+                              const logicJson = record.blockLogicCondition ?? "";
+                              const logicKey = `blockLogicCondition::${logicJson}`;
+                              const key = `${workflow}||${blockName}||${expression}||${questionId}`;
+                              if (!seen.has(key)) {
+                                seen.add(key);
+                                let parsed: unknown = null;
+                                try { parsed = JSON.parse(logicJson); } catch { /* ignore */ }
+                                if (!grouped.has(blockName)) grouped.set(blockName, []);
+                                grouped.get(blockName)!.push({
+                                  expression,
+                                  questionId,
+                                  parsed,
+                                  logicJson,
+                                  logicKey,
+                                  workflow,
+                                  details: extractLogicDetails(record.blockLogicCondition),
+                                });
+                              }
                             });
-                            return rows.length === 0 ? (
-                              <p className="text-[10px] text-slate-400">—</p>
-                            ) : (
-                              rows.sort().map((value, idx) => {
-                                const questionId = value.split(" = ")[0];
+                            if (grouped.size === 0) return renderCardEmptyState();
+                            return Array.from(grouped.entries())
+                              .sort((a, b) => a[0].localeCompare(b[0]))
+                              .map(([blockName, rows]) => (
+                                <div key={`blc-group-${blockName}`} className="border-l-2 border-slate-200 pl-2">
+                                  <p className="text-[10px] font-semibold text-slate-600 mb-1.5">{blockName}</p>
+                                  <div className="flex flex-col gap-2">
+                                  {rows.sort((a, b) => a.expression.localeCompare(b.expression)).map((row, idx) => {
+                                const active = activeLogicFilterKey === row.logicKey;
                                 return (
-                                  <button
-                                    key={`blc-${idx}`}
-                                    onClick={() => toggleFieldValue("questionId", questionId)}
-                                    className="block w-full text-left text-[11px] px-3 py-2 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
-                                    title={value}
+                                  <div
+                                    key={`blc-${blockName}-${idx}`}
+                                    role="button"
+                                    tabIndex={0}
+                                    onClick={() => {
+                                      applyLogicCardFilter("blockLogicCondition", row.logicKey, row.parsed, row.questionId, row.workflow);
+                                    }}
+                                    onKeyDown={(event) => {
+                                      if (event.key === "Enter" || event.key === " ") {
+                                        event.preventDefault();
+                                        applyLogicCardFilter("blockLogicCondition", row.logicKey, row.parsed, row.questionId, row.workflow);
+                                      }
+                                    }}
+                                    className={`block w-full rounded border p-2 text-left transition-colors ${active ? "border-indigo-300 bg-indigo-50" : "border-slate-200 bg-slate-50 hover:bg-indigo-50"}`}
+                                    title={row.expression}
                                   >
-                                    {value}
-                                  </button>
+                                    <div className="flex items-start justify-between gap-2">
+                                      <div className="min-w-0 flex-1 space-y-1">
+                                        <div className="flex flex-wrap gap-1">
+                                          {row.details.pairs.length === 0 ? (
+                                            <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">No question/value pairs</span>
+                                          ) : (
+                                            row.details.pairs.slice(0, 4).map((pair) => {
+                                              const title = questionTitleMap.get(pair.question);
+                                              const chip = (
+                                                <span key={`${row.logicJson}-pair-${pair.question}-${pair.value}`} className="rounded bg-indigo-50 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700 cursor-default">
+                                                  {pair.question} {"->"} {pair.value}
+                                                </span>
+                                              );
+                                              if (!title) return chip;
+                                              return (
+                                                <HoverCard key={`${row.logicJson}-pair-${pair.question}-${pair.value}`} openDelay={150} closeDelay={100}>
+                                                  <HoverCardTrigger asChild>{chip}</HoverCardTrigger>
+                                                  <HoverCardContent side="top" align="start" className="w-72 border-slate-200 bg-white p-2.5 text-xs">
+                                                    <p className="font-semibold text-slate-800 mb-0.5">{pair.question}</p>
+                                                    <p className="text-slate-600 leading-snug">{title}</p>
+                                                    <p className="mt-1.5 text-[10px] text-slate-400">Value: <span className="font-medium text-slate-600">{pair.value}</span></p>
+                                                  </HoverCardContent>
+                                                </HoverCard>
+                                              );
+                                            })
+                                          )}
+                                          {row.details.pairs.length > 4 ? (
+                                            <span className="rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700">+{row.details.pairs.length - 4}</span>
+                                          ) : null}
+                                        </div>
+                                      </div>
+                                      <div className="flex shrink-0 items-center gap-1">
+                                        <button
+                                          type="button"
+                                          onClick={(event) => {
+                                            event.stopPropagation();
+                                            setLogicModal({
+                                              title: "Block Logic Condition",
+                                              groupLabel: blockName,
+                                              workflow: row.workflow,
+                                              expression: row.expression,
+                                              rawLogic: row.logicJson,
+                                              parsed: row.parsed,
+                                              details: row.details,
+                                            });
+                                          }}
+                                          className="rounded border border-slate-200 bg-white p-1 text-slate-600 hover:bg-slate-100"
+                                          title="Open enlarged view"
+                                        >
+                                          <ZoomIn className="h-3 w-3" />
+                                        </button>
+                                      </div>
+                                    </div>
+                                  </div>
                                 );
-                              })
-                            );
+                              })}
+                                  </div>
+                                </div>
+                              ));
                           })()}
                         </div>
                       </div>
@@ -997,7 +1531,7 @@ function FlowsMetadataViewPage() {
                             });
 
                             if (grouped.size === 0) {
-                              return <p className="text-[10px] text-slate-400">—</p>;
+                              return renderCardEmptyState();
                             }
 
                             return Array.from(grouped.entries())
@@ -1059,7 +1593,7 @@ function FlowsMetadataViewPage() {
                             });
 
                             if (grouped.size === 0) {
-                              return <p className="text-[10px] text-slate-400">—</p>;
+                              return renderCardEmptyState();
                             }
 
                             return Array.from(grouped.entries())
@@ -1121,7 +1655,7 @@ function FlowsMetadataViewPage() {
                               }
                             });
                             return rows.length === 0 ? (
-                              <p className="text-[10px] text-slate-400">—</p>
+                              renderCardEmptyState()
                             ) : (
                               rows.sort().map((value, idx) => (
                                 <button
@@ -1174,7 +1708,7 @@ function FlowsMetadataViewPage() {
                             });
 
                             if (grouped.size === 0) {
-                              return <p className="text-[10px] text-slate-400">—</p>;
+                              return renderCardEmptyState();
                             }
 
                             return Array.from(grouped.entries())
@@ -1236,7 +1770,7 @@ function FlowsMetadataViewPage() {
                             });
 
                             if (grouped.size === 0) {
-                              return <p className="text-[10px] text-slate-400">—</p>;
+                              return renderCardEmptyState();
                             }
 
                             return Array.from(grouped.entries())
@@ -1298,7 +1832,7 @@ function FlowsMetadataViewPage() {
                             });
 
                             if (grouped.size === 0) {
-                              return <p className="text-[10px] text-slate-400">—</p>;
+                              return renderCardEmptyState();
                             }
 
                             return Array.from(grouped.entries())
@@ -1327,13 +1861,19 @@ function FlowsMetadataViewPage() {
                   </Card>
 
                   {/* Question Logic Condition */}
-                  <Card className={`border-slate-200 bg-white shadow-sm ${filters.questionLogicCondition && filters.questionLogicCondition !== ALL_VALUE ? "ring-2 ring-blue-200" : ""}`}>
+                  <Card className={`border-slate-200 bg-white shadow-sm ${activeLogicFilterKey?.startsWith("questionLogicCondition::") ? "ring-2 ring-blue-200" : ""}`}>
                     <CardContent className="flex flex-col p-0">
-                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-center justify-between">
-                        <h4 className="text-xs font-semibold text-slate-900">Question Logic Condition</h4>
-                        {filters.questionLogicCondition && filters.questionLogicCondition !== ALL_VALUE && (
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-start justify-between gap-2">
+                        <div>
+                          <h4 className="text-xs font-semibold text-slate-900">Question Logic Condition</h4>
+                          <p className="text-[9px] text-slate-500">grouped by Form Name</p>
+                        </div>
+                        {activeLogicFilterKey?.startsWith("questionLogicCondition::") && (
                           <button
-                            onClick={() => setFilterValue("questionLogicCondition", ALL_VALUE)}
+                            onClick={() => {
+                              setActiveLogicFilterKey(null);
+                              setQuestionIdMultiFilter([]);
+                            }}
                             className="p-0.5 hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors"
                             title="Reset filter"
                           >
@@ -1342,36 +1882,128 @@ function FlowsMetadataViewPage() {
                         )}
                       </div>
                       <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
-                        <div className="flex flex-wrap gap-2">
+                        <div className="flex flex-col gap-3">
                           {(() => {
                             const seen = new Set<string>();
-                            const rows: string[] = [];
-                            filteredData.forEach(record => {
-                              const pairs = extractLogicPairs(record.questionLogicCondition);
-                              pairs.forEach(pair => {
-                                if (!seen.has(pair) && pair !== EMPTY_VALUE) {
-                                  seen.add(pair);
-                                  rows.push(pair);
-                                }
-                              });
+                            const grouped = new Map<string, Array<{
+                              expression: string;
+                              questionId: string;
+                              parsed: unknown;
+                              logicJson: string;
+                              logicKey: string;
+                              workflow: string;
+                              details: { pairs: Array<{ question: string; value: string }>; questions: string[]; values: string[] };
+                            }>>();
+                            filteredDataForLogicCards.forEach(record => {
+                              const expression = extractLogicExpression(record.questionLogicCondition);
+                              if (expression === EMPTY_VALUE) return;
+                              const formName = normalizeValue(record.formName) || "—";
+                              const questionId = extractQuestionIdFromLogic(record.questionLogicCondition);
+                              const workflow = normalizeValue(record.workflow) || "—";
+                              const logicJson = record.questionLogicCondition ?? "";
+                              const logicKey = `questionLogicCondition::${logicJson}`;
+                              const key = `${workflow}||${formName}||${expression}||${questionId}`;
+                              if (!seen.has(key)) {
+                                seen.add(key);
+                                let parsed: unknown = null;
+                                try { parsed = JSON.parse(logicJson); } catch { /* ignore */ }
+                                if (!grouped.has(formName)) grouped.set(formName, []);
+                                grouped.get(formName)!.push({
+                                  expression,
+                                  questionId,
+                                  parsed,
+                                  logicJson,
+                                  logicKey,
+                                  workflow,
+                                  details: extractLogicDetails(record.questionLogicCondition),
+                                });
+                              }
                             });
-                            return rows.length === 0 ? (
-                              <p className="text-[10px] text-slate-400">—</p>
-                            ) : (
-                              rows.sort().map((value, idx) => {
-                                const questionId = value.split(" = ")[0];
-                                return (
-                                  <button
-                                    key={`qlc-${idx}`}
-                                    onClick={() => toggleFieldValue("questionId", questionId)}
-                                    className="block w-full text-left text-[11px] px-3 py-2 hover:bg-blue-100 text-slate-700 hover:text-blue-700 transition-colors whitespace-normal border border-slate-200 bg-slate-50"
-                                    title={value}
+                            if (grouped.size === 0) return renderCardEmptyState();
+                            return Array.from(grouped.entries())
+                              .sort((a, b) => a[0].localeCompare(b[0]))
+                              .map(([formName, rows]) => (
+                                <div key={`qlc-group-${formName}`} className="border-l-2 border-slate-200 pl-2">
+                                  <p className="text-[10px] font-semibold text-slate-600 mb-1.5">{formName}</p>
+                                  <div className="flex flex-col gap-2">
+                                    {rows.sort((a, b) => a.expression.localeCompare(b.expression)).map((row, idx) => {
+                                      const active = activeLogicFilterKey === row.logicKey;
+                                      return (
+                                        <div
+                                          key={`qlc-${formName}-${idx}`}
+                                    role="button"
+                                    tabIndex={0}
+                                    onClick={() => {
+                                      applyLogicCardFilter("questionLogicCondition", row.logicKey, row.parsed, row.questionId, row.workflow);
+                                    }}
+                                    onKeyDown={(event) => {
+                                      if (event.key === "Enter" || event.key === " ") {
+                                        event.preventDefault();
+                                        applyLogicCardFilter("questionLogicCondition", row.logicKey, row.parsed, row.questionId, row.workflow);
+                                      }
+                                    }}
+                                    className={`block w-full rounded border p-2 text-left transition-colors ${active ? "border-indigo-300 bg-indigo-50" : "border-slate-200 bg-slate-50 hover:bg-indigo-50"}`}
+                                    title={row.expression}
                                   >
-                                    {value}
-                                  </button>
+                                    <div className="flex items-start justify-between gap-2">
+                                      <div className="min-w-0 flex-1 space-y-1">
+                                        <div className="flex flex-wrap gap-1">
+                                          {row.details.pairs.length === 0 ? (
+                                            <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">No question/value pairs</span>
+                                          ) : (
+                                            row.details.pairs.slice(0, 4).map((pair) => {
+                                              const title = questionTitleMap.get(pair.question);
+                                              const chip = (
+                                                <span key={`${row.logicJson}-pair-${pair.question}-${pair.value}`} className="rounded bg-indigo-50 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700 cursor-default">
+                                                  {pair.question} {"->"} {pair.value}
+                                                </span>
+                                              );
+                                              if (!title) return chip;
+                                              return (
+                                                <HoverCard key={`${row.logicJson}-pair-${pair.question}-${pair.value}`} openDelay={150} closeDelay={100}>
+                                                  <HoverCardTrigger asChild>{chip}</HoverCardTrigger>
+                                                  <HoverCardContent side="top" align="start" className="w-72 border-slate-200 bg-white p-2.5 text-xs">
+                                                    <p className="font-semibold text-slate-800 mb-0.5">{pair.question}</p>
+                                                    <p className="text-slate-600 leading-snug">{title}</p>
+                                                    <p className="mt-1.5 text-[10px] text-slate-400">Value: <span className="font-medium text-slate-600">{pair.value}</span></p>
+                                                  </HoverCardContent>
+                                                </HoverCard>
+                                              );
+                                            })
+                                          )}
+                                          {row.details.pairs.length > 4 ? (
+                                            <span className="rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700">+{row.details.pairs.length - 4}</span>
+                                          ) : null}
+                                        </div>
+                                      </div>
+                                      <div className="flex shrink-0 items-center gap-1">
+                                        <button
+                                          type="button"
+                                          onClick={(event) => {
+                                            event.stopPropagation();
+                                            setLogicModal({
+                                              title: "Question Logic Condition",
+                                              groupLabel: formName,
+                                              workflow: row.workflow,
+                                              expression: row.expression,
+                                              rawLogic: row.logicJson,
+                                              parsed: row.parsed,
+                                              details: row.details,
+                                            });
+                                          }}
+                                          className="rounded border border-slate-200 bg-white p-1 text-slate-600 hover:bg-slate-100"
+                                          title="Open enlarged view"
+                                        >
+                                          <ZoomIn className="h-3 w-3" />
+                                        </button>
+                                      </div>
+                                    </div>
+                                  </div>
                                 );
-                              })
-                            );
+                                    })}
+                                  </div>
+                                </div>
+                              ));
                           })()}
                         </div>
                       </div>
@@ -1418,7 +2050,7 @@ function FlowsMetadataViewPage() {
                             });
 
                             if (grouped.size === 0) {
-                              return <p className="text-[10px] text-slate-400">—</p>;
+                              return renderCardEmptyState();
                             }
 
                             return Array.from(grouped.entries())
@@ -1442,6 +2074,110 @@ function FlowsMetadataViewPage() {
                               ));
                           })()}
                         </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                  {/* Tags */}
+                  <Card className="border-slate-200 bg-white shadow-sm md:col-span-4">
+                    <CardContent className="flex flex-col p-0">
+                      <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-start justify-between gap-2">
+                        <div>
+                          <h4 className="text-xs font-semibold text-slate-900">Tags</h4>
+                          <p className="text-[9px] text-slate-500">Same structure as Configuration TAGS column</p>
+                        </div>
+                      </div>
+
+                      <div className="overflow-auto p-3" style={{ maxHeight: "300px" }}>
+                        {tagGroupsForCard.length === 0 ? (
+                          renderCardEmptyState()
+                        ) : (
+                          <div className="space-y-2">
+                            {tagGroupsForCard
+                              .flatMap((workflowGroup) =>
+                                workflowGroup.blocks.map((blockGroup) => ({
+                                  workflow: workflowGroup.workflow,
+                                  block: blockGroup.block,
+                                  forms: blockGroup.forms,
+                                })),
+                              )
+                              .sort((left, right) => left.block.localeCompare(right.block))
+                              .map((blockGroup) => (
+                                <div key={`view-tags-block-${blockGroup.workflow}-${blockGroup.block}`} className="rounded-md border border-slate-200 bg-slate-50/60 p-2">
+                                  <Badge className="rounded-md bg-slate-100 px-2 text-[10px] font-medium text-slate-700" variant="secondary">
+                                    {blockGroup.block}
+                                  </Badge>
+                                  <div className="mt-1.5 space-y-1.5">
+                                    {blockGroup.forms.map((formGroup) => (
+                                      <div key={`view-tags-form-${blockGroup.workflow}-${blockGroup.block}-${formGroup.form}`} className="rounded border border-indigo-100 bg-white px-2 py-1.5">
+                                        <div className="mb-1">
+                                          <Badge className="rounded-md bg-indigo-50 px-2 text-[10px] font-medium text-indigo-700" variant="secondary">
+                                            {formGroup.form}
+                                          </Badge>
+                                        </div>
+                                        <div className="flex flex-wrap gap-1">
+                                          {formGroup.tags.map((tagEntry) => {
+                                            const active = activeTagFilterKey === tagEntry.tagKey;
+                                            return (
+                                              <HoverCard closeDelay={120} key={`view-tag-chip-${blockGroup.block}-${formGroup.form}-${tagEntry.tagKey}`} openDelay={140}>
+                                                <HoverCardTrigger asChild>
+                                                  <button
+                                                    type="button"
+                                                    onClick={() => toggleTagCardFilter(tagEntry.tagKey, blockGroup.workflow, tagEntry.references)}
+                                                    className={`rounded-md border px-2 py-0.5 text-[10px] font-medium ${active ? "border-violet-700 bg-violet-700 text-white" : "border-violet-200 bg-violet-50 text-violet-700 hover:bg-violet-100"}`}
+                                                  >
+                                                    {tagEntry.tagName}
+                                                  </button>
+                                                </HoverCardTrigger>
+                                                <HoverCardContent align="start" className="w-[480px] border-slate-200 bg-white p-3" side="top" sideOffset={8}>
+                                                  <div className="space-y-2 text-[11px]">
+                                                    <div className="font-semibold text-slate-800">{tagEntry.tagName}</div>
+                                                    <div className="text-[10px] uppercase tracking-wide text-slate-500">Tag references</div>
+                                                    <div className="max-h-48 overflow-y-auto rounded border border-slate-200">
+                                                      <table className="w-full border-collapse text-[10px]">
+                                                        <thead className="bg-slate-50 text-slate-500 sticky top-0">
+                                                          <tr>
+                                                            <th className="border-b border-slate-200 px-2 py-1 text-left">Question ID</th>
+                                                            <th className="border-b border-slate-200 px-2 py-1 text-left">Question</th>
+                                                            <th className="border-b border-slate-200 px-2 py-1 text-left">Op</th>
+                                                            <th className="border-b border-slate-200 px-2 py-1 text-left">Value</th>
+                                                          </tr>
+                                                        </thead>
+                                                        <tbody>
+                                                          {tagEntry.references.map((reference, referenceIndex) => (
+                                                            <Fragment key={`view-tag-ref-${blockGroup.block}-${formGroup.form}-${tagEntry.tagKey}-${reference.questionId}-${referenceIndex}`}>
+                                                              {reference.connector && (
+                                                                <tr>
+                                                                  <td colSpan={4} className="px-2 py-0.5 bg-slate-50">
+                                                                    <span className={`inline-block text-[9px] font-bold px-1.5 py-0.5 rounded ${reference.connector === "AND" ? "bg-indigo-100 text-indigo-700" : "bg-orange-100 text-orange-700"}`}>
+                                                                      {reference.connector}
+                                                                    </span>
+                                                                  </td>
+                                                                </tr>
+                                                              )}
+                                                              <tr>
+                                                                <td className="border-b border-slate-100 px-2 py-1 align-top font-medium text-slate-800">{reference.questionId}</td>
+                                                                <td className="border-b border-slate-100 px-2 py-1 align-top text-slate-700">{reference.questionTitle || reference.questionId}</td>
+                                                                <td className="border-b border-slate-100 px-2 py-1 align-top text-slate-500 whitespace-nowrap">{reference.operator || "-"}</td>
+                                                                <td className="border-b border-slate-100 px-2 py-1 align-top text-slate-700">{reference.value}</td>
+                                                              </tr>
+                                                            </Fragment>
+                                                          ))}
+                                                        </tbody>
+                                                      </table>
+                                                    </div>
+                                                  </div>
+                                                </HoverCardContent>
+                                              </HoverCard>
+                                            );
+                                          })}
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              ))}
+                          </div>
+                        )}
                       </div>
                     </CardContent>
                   </Card>
@@ -1523,6 +2259,184 @@ function FlowsMetadataViewPage() {
             </div>
           </CardContent>
         </Card>
+
+        <Dialog open={Boolean(logicModal)} onOpenChange={(open) => !open && setLogicModal(null)}>
+          <DialogContent className="max-w-4xl border-slate-200 bg-white">
+            {logicModal ? (
+              <>
+                <DialogHeader>
+                  <DialogTitle className="text-base text-slate-900">{logicModal.title}</DialogTitle>
+                  <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-slate-600">
+                    <Badge className="rounded-md bg-slate-100 px-2 text-[10px] font-medium text-slate-700" variant="secondary">
+                      {logicModal.groupLabel}
+                    </Badge>
+                    <span>Workflow: {logicModal.workflow}</span>
+                  </div>
+                </DialogHeader>
+
+                {logicModal.title === "Question Logic Condition" ? (
+                  <Tabs defaultValue="tree" className="mt-2">
+                    <TabsList className="h-7 text-xs">
+                      <TabsTrigger value="tree" className="px-3 text-xs">Logic tree</TabsTrigger>
+                      <TabsTrigger value="table" className="px-3 text-xs">Table</TabsTrigger>
+                    </TabsList>
+
+                    <TabsContent value="tree" className="mt-2">
+                      {logicModal.parsed ? (
+                        <div className="max-h-72 overflow-auto rounded border border-slate-200 bg-white p-2">
+                          <LogicNodeTree node={logicModal.parsed} questionDescriptions={questionDescriptionMap} />
+                        </div>
+                      ) : (
+                        <div className="rounded border border-slate-200 bg-slate-50 p-3 text-[11px] text-slate-500">No logic tree available.</div>
+                      )}
+                    </TabsContent>
+
+                    <TabsContent value="table" className="mt-2">
+                      {(() => {
+                        const refs = extractTagConditionReferences(logicModal.rawLogic);
+                        if (refs.length === 0) {
+                          return <div className="rounded border border-slate-200 bg-slate-50 p-3 text-[11px] text-slate-500">No conditions found.</div>;
+                        }
+                        return (
+                          <div className="max-h-72 overflow-y-auto rounded border border-slate-200">
+                            <table className="w-full border-collapse text-[10px]">
+                              <thead className="sticky top-0 bg-slate-50 text-slate-500">
+                                <tr>
+                                  <th className="border-b border-slate-200 px-2 py-1 text-left">Question ID</th>
+                                  <th className="border-b border-slate-200 px-2 py-1 text-left">Question</th>
+                                  <th className="border-b border-slate-200 px-2 py-1 text-left">Op</th>
+                                  <th className="border-b border-slate-200 px-2 py-1 text-left">Value</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {refs.map((ref, idx) => (
+                                  <Fragment key={`modal-q-${ref.questionId}-${idx}`}>
+                                    {ref.connector && (
+                                      <tr>
+                                        <td colSpan={4} className="px-2 py-0.5 bg-slate-50">
+                                          <span className={`inline-block text-[9px] font-bold px-1.5 py-0.5 rounded ${ref.connector === "AND" ? "bg-indigo-100 text-indigo-700" : "bg-orange-100 text-orange-700"}`}>
+                                            {ref.connector}
+                                          </span>
+                                        </td>
+                                      </tr>
+                                    )}
+                                    <tr className="hover:bg-slate-50">
+                                      <td className="border-b border-slate-100 px-2 py-1 align-top font-medium text-slate-800">{ref.questionId}</td>
+                                      <td className="border-b border-slate-100 px-2 py-1 align-top text-slate-700">{questionTitleMap.get(ref.questionId) || ref.questionId}</td>
+                                      <td className="border-b border-slate-100 px-2 py-1 align-top text-slate-500">{ref.operator || "-"}</td>
+                                      <td className="border-b border-slate-100 px-2 py-1 align-top text-slate-700">{ref.value}</td>
+                                    </tr>
+                                  </Fragment>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        );
+                      })()}
+                    </TabsContent>
+                  </Tabs>
+                ) : (
+                  <Tabs defaultValue="tree" className="mt-2">
+                    <TabsList className="h-7 text-xs">
+                      <TabsTrigger value="tree" className="px-3 text-xs">Logic tree</TabsTrigger>
+                      <TabsTrigger value="table" className="px-3 text-xs">Table</TabsTrigger>
+                    </TabsList>
+
+                    <TabsContent value="tree" className="mt-2">
+                      {logicModal.parsed ? (
+                        <div className="max-h-72 overflow-auto rounded border border-slate-200 bg-white p-2">
+                          <LogicNodeTree node={logicModal.parsed} questionDescriptions={questionDescriptionMap} />
+                        </div>
+                      ) : (
+                        <div className="rounded border border-slate-200 bg-slate-50 p-3 text-[11px] text-slate-500">No logic tree available.</div>
+                      )}
+                    </TabsContent>
+
+                    <TabsContent value="table" className="mt-2">
+                      {(() => {
+                        if (!logicModal.parsed) {
+                          return <div className="rounded border border-slate-200 bg-slate-50 p-3 text-[11px] text-slate-500">No conditions found.</div>;
+                        }
+
+                        const cols = "grid grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)_minmax(0,0.6fr)_minmax(0,1fr)] gap-x-3";
+
+                        const renderLeaf = (n: Record<string, unknown>, key: string) => {
+                          const pf = n.primaryField as Record<string, unknown> | undefined;
+                          const sf = n.secondaryField as Record<string, unknown> | undefined;
+                          const qId = (pf?.questionId as string) || (pf?.value as string) || "-";
+                          const op = (n.operator as string) || "-";
+                          const val = String(sf?.value ?? "-");
+                          return (
+                            <div key={key} className={`${cols} px-2 py-1 text-[10px] rounded hover:bg-white/70`}>
+                              <span className="font-medium text-slate-800 truncate" title={qId}>{qId}</span>
+                              <span className="text-slate-600 truncate" title={questionTitleMap.get(qId) || qId}>{questionTitleMap.get(qId) || qId}</span>
+                              <span className="text-slate-500">{op}</span>
+                              <span className="text-slate-700 truncate" title={val}>{val}</span>
+                            </div>
+                          );
+                        };
+
+                        const connectorBadge = (type: string) => (
+                          <div className="px-2 py-0.5">
+                            <span className={`inline-block text-[9px] font-bold px-1.5 py-0.5 rounded ${type === "AND" ? "bg-indigo-100 text-indigo-700" : "bg-orange-100 text-orange-700"}`}>
+                              {type}
+                            </span>
+                          </div>
+                        );
+
+                        const renderNode = (node: unknown, depth: number, key: string): ReactNode => {
+                          if (!node || typeof node !== "object") return null;
+                          const n = node as Record<string, unknown>;
+                          if (n.type && Array.isArray(n.items)) {
+                            const groupType = (n.type as string).toUpperCase();
+                            const items = n.items as unknown[];
+                            if (depth === 0) {
+                              return (
+                                <div key={key}>
+                                  {items.map((item, idx) => (
+                                    <div key={`${key}-${idx}`}>
+                                      {idx > 0 && connectorBadge(groupType)}
+                                      {renderNode(item, depth + 1, `${key}-${idx}`)}
+                                    </div>
+                                  ))}
+                                </div>
+                              );
+                            }
+                            return (
+                              <div key={key} className="my-0.5 rounded border border-slate-200 bg-slate-50 p-1">
+                                {items.map((item, idx) => (
+                                  <div key={`${key}-${idx}`}>
+                                    {idx > 0 && connectorBadge(groupType)}
+                                    {renderNode(item, depth + 1, `${key}-${idx}`)}
+                                  </div>
+                                ))}
+                              </div>
+                            );
+                          }
+                          return renderLeaf(n, key);
+                        };
+
+                        return (
+                          <div className="max-h-72 overflow-y-auto rounded border border-slate-200">
+                            <div className={`sticky top-0 z-10 ${cols} border-b border-slate-200 bg-slate-50 px-2 py-1 text-[10px] font-medium text-slate-500`}>
+                              <span>Question ID</span>
+                              <span>Question</span>
+                              <span>Op</span>
+                              <span>Value</span>
+                            </div>
+                            <div className="p-1">
+                              {renderNode(logicModal.parsed, 0, "root")}
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </TabsContent>
+                  </Tabs>
+                )}
+              </>
+            ) : null}
+          </DialogContent>
+        </Dialog>
       </div>
     </div>
   );
@@ -1918,6 +2832,169 @@ function firstNonEmpty(values: Array<string | null | undefined>): string | null 
     }
   }
   return null;
+}
+
+function extractAllQuestionIds(node: unknown, bucket: string[] = []): string[] {
+  if (!node || typeof node !== "object") return bucket;
+  const obj = node as Record<string, unknown>;
+
+  const primary = asObject(obj.primaryField);
+  if (primary) {
+    const id = firstNonEmpty([toDisplay(primary.value), toDisplay(primary.questionId)]);
+    if (id && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+      bucket.push(id);
+    }
+  }
+
+  const childArrays = [obj.items, obj.comparisons].filter(Array.isArray);
+  for (const arr of childArrays as unknown[][]) {
+    for (const child of arr) extractAllQuestionIds(child, bucket);
+  }
+  return bucket;
+}
+
+function LogicNodeTree({
+  node,
+  depth = 0,
+  questionDescriptions,
+}: {
+  node: unknown;
+  depth?: number;
+  questionDescriptions?: Map<string, string>;
+}): JSX.Element | null {
+  if (!node || typeof node !== "object") return null;
+  const obj = node as Record<string, unknown>;
+
+  const children: unknown[] = [];
+  if (Array.isArray(obj.items)) children.push(...obj.items);
+  if (Array.isArray(obj.comparisons)) children.push(...obj.comparisons);
+
+  const type = typeof obj.type === "string" ? obj.type.toUpperCase() : "";
+  const operator = typeof obj.operator === "string" ? obj.operator.toUpperCase() : "EQUAL";
+  const primary = asObject(obj.primaryField);
+  const secondary = asObject(obj.secondaryField);
+
+  // Leaf node
+  if (type === "SINGLE" || (children.length === 0 && (primary || secondary))) {
+    const source = firstNonEmpty([
+      toDisplay(primary?.value),
+      toDisplay(primary?.questionId),
+      toDisplay(primary?.source),
+    ]) || "—";
+    const expected = firstNonEmpty([
+      toDisplay(secondary?.value),
+      toDisplay(secondary?.id),
+      toDisplay(secondary?.source),
+      toDisplay(obj.value),
+    ]) || "—";
+    const operatorLabel = operator === "NOT_EQUAL" ? "≠" : "=";
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(source);
+    const questionDescription = !isUuid ? questionDescriptions?.get(source) : undefined;
+    const sourceChip = (
+      <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${isUuid ? "bg-slate-100 font-mono text-slate-500" : "bg-indigo-50 text-indigo-800"}`}>
+        {isUuid ? `${source.slice(0, 8)}…` : source}
+      </span>
+    );
+
+    return (
+      <div className="flex flex-wrap items-center gap-1 rounded border border-slate-200 bg-white px-2 py-1">
+        {questionDescription ? (
+          <HoverCard closeDelay={100} openDelay={150}>
+            <HoverCardTrigger asChild>
+              <span className="cursor-help">{sourceChip}</span>
+            </HoverCardTrigger>
+            <HoverCardContent align="start" className="w-80 border-slate-200 bg-white p-2.5 text-xs" side="top" sideOffset={6}>
+              <p className="font-semibold text-slate-800 mb-0.5">{source}</p>
+              <p className="text-slate-600 leading-snug">{questionDescription}</p>
+            </HoverCardContent>
+          </HoverCard>
+        ) : sourceChip}
+        <span className="text-[10px] font-bold text-slate-400">{operatorLabel}</span>
+        <span className="rounded bg-orange-50 px-1.5 py-0.5 text-[10px] font-medium text-orange-700">{expected}</span>
+      </div>
+    );
+  }
+
+  // Root container with only comparisons but no type field
+  if (!type && children.length > 0) {
+    return (
+      <div className="flex flex-col gap-1">
+        {children.map((child, idx) => (
+          <LogicNodeTree key={idx} node={child} depth={depth + 1} questionDescriptions={questionDescriptions} />
+        ))}
+      </div>
+    );
+  }
+
+  // Group node (AND / OR)
+  const isAnd = type !== "OR";
+  const lineColor = isAnd ? "border-indigo-400" : "border-orange-400";
+  const badgeClass = isAnd
+    ? "bg-indigo-100 text-indigo-700 border border-indigo-200"
+    : "bg-orange-100 text-orange-700 border border-orange-200";
+
+  return (
+    <div className="flex flex-col gap-1">
+      <span className={`inline-flex w-fit items-center rounded-full px-2 py-0.5 text-[10px] font-bold ${badgeClass}`}>
+        {type}
+      </span>
+      <div className={`ml-3 flex flex-col gap-1 border-l-2 pl-2 ${lineColor}`}>
+        {children.map((child, idx) => (
+          <LogicNodeTree key={idx} node={child} depth={depth + 1} questionDescriptions={questionDescriptions} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function formatLogicExpression(node: unknown): string {
+  if (!node || typeof node !== "object") {
+    return "";
+  }
+
+  const obj = node as Record<string, unknown>;
+  const childNodes: unknown[] = [];
+  if (Array.isArray(obj.items)) childNodes.push(...obj.items);
+  if (Array.isArray(obj.comparisons)) childNodes.push(...obj.comparisons);
+
+  const childExpressions = childNodes
+    .map((child) => formatLogicExpression(child))
+    .filter((expression) => Boolean(expression));
+
+  const primary = asObject(obj.primaryField);
+  const secondary = asObject(obj.secondaryField);
+  const source = firstNonEmpty([
+    toDisplay(primary?.value),
+    toDisplay(primary?.questionId),
+    toDisplay(primary?.source),
+  ]);
+  const expected = firstNonEmpty([
+    toDisplay(secondary?.value),
+    toDisplay(secondary?.id),
+    toDisplay(secondary?.source),
+    toDisplay(obj.value),
+  ]);
+  const rawOperator = firstNonEmpty([toDisplay(obj.operator), toDisplay(obj.type)]);
+
+  const selfExpression = source && expected
+    ? `${source} ${formatOperator(rawOperator ?? "EQUAL")} ${expected}`
+    : "";
+
+  if (childExpressions.length === 0) {
+    return selfExpression;
+  }
+
+  const normalizedType = toDisplay(obj.type).toUpperCase();
+  const joiner = normalizedType === "OR" ? " OR " : " AND ";
+  const groupedChildren = childExpressions.length === 1
+    ? childExpressions[0]
+    : `(${childExpressions.join(joiner)})`;
+
+  if (selfExpression) {
+    return `(${selfExpression} AND ${groupedChildren})`;
+  }
+
+  return groupedChildren;
 }
 
 function buildCopyOutput(records: FlowMetadata[]): string {
