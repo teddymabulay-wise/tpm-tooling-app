@@ -2,7 +2,6 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react-swc";
 import path from "path";
 import fs from "node:fs/promises";
-import { componentTagger } from "lovable-tagger";
 
 const ALLOWED_CSV_FILES = new Set([
   "Omnea Flow Meta Data.csv",
@@ -54,7 +53,7 @@ function localCsvSavePlugin() {
 }
 
 // https://vitejs.dev/config/
-export default defineConfig(({ mode }) => ({
+export default defineConfig(() => ({
   server: {
     host: "::",
     port: 8080,
@@ -69,7 +68,7 @@ export default defineConfig(({ mode }) => ({
       },
     },
   },
-  plugins: [react(), localCsvSavePlugin(), mode === "development" && componentTagger()].filter(Boolean),
+  plugins: [react(), localCsvSavePlugin()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

@@ -334,7 +334,7 @@ All routes are defined in `src/App.tsx`. All authenticated routes are nested und
 - **Endpoint browser:** `lib/api-contract-data.ts` defines ~50 endpoints across 10 collections (Authentication, Suppliers, Supplier Maintenance, Supplier Profile, Bank Account, Subsidiaries, Currencies, Departments, Custom Data, Request). Each entry defines the method, path, path parameters, query parameters, and request body schema.
 - **Live execution:** Calls `makeOmneaRequest()` with the selected env credentials. Response shown as JSON or auto-detected table.
 - **CSV Supplier Lookup:** Upload a CSV of supplier names; the tool fetches all Omnea suppliers and fuzzy-matches each CSV row against the full supplier list. Results are split into three groups: 100% match, partial match (≥72%), not found. If a supplier is not found in Omnea, the tool cross-references against an optional "ongoing requests" CSV. See §13.1 for the matching algorithm.
-- **Request Form Viewer:** Enter a request UUID; the tool fetches `https://api-prod.omnea.co/requests/request-forms/:id` (an unauthenticated endpoint — see security note in §15.6) and renders all form steps and answers.
+- **Request Form Viewer:** Enter a request UUID; the tool fetches `/requests/request-forms/:id` via `makeOmneaRequest` (authenticated, always hits production environment) and renders all form steps and answers.
 
 ---
 
@@ -980,10 +980,7 @@ A complementary server-side guard will be added in Workato (Sprint 4) to reject 
 
 **Risk:** If this endpoint returns sensitive request data without authentication (personal details, supplier information, financial data), it represents an information disclosure risk. The call also bypasses the environment switch — it always hits production regardless of the active environment.
 
-**Required remediation:**
-- Understand whether `requests/request-forms/:id` requires authentication (the team should verify this)
-- If it returns sensitive data, add authentication
-- If it must remain unauthenticated, document the business justification
+**Status (2026-04-26): Resolved in frontend.** The raw `fetch` call has been replaced with `makeOmneaRequest("/requests/request-forms/:id", { authEnvironment: "production" })`. Locally this routes through the Vite proxy with Omnea OAuth2 credentials. In production it routes through the Workato proxy once `VITE_USE_WORKATO_PROXY=true` is set in CI/CD.
 
 ---
 
@@ -1016,7 +1013,7 @@ A complementary server-side guard will be added in Workato (Sprint 4) to reject 
 
 **What:** `lovable-tagger` is a component-tagging library added by the Lovable.dev code generation tool. In production builds it is a no-op.
 
-**Required action:** Audit the `lovable-tagger` package for any telemetry or data exfiltration. If the package pings a Lovable.dev endpoint in development, consider removing it.
+**Status (2026-04-26): Resolved.** `lovable-tagger` has been removed — `npm uninstall lovable-tagger`, import removed from `vite.config.ts`, and `componentTagger()` removed from the plugins array.
 
 ---
 
@@ -1059,7 +1056,7 @@ Content-Security-Policy:
 | **No error boundary** | Unhandled errors crash the whole page | **`PageErrorBoundary` wrapping all routes** (Sprint 7 ✅) | Resolved |
 | **Hardcoded concurrency** | 80/60 concurrent requests tuned empirically | No change | May hit Omnea rate limits with large datasets |
 | **No pagination in UI** | Some pages load all records into memory | No change | Memory pressure with very large datasets |
-| **`api-prod.omnea.co` hardcode** | Request Form Viewer always hits production | Fix implemented in Workato recipe design (Sprint 2 — awaiting recipe deployment) | Bypasses environment toggle (§15.6) |
+| **`api-prod.omnea.co` hardcode** | Request Form Viewer always hits production | **Replaced with `makeOmneaRequest` (2026-04-26 ✅)** — authenticated locally; routes through Workato proxy once deployed | Resolved at frontend level (§15.6) |
 | **QA Cleanup safety** | Bulk deletes reachable from Production | **Hard block + typed confirmation + toggle hidden** (Sprint 5 ✅) | Resolved at frontend level |
 
 ---
@@ -1078,9 +1075,9 @@ Before the application can be approved for hosting on Wise infrastructure, the f
 
 ### Pre-Deployment
 
-- [ ] **Route `api-prod.omnea.co` call through Workato** — `OmneaAPIPage.tsx` still calls the endpoint directly; fix is designed in `WORKATO_MIGRATION_PLAN.md` Sprint 2 (§15.6).
+- [x] ~~**Route `api-prod.omnea.co` call through Workato**~~ — **Done.** `OmneaAPIPage.tsx` now uses `makeOmneaRequest` with auth; will route through Workato once `VITE_USE_WORKATO_PROXY=true` (§15.6).
 - [x] ~~**Lock QA Cleanup to QA environment**~~ — **Done.** Hard production block, typed `DELETE` confirmation, and env toggle hidden on `/tools/qa-cleanup` (§15.5).
-- [ ] **Audit `lovable-tagger`** for any external telemetry; remove if not needed.
+- [x] ~~**Audit `lovable-tagger`**~~ — **Done.** Package removed entirely (§15.9).
 - [x] ~~**Add a `.gitignore` entry for `.env`**~~ — **Already present** in `.gitignore`.
 - [ ] **Add a Content Security Policy header** to the web server or CDN configuration (§15.10).
 

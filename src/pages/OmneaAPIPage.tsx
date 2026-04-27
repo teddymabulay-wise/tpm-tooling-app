@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { omneaEndpoints, APIEndpoint } from "../lib/api-contract-data";
+import { makeOmneaRequest } from "@/lib/omnea-api-utils";
 import { Plug, Loader } from "lucide-react";
 import { ChevronRight } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "../components/ui/tabs";
@@ -63,16 +64,16 @@ const OmneaAPIPage = () => {
     setRequestData(null);
 
     try {
-      const response = await fetch(
-        `https://api-prod.omnea.co/requests/request-forms/${requestId}`
+      const result = await makeOmneaRequest<unknown>(
+        `/requests/request-forms/${requestId}`,
+        { method: "GET", authEnvironment: "production" }
       );
 
-      if (!response.ok) {
-        throw new Error(`API returned ${response.status}: ${response.statusText}`);
+      if (result.error) {
+        throw new Error(result.error);
       }
 
-      const data = await response.json();
-      setRequestData(data);
+      setRequestData(result.data);
     } catch (error) {
       setRequestError(
         error instanceof Error ? error.message : "Failed to fetch request data"
