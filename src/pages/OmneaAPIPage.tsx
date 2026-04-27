@@ -65,7 +65,7 @@ const OmneaAPIPage = () => {
 
     try {
       const result = await makeOmneaRequest<unknown>(
-        `/requests/request-forms/${requestId}`,
+        `{{baseUrl}}/requests/request-forms/${requestId}`,
         { method: "GET", authEnvironment: "production" }
       );
 
