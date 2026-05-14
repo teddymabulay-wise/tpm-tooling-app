@@ -18,6 +18,24 @@ function equalsIgnoreCase(raw: string | undefined, expected: string): boolean {
   return (raw ?? '').trim().toLowerCase() === expected.toLowerCase()
 }
 
+function normalizeQuestionKey(raw: string): string {
+  return raw.trim().replace(/\s+/g, ' ').toLowerCase()
+}
+
+function getAnswerValue(answers: QuestionAnswerMap, key: string): string | undefined {
+  if (answers[key] != null) return answers[key]
+  if (answers[key.toLowerCase()] != null) return answers[key.toLowerCase()]
+
+  const target = normalizeQuestionKey(key)
+  for (const [answerKey, value] of Object.entries(answers)) {
+    if (normalizeQuestionKey(answerKey) === target) {
+      return value
+    }
+  }
+
+  return undefined
+}
+
 function isHigh(tags: DerivedTagSet): boolean {
   return tags.materialityImpact === 'High'
 }
@@ -69,8 +87,8 @@ const MATERIAL_GROUPS: Array<{ group: number; matches: (tags: DerivedTagSet, ans
   {
     group: 4,
     matches: (tags, answers) =>
-      includesIgnoreCase(answers['mainAssessmentBanking-MainAssessmentSection1-question-7'], 'liquidity credit facility') &&
-      equalsIgnoreCase(answers['buyerLegalEntity'], 'Wise Australia Pty Ltd') &&
+      includesIgnoreCase(getAnswerValue(answers, 'mainAssessmentBanking-MainAssessmentSection1-question-7'), 'liquidity credit facility') &&
+      equalsIgnoreCase(getAnswerValue(answers, 'buyerLegalEntity'), 'Wise Australia Pty Ltd') &&
       tags.bankingSupplier,
     rule: 'Material group 4: Liquidity credit facility for Wise Australia banking supplier',
   },
@@ -78,7 +96,7 @@ const MATERIAL_GROUPS: Array<{ group: number; matches: (tags: DerivedTagSet, ans
     group: 5,
     matches: (tags, answers) =>
       ['Safeguarding Asset Custodian', 'Safeguarding Credit Institution', 'Safeguarding Insurance Provider'].some((value) =>
-        includesIgnoreCase(answers['mainAssessmentBanking-MainAssessmentSection1-question-7'], value)
+        includesIgnoreCase(getAnswerValue(answers, 'mainAssessmentBanking-MainAssessmentSection1-question-7'), value)
       ) && tags.bankingSupplier,
     rule: 'Material group 5: Safeguarding banking sub-function',
   },
@@ -117,7 +135,7 @@ const STANDARD_GROUPS: Array<{ group: number; matches: (tags: DerivedTagSet, ans
   { group: 4, matches: (tags) => isHigh(tags) && isInstantOrEasy(tags) && tags.thirdPartySupplier && tags.supportive, rule: 'Standard group 4' },
   {
     group: 5,
-    matches: (tags, answers) => equalsIgnoreCase(answers['mainAssessmentBanking-MainAssessmentSection1-question-7'], 'Corporate money movement') && tags.bankingSupplier,
+    matches: (tags, answers) => equalsIgnoreCase(getAnswerValue(answers, 'mainAssessmentBanking-MainAssessmentSection1-question-7'), 'Corporate money movement') && tags.bankingSupplier,
     rule: 'Standard group 5',
   },
   { group: 6, matches: (tags) => tags.lightTouch, rule: 'Standard group 6' },

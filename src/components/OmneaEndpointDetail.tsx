@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -6,6 +6,8 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import { StatusPill } from "@/components/StatusPill";
 import {
   Table,
@@ -17,14 +19,30 @@ import {
 } from "@/components/ui/table";
 import type { APIEndpoint } from "@/lib/api-contract-data";
 import { getOmneaEnvironmentConfig } from "@/lib/omnea-environment";
-import { Play, Loader2, Copy, Check, AlertCircle, Code2, Grid3x3, ChevronDown, ChevronRight, ArrowUp, ArrowDown, Upload, CheckCircle2, XCircle, Download } from "lucide-react";
+import { Play, Loader2, Copy, Check, AlertCircle, Code2, Grid3x3, ChevronDown, ChevronRight, ArrowUp, ArrowDown, Upload, CheckCircle2, XCircle, Download, Building2 } from "lucide-react";
 import { toast } from "sonner";
 import { makeOmneaRequest, resolvePathTemplate, fetchAllOmneaPages } from "@/lib/omnea-api-utils";
 
 // ─── Fuzzy matching ───────────────────────────────────────────────────────────
 
 function normalize(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+  return s
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/ß/g, 'ss')
+    .replace(/æ/g, 'ae')
+    .replace(/œ/g, 'oe')
+    .replace(/ø/g, 'o')
+    .replace(/ł/g, 'l')
+    .replace(/đ/g, 'd')
+    .replace(/&/g, ' and ')
+    .replace(/@/g, ' at ')
+    .replace(/[/'’`]/g, '')
+    .replace(/[._,+-]/g, ' ')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function levenshtein(a: string, b: string): number {
@@ -43,10 +61,15 @@ function levenshtein(a: string, b: string): number {
 function fuzzyScore(query: string, candidate: string): number {
   const q = normalize(query);
   const c = normalize(candidate);
+  if (!q || !c) return 0;
   if (q === c) return 1;
-  if (c.includes(q) || q.includes(c)) return 0.92;
+  const shorter = q.length <= c.length ? q : c;
+  const shorterWordCount = shorter.split(' ').filter(Boolean).length;
+  const lengthRatio = Math.min(q.length, c.length) / Math.max(q.length, c.length);
+  if ((c.includes(q) || q.includes(c)) && shorter.length >= 8 && shorterWordCount >= 2 && lengthRatio >= 0.6) {
+    return 0.92;
+  }
   const maxLen = Math.max(q.length, c.length);
-  if (maxLen === 0) return 1;
   const dist = levenshtein(q, c);
   return Math.max(0, 1 - dist / maxLen);
 }
@@ -80,14 +103,19 @@ function wordMatchScore(query: string, candidate: string, noiseSet: Set<string>)
   return f1 * 0.95; // cap below 1.0 so an exact fuzzy match always wins
 }
 
-function combinedScore(query: string, candidate: string, noiseSet: Set<string>): number {
-  return Math.max(fuzzyScore(query, candidate), wordMatchScore(query, candidate, noiseSet));
+function combinedScore(query: string, candidate: string, noiseSet: Set<string>, enableWordMatch = true): number {
+  const fuzzy = fuzzyScore(query, candidate);
+  if (!enableWordMatch) return fuzzy;
+  return Math.max(fuzzy, wordMatchScore(query, candidate, noiseSet));
 }
 
 interface OmneaMatch {
   name: string;
   id: string;
   score: number;
+  email?: string;
+  firstName?: string;
+  lastName?: string;
 }
 
 interface OngoingMatch {
@@ -103,6 +131,7 @@ interface CsvMatchResult {
 }
 
 const FUZZY_THRESHOLD = 0.72;
+const MAX_VISIBLE_CSV_MATCHES = 3;
 
 interface Props {
   endpoint: APIEndpoint;
@@ -114,7 +143,51 @@ type SubsidiaryDraft = {
   remoteId: string;
 };
 
+type SupplierOption = {
+  id: string;
+  name: string;
+  remoteId: string;
+};
+
+type RelationMode = "omit" | "set" | "clear";
+
+type BatchUserUpdateDraft = {
+  identifierMode: "id" | "email";
+  identifierValue: string;
+  managerUserMode: RelationMode;
+  managerUserLookupMode: "id" | "email";
+  managerUserLookupValue: string;
+  departmentMode: RelationMode;
+  departmentLookupMode: "id" | "remoteId";
+  departmentLookupValue: string;
+  subsidiaryMode: RelationMode;
+  subsidiaryLookupMode: "id" | "remoteId";
+  subsidiaryLookupValue: string;
+  allowedSubsidiariesMode: RelationMode;
+  allowedSubsidiariesLookupMode: "id" | "remoteId";
+  allowedSubsidiaryIds: string;
+  customFieldsJson: string;
+};
+
 const defaultSubsidiary: SubsidiaryDraft = { name: "", remoteId: "" };
+
+const defaultBatchUserUpdate: BatchUserUpdateDraft = {
+  identifierMode: "id",
+  identifierValue: "",
+  managerUserMode: "omit",
+  managerUserLookupMode: "id",
+  managerUserLookupValue: "",
+  departmentMode: "omit",
+  departmentLookupMode: "id",
+  departmentLookupValue: "",
+  subsidiaryMode: "omit",
+  subsidiaryLookupMode: "id",
+  subsidiaryLookupValue: "",
+  allowedSubsidiariesMode: "omit",
+  allowedSubsidiariesLookupMode: "id",
+  allowedSubsidiaryIds: "",
+  customFieldsJson: "",
+};
 
 type SubsidiaryUpdateDraft = {
   name: string;
@@ -170,11 +243,17 @@ const defaultSupplier: SupplierDraft = {
 };
 
 const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
+  const isSupplierCsvLookup = endpoint.id === "get-suppliers-by-csv";
+  const isUserCsvLookup = endpoint.id === "get-users-by-csv";
+  const isCsvLookupEndpoint = isSupplierCsvLookup || isUserCsvLookup;
+  const csvEntityLabel = isUserCsvLookup ? "user" : "supplier";
+  const csvEntityLabelPlural = isUserCsvLookup ? "users" : "suppliers";
   const [params, setParams] = useState<Record<string, string>>({});
   const [bodyStr, setBodyStr] = useState("");
   const [suppliers, setSuppliers] = useState<Array<SupplierDraft>>([defaultSupplier]);
   const [subsidiaries, setSubsidiaries] = useState<Array<SubsidiaryDraft>>([defaultSubsidiary]);
   const [subsidiaryUpdate, setSubsidiaryUpdate] = useState<SubsidiaryUpdateDraft>(defaultSubsidiaryUpdate);
+  const [batchUserUpdates, setBatchUserUpdates] = useState<Array<BatchUserUpdateDraft>>([defaultBatchUserUpdate]);
 
   // CSV supplier lookup state
   const csvInputRef = useRef<HTMLInputElement>(null);
@@ -203,6 +282,24 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
   const [sortColumn, setSortColumn] = useState<string | null>(null);
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>({});
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [paginationMode, setPaginationMode] = useState<"page" | "all" | null>(null);
+  const [pageNumber, setPageNumber] = useState(0);
+  const [pageCount, setPageCount] = useState<number | null>(null);
+  const [totalItems, setTotalItems] = useState<number | null>(null);
+  const [pageCursors, setPageCursors] = useState<Array<string | null>>([]);
+  const [supplierOptions, setSupplierOptions] = useState<SupplierOption[]>([]);
+  const [supplierOptionsLoading, setSupplierOptionsLoading] = useState(false);
+  const [supplierPickerOpen, setSupplierPickerOpen] = useState(false);
+
+  useEffect(() => {
+    setNextCursor(null);
+    setPaginationMode(null);
+    setPageNumber(0);
+    setPageCount(null);
+    setTotalItems(null);
+    setPageCursors([]);
+  }, [endpoint.id]);
 
   const startResize = (header: string, startX: number, startWidth: number) => {
     const onMove = (e: PointerEvent) => {
@@ -221,6 +318,209 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
   };
 
   const updateParam = (key: string, value: string) => setParams((p) => ({ ...p, [key]: value }));
+
+  const templateKeys = Array.from(endpoint.path.matchAll(/\{\{(\w+)\}\}/g), (match) => match[1]).filter((key) => key !== "baseUrl");
+  const templateKeySet = new Set(templateKeys);
+  const pathTemplateParams = endpoint.pathParams.filter((param) => templateKeySet.has(param.key));
+  const queryLikeParams = endpoint.pathParams.filter((param) => !templateKeySet.has(param.key));
+  const isPaginatedEndpoint = endpoint.method === "GET" && endpoint.pathParams.some((param) => param.key === "cursor");
+  const supportsSupplierPicker = pathTemplateParams.some((param) => param.key === "supplierId");
+  const supportsSupplierContactAggregation = endpoint.id === "list-internal-contacts" || endpoint.id === "list-external-contacts";
+
+  const extractNextCursor = (raw: unknown): string | null => {
+    if (!raw || typeof raw !== "object") return null;
+
+    const obj = raw as Record<string, unknown>;
+    const nestedData = obj.data && typeof obj.data === "object"
+      ? (obj.data as Record<string, unknown>)
+      : undefined;
+    const containers = [obj, nestedData].filter(
+      (value): value is Record<string, unknown> => Boolean(value)
+    );
+
+    for (const container of containers) {
+      for (const key of ["nextCursor", "next_cursor"]) {
+        const value = container[key];
+        if (typeof value === "string" && value) return value;
+      }
+
+      const meta = container.meta as Record<string, unknown> | undefined;
+      const pagination = container.pagination as Record<string, unknown> | undefined;
+      const nestedContainers = [meta, pagination].filter(
+        (value): value is Record<string, unknown> => Boolean(value)
+      );
+
+      for (const nested of nestedContainers) {
+        for (const key of ["nextCursor", "next_cursor", "cursor", "pageToken", "page_token", "continuationToken"]) {
+          const value = nested[key];
+          if (typeof value === "string" && value) return value;
+        }
+      }
+    }
+
+    return null;
+  };
+
+  const countItems = (raw: unknown): number | null => {
+    if (Array.isArray(raw)) return raw.length;
+    if (!raw || typeof raw !== "object") return null;
+
+    const obj = raw as Record<string, unknown>;
+    if (Array.isArray(obj.data)) return obj.data.length;
+    if (obj.data && typeof obj.data === "object") {
+      const nested = obj.data as Record<string, unknown>;
+      if (Array.isArray(nested.data)) return nested.data.length;
+      return 1;
+    }
+
+    return 1;
+  };
+
+  const buildGetParams = (overrides: Record<string, string> = {}) => ({
+    ...params,
+    ...overrides,
+  });
+
+  const buildQueryString = (requestParams: Record<string, string>) =>
+    new URLSearchParams(
+      Object.entries(requestParams).filter(
+        ([key, value]) => value && !templateKeySet.has(key) && key !== "cursor" && key !== "limit"
+      )
+    ).toString();
+
+  const getMissingTemplateKeys = (requestParams: Record<string, string>) =>
+    templateKeys.filter((key) => !String(requestParams[key] ?? "").trim());
+
+  const buildPaginatedBasePath = () => {
+    const requestParams = buildGetParams();
+    let url = resolvePathTemplate(endpoint.path, requestParams);
+    const query = buildQueryString(requestParams);
+
+    if (query) {
+      url += `${url.includes("?") ? "&" : "?"}${query}`;
+    }
+
+    return url;
+  };
+
+  const loadSupplierOptions = async () => {
+    if (supplierOptionsLoading) return supplierOptions;
+    if (supplierOptions.length > 0) return supplierOptions;
+
+    setSupplierOptionsLoading(true);
+    try {
+      const config = getOmneaEnvironmentConfig();
+      const suppliersResponse = await fetchAllOmneaPages<Record<string, unknown>>(
+        `${config.apiBaseUrl}/v1/suppliers`
+      );
+      const nextOptions = suppliersResponse
+        .map((supplier) => ({
+          id: typeof supplier.id === "string" ? supplier.id : "",
+          name: typeof supplier.name === "string" ? supplier.name : "",
+          remoteId: typeof supplier.remoteId === "string" ? supplier.remoteId : "",
+        }))
+        .filter((supplier) => supplier.id && supplier.name)
+        .sort((left, right) => left.name.localeCompare(right.name));
+
+      setSupplierOptions(nextOptions);
+      return nextOptions;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to load suppliers";
+      toast.error(message);
+      return [] as SupplierOption[];
+    } finally {
+      setSupplierOptionsLoading(false);
+    }
+  };
+
+  const runAcrossAllSuppliers = async () => {
+    setLoading(true);
+    setResponse(null);
+    setError(null);
+    setNextCursor(null);
+    setPaginationMode("all");
+    setPageNumber(0);
+    setPageCount(null);
+    setTotalItems(null);
+    setPageCursors([]);
+
+    try {
+      const config = getOmneaEnvironmentConfig();
+      const availableSuppliers = supplierOptions.length > 0 ? supplierOptions : await loadSupplierOptions();
+
+      if (availableSuppliers.length === 0) {
+        throw new Error("No suppliers available to query");
+      }
+
+      const requestParams = buildGetParams();
+      const query = buildQueryString(requestParams);
+      const contactPathSuffix = endpoint.id === "list-internal-contacts" ? "internal-contacts" : "external-contacts";
+      const aggregatedRows: Record<string, unknown>[] = [];
+      let suppliersWithContacts = 0;
+      const batchSize = 8;
+
+      for (let index = 0; index < availableSuppliers.length; index += batchSize) {
+        const batch = availableSuppliers.slice(index, index + batchSize);
+        const batchResults = await Promise.all(
+          batch.map(async (supplier) => {
+            let basePath = `${config.apiBaseUrl}/v1/suppliers/${supplier.id}/${contactPathSuffix}`;
+            if (query) {
+              basePath += `?${query}`;
+            }
+
+            const items = await fetchAllOmneaPages<Record<string, unknown>>(basePath);
+            return { supplier, items };
+          })
+        );
+
+        for (const result of batchResults) {
+          if (result.items.length > 0) {
+            suppliersWithContacts += 1;
+          }
+
+          aggregatedRows.push(
+            ...result.items.map((item) => ({
+              supplierId: result.supplier.id,
+              supplierName: result.supplier.name,
+              supplierRemoteId: result.supplier.remoteId || null,
+              ...item,
+            }))
+          );
+        }
+
+        setPageCount(index + batch.length);
+        setTotalItems(aggregatedRows.length);
+      }
+
+      const durationMs = null;
+      const aggregatedResponse = {
+        data: aggregatedRows,
+        meta: {
+          suppliersQueried: availableSuppliers.length,
+          suppliersWithContacts,
+          contactType: contactPathSuffix,
+        },
+      };
+
+      setResponse(aggregatedResponse as Record<string, unknown>);
+      setStatusCode(200);
+      setDuration(durationMs);
+      setPageNumber(availableSuppliers.length);
+
+      if (onResponse) {
+        onResponse(aggregatedResponse, 200, durationMs);
+      }
+
+      toast.success(`${endpoint.name} — fetched ${aggregatedRows.length} contacts across ${availableSuppliers.length} suppliers`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to fetch supplier contacts";
+      setError(message);
+      toast.error(message);
+      setResponse(null);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const updateSupplier = (idx: number, field: string, value: unknown) => {
     setSuppliers((prev) =>
@@ -259,6 +559,13 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
   const addSubsidiary = () => setSubsidiaries((prev) => [...prev, defaultSubsidiary]);
   const removeSubsidiary = (idx: number) => setSubsidiaries((prev) => prev.filter((_, i) => i !== idx));
 
+  const updateBatchUser = (idx: number, field: keyof BatchUserUpdateDraft, value: string) => {
+    setBatchUserUpdates((prev) => prev.map((row, rowIdx) => (rowIdx === idx ? { ...row, [field]: value } : row)));
+  };
+
+  const addBatchUserUpdate = () => setBatchUserUpdates((prev) => [...prev, defaultBatchUserUpdate]);
+  const removeBatchUserUpdate = (idx: number) => setBatchUserUpdates((prev) => prev.filter((_, rowIdx) => rowIdx !== idx));
+
   const allowedCustomEntityTypeChoices = [
     "Third Party",
     "Banking Services",
@@ -266,14 +573,65 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
     "Legal",
   ];
 
+  const parseCsvRow = (line: string) => {
+    const values: string[] = [];
+    let current = '';
+    let inQuotes = false;
+
+    for (let index = 0; index < line.length; index += 1) {
+      const char = line[index];
+      const nextChar = line[index + 1];
+
+      if (char === '"') {
+        if (inQuotes && nextChar === '"') {
+          current += '"';
+          index += 1;
+        } else {
+          inQuotes = !inQuotes;
+        }
+        continue;
+      }
+
+      if (char === ',' && !inQuotes) {
+        values.push(current.trim());
+        current = '';
+        continue;
+      }
+
+      current += char;
+    }
+
+    values.push(current.trim());
+    return values;
+  };
+
   const parseCsvFile = (file: File) => {
     const reader = new FileReader();
     reader.onload = (e) => {
       const text = (e.target?.result as string) ?? '';
-      const names = text.split(/\r?\n/)
-        .map(l => l.replace(/^"|"$/g, '').trim())
-        .filter(Boolean)
-        .filter((_, i) => i > 0 || !/^name$/i.test(_.toLowerCase())); // skip header if "name"
+      const lines = text.split(/\r?\n/).filter(line => line.trim().length > 0);
+      if (lines.length === 0) {
+        setCsvNames([]);
+        setCsvResults(null);
+        return;
+      }
+
+      const headers = parseCsvRow(lines[0]).map((value) => normalize(value));
+      const nameColumnIndex = headers.findIndex((value) => value === 'name');
+
+      if (nameColumnIndex === -1) {
+        setCsvNames([]);
+        setCsvResults(null);
+        toast.error('CSV must include a Name column');
+        return;
+      }
+
+      const names = lines
+        .slice(1)
+        .map((line) => parseCsvRow(line)[nameColumnIndex] ?? '')
+        .map((value) => value.trim())
+        .filter(Boolean);
+
       setCsvNames(names);
       setCsvResults(null);
     };
@@ -301,43 +659,85 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
     reader.readAsText(file);
   };
 
+  const getCsvLookupCandidates = async (config: ReturnType<typeof getOmneaEnvironmentConfig>) => {
+    if (isUserCsvLookup) {
+      const allUsers = await fetchAllOmneaPages<Record<string, unknown>>(
+        `${config.apiBaseUrl}/v1/users`,
+        { onProgress: ({ totalItems }) => setCsvProgress({ phase: 'fetching', fetched: totalItems }) },
+      );
+
+      return allUsers.map((user) => {
+        const firstName = typeof user.firstName === 'string' ? user.firstName.trim() : '';
+        const lastName = typeof user.lastName === 'string' ? user.lastName.trim() : '';
+        const fullName = [firstName, lastName].filter(Boolean).join(' ').trim();
+        const email = typeof user.email === 'string' ? user.email.trim() : '';
+        const displayName = normalize(fullName) ? fullName : email;
+        return {
+          id: typeof user.id === 'string' ? user.id : '',
+          name: displayName,
+          email,
+          firstName,
+          lastName,
+        };
+      }).filter((candidate) => candidate.id && candidate.name);
+    }
+
+    const allSuppliers = await fetchAllOmneaPages<Record<string, unknown>>(
+      `${config.apiBaseUrl}/v1/suppliers`,
+      { onProgress: ({ totalItems }) => setCsvProgress({ phase: 'fetching', fetched: totalItems }) },
+    );
+
+    return allSuppliers.map((supplier) => ({
+      id: typeof supplier.id === 'string' ? supplier.id : '',
+      name: typeof supplier.name === 'string' ? supplier.name : '',
+    })).filter((candidate) => candidate.id && candidate.name);
+  };
+
   const runCsvLookup = async () => {
     if (csvNames.length === 0) {
-      toast.error('Upload a CSV with supplier names first');
+      toast.error(`Upload a CSV with ${csvEntityLabel} names first`);
       return;
     }
     setCsvRunning(true);
     setCsvResults(null);
     setCsvProgress({ phase: 'fetching', fetched: 0 });
     try {
+      const enableWordMatch = isSupplierCsvLookup;
       const noiseSet = new Set(
         noiseWordsInput.split(',').map(w => normalize(w)).filter(Boolean)
       );
       const config = getOmneaEnvironmentConfig();
-      const allSuppliers = await fetchAllOmneaPages<Record<string, unknown>>(
-        `${config.apiBaseUrl}/v1/suppliers`,
-        { onProgress: ({ totalItems }) => setCsvProgress({ phase: 'fetching', fetched: totalItems }) },
-      );
+      const candidates = await getCsvLookupCandidates(config);
 
       const results: CsvMatchResult[] = [];
       for (let i = 0; i < csvNames.length; i++) {
         const csvName = csvNames[i];
         const matches: OmneaMatch[] = [];
-        for (const s of allSuppliers) {
-          const name = typeof s.name === 'string' ? s.name : '';
-          const id = typeof s.id === 'string' ? s.id : '';
-          const score = combinedScore(csvName, name, noiseSet);
-          if (score >= FUZZY_THRESHOLD) matches.push({ name, id, score });
+        for (const candidate of candidates) {
+          const score = combinedScore(csvName, candidate.name, noiseSet, enableWordMatch);
+          if (score >= FUZZY_THRESHOLD) {
+            matches.push({
+              name: candidate.name,
+              id: candidate.id,
+              score,
+              email: candidate.email,
+              firstName: candidate.firstName,
+              lastName: candidate.lastName,
+            });
+          }
         }
         matches.sort((a, b) => b.score - a.score);
+        if (matches.length > MAX_VISIBLE_CSV_MATCHES) {
+          matches.length = MAX_VISIBLE_CSV_MATCHES;
+        }
 
         // If not found in Omnea, check ongoing requests as a second data point
         let ongoingMatch: OngoingMatch | null = null;
-        if (matches.length === 0 && ongoingRequests.length > 0) {
+        if (isSupplierCsvLookup && matches.length === 0 && ongoingRequests.length > 0) {
           let bestScore = 0;
           let bestRow: { supplier: string; state: string } | null = null;
           for (const row of ongoingRequests) {
-            const score = combinedScore(csvName, row.supplier, noiseSet);
+            const score = combinedScore(csvName, row.supplier, noiseSet, enableWordMatch);
             if (score >= FUZZY_THRESHOLD && score > bestScore) {
               bestScore = score;
               bestRow = row;
@@ -358,7 +758,11 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
       setCsvResults(results);
       const found = results.filter(r => r.matches.length > 0).length;
       const inProgress = results.filter(r => r.matches.length === 0 && r.ongoingMatch).length;
-      toast.success(`Matched ${found} in Omnea, ${inProgress} in ongoing requests, ${csvNames.length - found - inProgress} not found`);
+      if (isSupplierCsvLookup) {
+        toast.success(`Matched ${found} in Omnea, ${inProgress} in ongoing requests, ${csvNames.length - found - inProgress} not found`);
+      } else {
+        toast.success(`Matched ${found} in Omnea, ${csvNames.length - found} not found`);
+      }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Lookup failed');
     } finally {
@@ -369,13 +773,14 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
 
   const exportCsvResults = () => {
     if (!csvResults) return;
-    const header = 'csv_name,status,omnea_name,omnea_id,match_score,ongoing_state';
+    const header = 'csv_name,status,omnea_name,omnea_email,omnea_id,match_score,ongoing_state';
     const rows = csvResults.flatMap(r => {
       if (r.matches.length > 0) {
         return r.matches.map(m => [
           `"${r.csvName.replace(/"/g, '""')}"`,
           'found',
           `"${m.name.replace(/"/g, '""')}"`,
+          `"${(m.email ?? '').replace(/"/g, '""')}"`,
           m.id,
           m.score.toFixed(2),
           '',
@@ -387,25 +792,34 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
           'ongoing_request',
           `"${r.ongoingMatch.supplier.replace(/"/g, '""')}"`,
           '',
+          '',
           r.ongoingMatch.score.toFixed(2),
           `"${r.ongoingMatch.state.replace(/"/g, '""')}"`,
         ].join(',')];
       }
-      return [[`"${r.csvName.replace(/"/g, '""')}"`, 'not_found', '', '', '', ''].join(',')];
+      return [[`"${r.csvName.replace(/"/g, '""')}"`, 'not_found', '', '', '', '', ''].join(',')];
     });
     const blob = new Blob([`${header}\n${rows.join('\n')}`], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'supplier-csv-lookup-results.csv';
+    a.download = `${csvEntityLabel}-csv-lookup-results.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
-  const run = async () => {
+  const run = async (mode: "single" | "previous" | "next" | "all" = isPaginatedEndpoint ? "all" : "single") => {
     setLoading(true);
     setResponse(null);
     setError(null);
+    if (mode !== "next" && mode !== "previous") {
+      setNextCursor(null);
+      setPaginationMode(null);
+      setPageNumber(0);
+      setPageCount(null);
+      setTotalItems(null);
+      setPageCursors([]);
+    }
     
     try {
       let body: Record<string, unknown> | undefined;
@@ -570,6 +984,79 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
         }
 
         body = patchBody;
+      } else if (endpoint.id === "batch-update-users") {
+        const users = batchUserUpdates
+          .filter((row) => row.identifierValue.trim())
+          .map((row, idx) => {
+            const identifier = row.identifierValue.trim();
+            const userPatch: Record<string, unknown> = row.identifierMode === "email"
+              ? { email: identifier }
+              : { id: identifier };
+
+            const applyRelation = (
+              fieldName: "managerUser" | "department" | "subsidiary",
+              mode: RelationMode,
+              lookupMode: "id" | "email" | "remoteId",
+              value: string
+            ) => {
+              if (mode === "clear") {
+                userPatch[fieldName] = null;
+                return;
+              }
+              if (mode === "set") {
+                const trimmed = value.trim();
+                if (!trimmed) {
+                  throw new Error(`Row ${idx + 1}: ${fieldName} ${lookupMode} is required when mode is set`);
+                }
+                userPatch[fieldName] = lookupMode === "id"
+                  ? { id: trimmed }
+                  : lookupMode === "email"
+                    ? { email: trimmed }
+                    : { remoteId: trimmed };
+              }
+            };
+
+            applyRelation("managerUser", row.managerUserMode, row.managerUserLookupMode, row.managerUserLookupValue);
+            applyRelation("department", row.departmentMode, row.departmentLookupMode, row.departmentLookupValue);
+            applyRelation("subsidiary", row.subsidiaryMode, row.subsidiaryLookupMode, row.subsidiaryLookupValue);
+
+            if (row.allowedSubsidiariesMode === "clear") {
+              userPatch.allowedSubsidiaries = [];
+            } else if (row.allowedSubsidiariesMode === "set") {
+              const ids = row.allowedSubsidiaryIds
+                .split(/[\n,]/)
+                .map((value) => value.trim())
+                .filter(Boolean);
+
+              if (ids.length === 0) {
+                throw new Error(`Row ${idx + 1}: at least one allowed subsidiary ${row.allowedSubsidiariesLookupMode} is required when mode is set`);
+              }
+
+              userPatch.allowedSubsidiaries = ids.map((value) => (
+                row.allowedSubsidiariesLookupMode === "id"
+                  ? { id: value }
+                  : { remoteId: value }
+              ));
+            }
+
+            if (row.customFieldsJson.trim()) {
+              try {
+                userPatch.customFields = JSON.parse(row.customFieldsJson);
+              } catch {
+                throw new Error(`Row ${idx + 1}: customFields must be valid JSON`);
+              }
+            }
+
+            return userPatch;
+          });
+
+        if (users.length === 0) {
+          setError("Please provide at least one user ID or email to update");
+          setLoading(false);
+          return;
+        }
+
+        body = { users };
       } else {
         // For other endpoints, parse JSON body if provided
         if (bodyStr) {
@@ -583,16 +1070,91 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
         }
       }
 
+      const requestCursor = mode === "next"
+        ? nextCursor
+        : mode === "previous"
+          ? (pageNumber <= 2 ? null : (pageCursors[pageNumber - 2] ?? null))
+          : null;
+      const requestParams = buildGetParams(requestCursor ? { cursor: requestCursor } : {});
+      const missingTemplateKeys = getMissingTemplateKeys(requestParams);
+
+      if (missingTemplateKeys.length > 0) {
+        const message = `Please provide required path parameter${missingTemplateKeys.length > 1 ? "s" : ""}: ${missingTemplateKeys.join(", ")}`;
+        setError(message);
+        toast.error(message);
+        setLoading(false);
+        return;
+      }
+
+      if (mode === "all" && isPaginatedEndpoint) {
+        const startTime = performance.now();
+        let progress = { pageCount: 0, totalItems: 0 };
+        const items = await fetchAllOmneaPages<Record<string, unknown>>(
+          buildPaginatedBasePath(),
+          {
+            onProgress: (nextProgress) => {
+              progress = nextProgress;
+              setPageCount(nextProgress.pageCount);
+              setTotalItems(nextProgress.totalItems);
+            },
+          }
+        );
+
+        if (progress.pageCount === 0) {
+          throw new Error("Failed to fetch paginated response");
+        }
+
+        const durationMs = Math.round(performance.now() - startTime);
+        const paginatedResponse = { data: items };
+        setResponse(paginatedResponse as Record<string, unknown>);
+        setStatusCode(200);
+        setDuration(durationMs);
+        setPaginationMode("all");
+        setPageNumber(progress.pageCount);
+        setNextCursor(null);
+        setPageCursors([]);
+
+        if (onResponse) {
+          onResponse(paginatedResponse, 200, durationMs);
+        }
+
+        toast.success(`${endpoint.method} ${endpoint.name} — fetched ${progress.totalItems} items across ${progress.pageCount} pages (${durationMs}ms)`);
+        setLoading(false);
+        return;
+      }
+
       // Make the API request
       const result = await makeOmneaRequest(endpoint.path, {
         method: endpoint.method as "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
         body,
-        params,
+        params: requestParams,
       });
 
       setResponse(result.data as Record<string, unknown> || { error: result.error });
       setStatusCode(result.statusCode);
       setDuration(result.duration);
+      setPaginationMode(isPaginatedEndpoint ? "page" : null);
+
+      if (isPaginatedEndpoint) {
+        setNextCursor(extractNextCursor(result.data));
+        if (mode === "next") {
+          const nextPageNumber = pageNumber + 1;
+          setPageNumber(nextPageNumber);
+          setPageCursors((current) => {
+            const nextHistory = [...current];
+            nextHistory[nextPageNumber - 1] = requestCursor;
+            return nextHistory;
+          });
+        } else if (mode === "previous") {
+          const previousPageNumber = Math.max(1, pageNumber - 1);
+          setPageNumber(previousPageNumber);
+        } else {
+          setPageNumber(1);
+          setPageCursors([null]);
+        }
+        setPageCount(null);
+        setTotalItems(countItems(result.data));
+      }
 
       // Call onResponse callback if provided
       if (onResponse) {
@@ -849,19 +1411,100 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
         {endpoint.collection && <p className="text-[11px] text-muted-foreground mt-0.5"><span className="font-medium">Collection:</span> {endpoint.collection}</p>}
       </Card>
 
-      {endpoint.pathParams.length > 0 && (
+      {pathTemplateParams.length > 0 && (
         <Card className="p-4 space-y-3">
-          <p className="text-xs font-semibold text-foreground">Path Parameters</p>
-          {endpoint.pathParams.map((pp) => (
+          <p className="text-xs font-semibold text-foreground">Required Path Parameters</p>
+          {pathTemplateParams.map((pp) => (
             <div key={pp.key}>
               <Label className="text-[10px] font-mono text-muted-foreground">{`{{${pp.key}}}`}</Label>
-              <Input placeholder={pp.description} value={params[pp.key] || ""} onChange={(e) => updateParam(pp.key, e.target.value)} className="mt-1 font-mono text-xs h-8" />
+              {pp.key === "supplierId" ? (
+                <div className="mt-1 space-y-2">
+                  <Popover open={supplierPickerOpen} onOpenChange={setSupplierPickerOpen}>
+                    <PopoverTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="h-8 w-full justify-between font-mono text-xs"
+                        onClick={() => {
+                          if (supplierOptions.length === 0) {
+                            void loadSupplierOptions();
+                          }
+                        }}
+                      >
+                        <span className="truncate text-left">
+                          {params[pp.key]
+                            ? `${supplierOptions.find((supplier) => supplier.id === params[pp.key])?.name ?? "Selected supplier"} (${params[pp.key]})`
+                            : supplierOptionsLoading
+                              ? "Loading suppliers..."
+                              : "Select supplier from list"}
+                        </span>
+                        <Building2 className="ml-2 h-3.5 w-3.5 shrink-0 opacity-60" />
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent className="w-[420px] p-0" align="start">
+                      <Command>
+                        <CommandInput placeholder="Search suppliers by name or UUID" />
+                        <CommandList>
+                          <CommandEmpty>
+                            {supplierOptionsLoading ? "Loading suppliers..." : "No suppliers found."}
+                          </CommandEmpty>
+                          <CommandGroup>
+                            {supplierOptions.map((supplier) => (
+                              <CommandItem
+                                key={supplier.id}
+                                value={`${supplier.name} ${supplier.id} ${supplier.remoteId}`}
+                                onSelect={() => {
+                                  updateParam(pp.key, supplier.id);
+                                  setSupplierPickerOpen(false);
+                                }}
+                              >
+                                <Check className={`mr-2 h-4 w-4 ${params[pp.key] === supplier.id ? "opacity-100" : "opacity-0"}`} />
+                                <div className="min-w-0">
+                                  <p className="truncate text-sm font-medium">{supplier.name}</p>
+                                  <p className="truncate text-[10px] font-mono text-muted-foreground">{supplier.id}</p>
+                                </div>
+                              </CommandItem>
+                            ))}
+                          </CommandGroup>
+                        </CommandList>
+                      </Command>
+                    </PopoverContent>
+                  </Popover>
+                  <Input
+                    placeholder={`${pp.description} (or paste UUID manually)`}
+                    value={params[pp.key] || ""}
+                    onChange={(e) => updateParam(pp.key, e.target.value)}
+                    className="font-mono text-xs h-8"
+                  />
+                </div>
+              ) : (
+                <Input placeholder={pp.description} value={params[pp.key] || ""} onChange={(e) => updateParam(pp.key, e.target.value)} className="mt-1 font-mono text-xs h-8" />
+              )}
+              <p className="mt-1 text-[10px] text-muted-foreground">{pp.description}</p>
             </div>
           ))}
         </Card>
       )}
 
-      {endpoint.bodyParams && endpoint.bodyParams.length > 0 && endpoint.id !== "create-suppliers-batch" && endpoint.id !== "create-subsidiaries-batch" && endpoint.id !== "update-subsidiary-by-id" && endpoint.id !== "update-subsidiary-by-remote-id" && (
+      {queryLikeParams.length > 0 && (
+        <Card className="p-4 space-y-3">
+          <p className="text-xs font-semibold text-foreground">Optional Query Parameters</p>
+          {queryLikeParams.map((pp) => (
+            <div key={pp.key}>
+              <Label className="text-[10px] font-mono text-muted-foreground">{pp.key}</Label>
+              <Input
+                placeholder={pp.description}
+                value={params[pp.key] || ""}
+                onChange={(e) => updateParam(pp.key, e.target.value)}
+                className="mt-1 font-mono text-xs h-8"
+              />
+              <p className="mt-1 text-[10px] text-muted-foreground">{pp.description}</p>
+            </div>
+          ))}
+        </Card>
+      )}
+
+      {endpoint.bodyParams && endpoint.bodyParams.length > 0 && endpoint.id !== "create-suppliers-batch" && endpoint.id !== "create-subsidiaries-batch" && endpoint.id !== "update-subsidiary-by-id" && endpoint.id !== "update-subsidiary-by-remote-id" && endpoint.id !== "batch-update-users" && (
         <Card className="p-4 space-y-3">
           <p className="text-xs font-semibold text-foreground">Request Body (JSON)</p>
           <Textarea
@@ -878,6 +1521,201 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
             ))}
           </div>
         </Card>
+      )}
+
+      {endpoint.id === "batch-update-users" && (
+        <div className="space-y-2">
+          {batchUserUpdates.map((userUpdate, idx) => (
+            <Card key={idx} className="p-3 space-y-3">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-semibold text-foreground">User update {idx + 1}</p>
+                {batchUserUpdates.length > 1 && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => removeBatchUserUpdate(idx)}
+                    className="h-6 px-2 text-xs text-destructive hover:text-destructive hover:bg-destructive/10"
+                  >
+                    Remove
+                  </Button>
+                )}
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div className="col-span-2">
+                  <Label className="text-[10px] font-medium">User lookup *</Label>
+                  <div className="mt-0.5 grid grid-cols-[120px_1fr] gap-2">
+                    <Select value={userUpdate.identifierMode} onValueChange={(value: "id" | "email") => updateBatchUser(idx, "identifierMode", value)}>
+                      <SelectTrigger className="text-xs h-7">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="id">ID</SelectItem>
+                        <SelectItem value="email">Email</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Input
+                      placeholder={userUpdate.identifierMode === "email" ? "user@example.com" : "User UUID"}
+                      value={userUpdate.identifierValue}
+                      onChange={(e) => updateBatchUser(idx, "identifierValue", e.target.value)}
+                      className="font-mono text-xs h-7"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <Label className="text-[10px] font-medium">Manager user</Label>
+                  <Select value={userUpdate.managerUserMode} onValueChange={(value: RelationMode) => updateBatchUser(idx, "managerUserMode", value)}>
+                    <SelectTrigger className="mt-0.5 text-xs h-7">
+                      <SelectValue placeholder="Do not send" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="omit">Do not send</SelectItem>
+                      <SelectItem value="set">Set manager user</SelectItem>
+                      <SelectItem value="clear">Clear manager user</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {userUpdate.managerUserMode === "set" && (
+                    <div className="mt-1 grid grid-cols-[120px_1fr] gap-2">
+                      <Select value={userUpdate.managerUserLookupMode} onValueChange={(value: "id" | "email") => updateBatchUser(idx, "managerUserLookupMode", value)}>
+                        <SelectTrigger className="text-xs h-7">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="id">ID</SelectItem>
+                          <SelectItem value="email">Email</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <Input
+                        placeholder={userUpdate.managerUserLookupMode === "email" ? "manager@example.com" : "Manager user UUID"}
+                        value={userUpdate.managerUserLookupValue}
+                        onChange={(e) => updateBatchUser(idx, "managerUserLookupValue", e.target.value)}
+                        className="font-mono text-xs h-7"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                <div>
+                  <Label className="text-[10px] font-medium">Department</Label>
+                  <Select value={userUpdate.departmentMode} onValueChange={(value: RelationMode) => updateBatchUser(idx, "departmentMode", value)}>
+                    <SelectTrigger className="mt-0.5 text-xs h-7">
+                      <SelectValue placeholder="Do not send" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="omit">Do not send</SelectItem>
+                      <SelectItem value="set">Set department</SelectItem>
+                      <SelectItem value="clear">Clear department</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {userUpdate.departmentMode === "set" && (
+                    <div className="mt-1 grid grid-cols-[120px_1fr] gap-2">
+                      <Select value={userUpdate.departmentLookupMode} onValueChange={(value: "id" | "remoteId") => updateBatchUser(idx, "departmentLookupMode", value)}>
+                        <SelectTrigger className="text-xs h-7">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="id">ID</SelectItem>
+                          <SelectItem value="remoteId">Remote ID</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <Input
+                        placeholder={userUpdate.departmentLookupMode === "remoteId" ? "Department remote ID" : "Department UUID"}
+                        value={userUpdate.departmentLookupValue}
+                        onChange={(e) => updateBatchUser(idx, "departmentLookupValue", e.target.value)}
+                        className="font-mono text-xs h-7"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                <div>
+                  <Label className="text-[10px] font-medium">Subsidiary</Label>
+                  <Select value={userUpdate.subsidiaryMode} onValueChange={(value: RelationMode) => updateBatchUser(idx, "subsidiaryMode", value)}>
+                    <SelectTrigger className="mt-0.5 text-xs h-7">
+                      <SelectValue placeholder="Do not send" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="omit">Do not send</SelectItem>
+                      <SelectItem value="set">Set subsidiary</SelectItem>
+                      <SelectItem value="clear">Clear subsidiary</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {userUpdate.subsidiaryMode === "set" && (
+                    <div className="mt-1 grid grid-cols-[120px_1fr] gap-2">
+                      <Select value={userUpdate.subsidiaryLookupMode} onValueChange={(value: "id" | "remoteId") => updateBatchUser(idx, "subsidiaryLookupMode", value)}>
+                        <SelectTrigger className="text-xs h-7">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="id">ID</SelectItem>
+                          <SelectItem value="remoteId">Remote ID</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <Input
+                        placeholder={userUpdate.subsidiaryLookupMode === "remoteId" ? "Subsidiary remote ID" : "Subsidiary UUID"}
+                        value={userUpdate.subsidiaryLookupValue}
+                        onChange={(e) => updateBatchUser(idx, "subsidiaryLookupValue", e.target.value)}
+                        className="font-mono text-xs h-7"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                <div>
+                  <Label className="text-[10px] font-medium">Allowed subsidiaries</Label>
+                  <Select value={userUpdate.allowedSubsidiariesMode} onValueChange={(value: RelationMode) => updateBatchUser(idx, "allowedSubsidiariesMode", value)}>
+                    <SelectTrigger className="mt-0.5 text-xs h-7">
+                      <SelectValue placeholder="Do not send" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="omit">Do not send</SelectItem>
+                      <SelectItem value="set">Set allowed subsidiaries</SelectItem>
+                      <SelectItem value="clear">Clear allowed subsidiaries</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {userUpdate.allowedSubsidiariesMode === "set" && (
+                    <div className="mt-1 space-y-2">
+                      <Select value={userUpdate.allowedSubsidiariesLookupMode} onValueChange={(value: "id" | "remoteId") => updateBatchUser(idx, "allowedSubsidiariesLookupMode", value)}>
+                        <SelectTrigger className="text-xs h-7">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="id">ID</SelectItem>
+                          <SelectItem value="remoteId">Remote ID</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <Textarea
+                        placeholder={userUpdate.allowedSubsidiariesLookupMode === "remoteId" ? "Subsidiary remote IDs, one per line or comma-separated" : "Subsidiary UUIDs, one per line or comma-separated"}
+                        value={userUpdate.allowedSubsidiaryIds}
+                        onChange={(e) => updateBatchUser(idx, "allowedSubsidiaryIds", e.target.value)}
+                        className="font-mono text-xs min-h-[70px]"
+                      />
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div>
+                <Label className="text-[10px] font-medium">Custom fields (JSON object, optional)</Label>
+                <Textarea
+                  placeholder='{"cost-centre":{"value":"ENG"}}'
+                  value={userUpdate.customFieldsJson}
+                  onChange={(e) => updateBatchUser(idx, "customFieldsJson", e.target.value)}
+                  className="mt-0.5 font-mono text-xs min-h-[80px]"
+                />
+              </div>
+
+              <p className="text-[10px] text-muted-foreground">
+                This batch endpoint supports identifying the user by ID or email. It supports updating manager user, department, subsidiary, allowed subsidiaries, and custom fields. It does not support first name, last name, or role updates.
+              </p>
+            </Card>
+          ))}
+
+          <Button variant="outline" onClick={addBatchUserUpdate} size="sm" className="w-full">
+            Add user update
+          </Button>
+        </div>
       )}
 
       {(endpoint.id === "update-subsidiary-by-id" || endpoint.id === "update-subsidiary-by-remote-id") && (
@@ -1218,13 +2056,13 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
         </div>
       )}
 
-      {endpoint.id === "get-suppliers-by-csv" ? (
+      {isCsvLookupEndpoint ? (
         <div className="space-y-4">
           {/* Upload zone */}
           <Card className="p-4 space-y-3">
-            <p className="text-xs font-semibold text-foreground">Upload supplier name CSV</p>
+            <p className="text-xs font-semibold text-foreground">Upload {csvEntityLabel} name CSV</p>
             <p className="text-[11px] text-muted-foreground">
-              Single-column CSV — one supplier name per row. A header row named "name" is automatically skipped.
+              Upload any CSV shape, but it must include a <span className="font-medium">Name</span> column. Values are always read from that column.
             </p>
             <div
               role="button"
@@ -1261,74 +2099,76 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
                 ))}
               </div>
             )}
-            {/* Noise words settings */}
-            <div className="border-t pt-3 space-y-2">
-              <button
-                type="button"
-                onClick={() => setNoiseSettingsOpen(o => !o)}
-                className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground transition-colors"
-              >
-                {noiseSettingsOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-                Word match settings
-              </button>
-              {noiseSettingsOpen && (
-                <div className="space-y-1.5">
-                  <p className="text-[11px] text-muted-foreground">
-                    <span className="font-medium">Noise words</span> — comma-separated. These are stripped before word-level matching.
-                    Word matching requires <span className="font-medium">at least 2</span> meaningful words to match; single-word hits are never used.
-                  </p>
-                  <Textarea
-                    value={noiseWordsInput}
-                    onChange={e => setNoiseWordsInput(e.target.value)}
-                    className="font-mono text-[11px] min-h-[72px]"
-                    placeholder="sa, ltd, inc, corp, …"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setNoiseWordsInput(DEFAULT_NOISE_WORDS.join(', '))}
-                    className="text-[11px] text-primary hover:underline"
-                  >
-                    Reset to defaults
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {/* Ongoing requests CSV — second data point */}
-            <div className="border-t pt-3 space-y-2">
-              <p className="text-xs font-semibold text-foreground">Ongoing requests <span className="font-normal text-muted-foreground">(optional)</span></p>
-              <p className="text-[11px] text-muted-foreground">
-                Upload a 2-column CSV (<span className="font-mono">Supplier, State</span>) of in-progress requests. Suppliers not found in Omnea will be matched against this list as a second data point.
-              </p>
-              <div
-                role="button"
-                tabIndex={0}
-                onClick={() => ongoingInputRef.current?.click()}
-                onKeyDown={e => e.key === 'Enter' && ongoingInputRef.current?.click()}
-                onDragOver={e => e.preventDefault()}
-                onDrop={e => {
-                  e.preventDefault();
-                  const file = e.dataTransfer.files[0];
-                  if (file) parseOngoingCsvFile(file);
-                }}
-                className="border-2 border-dashed rounded-lg p-4 text-center cursor-pointer hover:border-primary/50 hover:bg-muted/30 transition-colors"
-              >
-                <Upload className="h-4 w-4 mx-auto mb-1.5 text-muted-foreground" />
-                {ongoingRequests.length > 0 ? (
-                  <p className="text-sm font-medium text-foreground">
-                    {ongoingFileName} — <span className="text-primary">{ongoingRequests.length} requests loaded</span>
-                  </p>
-                ) : (
-                  <p className="text-sm text-muted-foreground">Drop ongoing requests CSV here or click to browse</p>
+            {isSupplierCsvLookup && (
+              <div className="border-t pt-3 space-y-2">
+                <button
+                  type="button"
+                  onClick={() => setNoiseSettingsOpen(o => !o)}
+                  className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  {noiseSettingsOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                  Word match settings
+                </button>
+                {noiseSettingsOpen && (
+                  <div className="space-y-1.5">
+                    <p className="text-[11px] text-muted-foreground">
+                      <span className="font-medium">Noise words</span> — comma-separated. These are stripped before word-level matching.
+                      Word matching requires <span className="font-medium">at least 2</span> meaningful words to match; single-word hits are never used.
+                    </p>
+                    <Textarea
+                      value={noiseWordsInput}
+                      onChange={e => setNoiseWordsInput(e.target.value)}
+                      className="font-mono text-[11px] min-h-[72px]"
+                      placeholder="sa, ltd, inc, corp, …"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setNoiseWordsInput(DEFAULT_NOISE_WORDS.join(', '))}
+                      className="text-[11px] text-primary hover:underline"
+                    >
+                      Reset to defaults
+                    </button>
+                  </div>
                 )}
-                <input ref={ongoingInputRef} type="file" accept=".csv" className="hidden"
-                  onChange={e => {
-                    const file = e.target.files?.[0];
+              </div>
+            )}
+
+            {isSupplierCsvLookup && (
+              <div className="border-t pt-3 space-y-2">
+                <p className="text-xs font-semibold text-foreground">Ongoing requests <span className="font-normal text-muted-foreground">(optional)</span></p>
+                <p className="text-[11px] text-muted-foreground">
+                  Upload a 2-column CSV (<span className="font-mono">Supplier, State</span>) of in-progress requests. Suppliers not found in Omnea will be matched against this list as a second data point.
+                </p>
+                <div
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => ongoingInputRef.current?.click()}
+                  onKeyDown={e => e.key === 'Enter' && ongoingInputRef.current?.click()}
+                  onDragOver={e => e.preventDefault()}
+                  onDrop={e => {
+                    e.preventDefault();
+                    const file = e.dataTransfer.files[0];
                     if (file) parseOngoingCsvFile(file);
                   }}
-                />
+                  className="border-2 border-dashed rounded-lg p-4 text-center cursor-pointer hover:border-primary/50 hover:bg-muted/30 transition-colors"
+                >
+                  <Upload className="h-4 w-4 mx-auto mb-1.5 text-muted-foreground" />
+                  {ongoingRequests.length > 0 ? (
+                    <p className="text-sm font-medium text-foreground">
+                      {ongoingFileName} — <span className="text-primary">{ongoingRequests.length} requests loaded</span>
+                    </p>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">Drop ongoing requests CSV here or click to browse</p>
+                  )}
+                  <input ref={ongoingInputRef} type="file" accept=".csv" className="hidden"
+                    onChange={e => {
+                      const file = e.target.files?.[0];
+                      if (file) parseOngoingCsvFile(file);
+                    }}
+                  />
+                </div>
               </div>
-            </div>
+            )}
 
             <Button onClick={runCsvLookup} disabled={csvRunning || csvNames.length === 0} size="sm" className="gap-1.5 min-w-[160px]">
               <Loader2 className={`h-3.5 w-3.5 ${csvRunning ? 'animate-spin' : 'hidden'}`} />
@@ -1360,7 +2200,7 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
                     onClick={() => setCsvTableOpen(prev => ({ ...prev, [openKey]: !prev[openKey] }))}
                     className={`w-full flex items-center justify-between px-3 py-2 border-b ${headerColor} hover:brightness-95 transition-all`}
                   >
-                    <p className={`text-xs font-semibold ${textColor}`}>{headerText} — {rows.length} supplier{rows.length !== 1 ? 's' : ''}</p>
+                    <p className={`text-xs font-semibold ${textColor}`}>{headerText} — {rows.length} {csvEntityLabel}{rows.length !== 1 ? 's' : ''}</p>
                     {isOpen ? <ChevronDown className={`h-3.5 w-3.5 ${textColor}`} /> : <ChevronRight className={`h-3.5 w-3.5 ${textColor}`} />}
                   </button>
                   {isOpen && (
@@ -1368,7 +2208,8 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
                       <TableHeader>
                         <TableRow>
                           <TableHead className="text-xs">CSV Name</TableHead>
-                          <TableHead className="text-xs">Omnea Name</TableHead>
+                          <TableHead className="text-xs">{isUserCsvLookup ? 'Matched User' : 'Omnea Name'}</TableHead>
+                          {isUserCsvLookup && <TableHead className="text-xs">Email</TableHead>}
                           <TableHead className="text-xs">Omnea ID</TableHead>
                           <TableHead className="text-xs w-20">Score</TableHead>
                         </TableRow>
@@ -1391,7 +2232,21 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
                                   <span className="text-muted-foreground/40 text-[10px]">↳</span>
                                 )}
                               </TableCell>
-                              <TableCell className="text-xs">{m.name}</TableCell>
+                              <TableCell className="text-xs align-top">
+                                <div className="space-y-0.5">
+                                  <div>{m.name}</div>
+                                  {isUserCsvLookup && (m.firstName || m.lastName) && (
+                                    <div className="text-[11px] text-muted-foreground">
+                                      {[m.firstName, m.lastName].filter(Boolean).join(' ')}
+                                    </div>
+                                  )}
+                                </div>
+                              </TableCell>
+                              {isUserCsvLookup && (
+                                <TableCell className="text-[11px] text-muted-foreground align-top">
+                                  {m.email || '—'}
+                                </TableCell>
+                              )}
                               <TableCell className="text-[11px] font-mono text-muted-foreground">{m.id}</TableCell>
                               <TableCell className="text-xs">
                                 <span className={`font-mono font-semibold ${m.score >= 0.99 ? 'text-green-600' : m.score >= 0.8 ? 'text-amber-600' : 'text-orange-600'}`}>
@@ -1424,7 +2279,7 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
                       {partialResults.length} found partial
                     </Badge>
                   )}
-                  {ongoingResults.length > 0 && (
+                      {isSupplierCsvLookup && ongoingResults.length > 0 && (
                     <Badge className="bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 gap-1">
                       <AlertCircle className="h-3 w-3" />
                       {ongoingResults.length} in ongoing requests
@@ -1458,7 +2313,7 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
                 )}
 
                 {/* In ongoing requests */}
-                {ongoingResults.length > 0 && (() => {
+                {isSupplierCsvLookup && ongoingResults.length > 0 && (() => {
                   const isOpen = csvTableOpen.ongoing;
                   return (
                     <Card className="overflow-hidden">
@@ -1508,7 +2363,7 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
                         onClick={() => setCsvTableOpen(prev => ({ ...prev, notFound: !prev.notFound }))}
                         className="w-full flex items-center justify-between px-3 py-2 border-b bg-red-50 dark:bg-red-950/20 border-red-200 dark:border-red-800 hover:brightness-95 transition-all"
                       >
-                        <p className="text-xs font-semibold text-red-700 dark:text-red-400">Not found in Omnea or ongoing requests — {notFoundResults.length} supplier{notFoundResults.length !== 1 ? 's' : ''}</p>
+                        <p className="text-xs font-semibold text-red-700 dark:text-red-400">Not found in Omnea{isSupplierCsvLookup ? ' or ongoing requests' : ''} — {notFoundResults.length} {csvEntityLabel}{notFoundResults.length !== 1 ? 's' : ''}</p>
                         {isOpen ? <ChevronDown className="h-3.5 w-3.5 text-red-700 dark:text-red-400" /> : <ChevronRight className="h-3.5 w-3.5 text-red-700 dark:text-red-400" />}
                       </button>
                       {isOpen && (
@@ -1534,8 +2389,89 @@ const OmneaEndpointDetail = ({ endpoint, onResponse }: Props) => {
             );
           })()}
         </div>
+      ) : isPaginatedEndpoint ? (
+        <Card className="border-border/70 bg-secondary/20 p-3">
+          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <p className="text-xs font-semibold text-foreground">Pagination</p>
+                {paginationMode === "page" && pageNumber > 0 && (
+                  <span className="rounded-full bg-background px-2 py-0.5 text-[10px] font-medium text-muted-foreground border border-border/70">
+                    Page {pageNumber}
+                  </span>
+                )}
+                {paginationMode === "all" && totalItems !== null && (
+                  <span className="rounded-full bg-background px-2 py-0.5 text-[10px] font-medium text-muted-foreground border border-border/70">
+                    {totalItems} items
+                  </span>
+                )}
+              </div>
+              <p className="text-[11px] leading-5 text-muted-foreground">
+                {paginationMode === "all" && totalItems !== null && pageCount !== null
+                  ? `Loaded all ${totalItems} items across ${pageCount} pages.`
+                  : paginationMode === "page" && pageNumber > 0
+                    ? `Viewing page ${pageNumber}${totalItems !== null ? ` with ${totalItems} items` : ""}.${nextCursor ? " More pages available." : " End of results."}`
+                    : "Choose all pages or browse page by page."}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {supportsSupplierContactAggregation && supportsSupplierPicker && (
+                <Button onClick={runAcrossAllSuppliers} disabled={loading} size="sm" variant="secondary" className="h-8 px-2.5 text-xs">
+                  {loading && paginationMode === "all" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Building2 className="h-3.5 w-3.5" />}
+                  Fetch all suppliers' contacts
+                </Button>
+              )}
+              {paginationMode === "page" && pageNumber > 0 ? (
+                <>
+                  <div className="flex items-center gap-1 rounded-md border border-border bg-background p-1">
+                    <Button
+                      onClick={() => run("previous")}
+                      disabled={loading || pageNumber <= 1}
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2 text-xs"
+                    >
+                      {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ChevronDown className="h-3.5 w-3.5 -rotate-90" />}
+                      Prev
+                    </Button>
+                    <Button
+                      onClick={() => run("next")}
+                      disabled={loading || !nextCursor}
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2 text-xs"
+                    >
+                      Next
+                      {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                    </Button>
+                  </div>
+                  {pageNumber > 1 && (
+                    <Button
+                      onClick={() => run("single")}
+                      disabled={loading}
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2 text-xs text-muted-foreground"
+                    >
+                      Reset
+                    </Button>
+                  )}
+                </>
+              ) : (
+                <Button onClick={() => run("single")} disabled={loading} size="sm" variant="outline" className="h-8 px-2.5 text-xs">
+                  {loading && paginationMode !== "all" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+                  Browse
+                </Button>
+              )}
+              <Button onClick={() => run("all")} disabled={loading} size="sm" className="h-8 px-2.5 text-xs">
+                {loading && paginationMode === "all" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+                Fetch all
+              </Button>
+            </div>
+          </div>
+        </Card>
       ) : (
-        <Button onClick={run} disabled={loading} size="sm">
+        <Button onClick={() => run("single")} disabled={loading} size="sm">
           {loading ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <Play className="h-3.5 w-3.5 mr-1.5" />}
           Send Request
         </Button>

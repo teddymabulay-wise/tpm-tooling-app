@@ -18,6 +18,7 @@
     "release:auto": "bash scripts/release.sh"
   },
   "dependencies": {
+    "@api/omnea-public-api-ultm": "file:.api/apis/omnea-public-api-ultm",
     "@hookform/resolvers": "^3.10.0",
     "@radix-ui/react-accordion": "^1.2.11",
     "@radix-ui/react-alert-dialog": "^1.1.14",

@@ -11,6 +11,7 @@ type ParsedCsv = {
 type HeaderMapping = {
   key: string
   isQuestion: boolean
+  aliases: string[]
 }
 
 type MergedRequestAccumulator = {
@@ -104,18 +105,41 @@ function normalizeCell(value: string | undefined): string {
 
 function extractHeaderMapping(header: string): HeaderMapping {
   const trimmed = header.trim()
-  const parenMatch = trimmed.match(/\(([^)]+)\)\s*$/)
+  const trailingBracketMatch = trimmed.match(/[\[(]([^\[\]()]+)[\])]\s*$/)
+  const anyBracketMatches = Array.from(trimmed.matchAll(/[\[(]([^\[\]()]+)[\])]/g))
+  const inferredQuestionId = trailingBracketMatch?.[1]?.trim() ?? anyBracketMatches.at(-1)?.[1]?.trim() ?? null
 
-  if (parenMatch) {
+  const aliases = (() => {
+    if (!inferredQuestionId) return [trimmed]
+
+    const normalized = inferredQuestionId.replace(/\s+/g, ' ').trim()
+    return Array.from(new Set([
+      normalized,
+      normalized.toLowerCase(),
+      trimmed,
+      trimmed.toLowerCase(),
+    ]))
+  })()
+
+  if (inferredQuestionId) {
     return {
-      key: parenMatch[1].trim(),
+      key: inferredQuestionId,
       isQuestion: true,
+      aliases,
     }
   }
 
   return {
     key: trimmed,
     isQuestion: false,
+    aliases: [trimmed],
+  }
+}
+
+function mergeAnswerIfEmpty(target: QuestionAnswerMap, key: string, value: string): void {
+  if (!key || !value) return
+  if (!target[key]) {
+    target[key] = value
   }
 }
 
@@ -180,8 +204,12 @@ export function parseRequestStepsCsv(csvText: string): ParsedRequest[] {
 
         if (!rawValue) continue
 
-        if (!rowAnswers[mapping.key]) {
-          rowAnswers[mapping.key] = rawValue
+        if (mapping.isQuestion) {
+          mapping.aliases.forEach((alias) => {
+            mergeAnswerIfEmpty(rowAnswers, alias, rawValue)
+          })
+        } else {
+          mergeAnswerIfEmpty(rowAnswers, mapping.key, rawValue)
         }
       }
 
@@ -239,10 +267,14 @@ export function parseRequestStepsCsv(csvText: string): ParsedRequest[] {
           supplierIdentifiers: Array.from(request.supplierIdentifiers),
           completedAt: request.completedAt,
           answers,
-          actualTagsRaw: answers['Tags TPs'] ?? null,
-          actualMaterialityFromRequest: answers['866e08ac-b83b-41ee-8f0d-c45e0689b5e1'] ?? null,
-          infoSecCriticalityTier: answers['2eda8d5e-4752-4f9b-9788-e64ad5b235e7'] ?? null,
-          infoSecSensitivityTier: answers['2a1bff47-835c-4fb4-9217-52550d61427c'] ?? null,
+          actualTagsRaw: answers['Tags TPs'] ?? answers['tags'] ?? null,
+          actualMaterialityFromRequest:
+            answers['866e08ac-b83b-41ee-8f0d-c45e0689b5e1'] ??
+            answers['Request: Materiality level (866e08ac-b83b-41ee-8f0d-c45e0689b5e1)'] ??
+            answers['request: materiality level (866e08ac-b83b-41ee-8f0d-c45e0689b5e1)'] ??
+            null,
+          infoSecCriticalityTier: answers['2eda8d5e-4752-4f9b-9788-e64ad5b235e7'] ?? answers['infosec criticality tier'] ?? null,
+          infoSecSensitivityTier: answers['2a1bff47-835c-4fb4-9217-52550d61427c'] ?? answers['infosec sensitivity tier'] ?? null,
         }
       })
       .sort((left, right) => left.requestId.localeCompare(right.requestId))

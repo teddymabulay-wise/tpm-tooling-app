@@ -9,6 +9,7 @@ interface CSVUploaderProps {
   description?: string;
   defaultOpen?: boolean;
   onFileLoaded?: (text: string, fileName: string) => void;
+  showPreviewTable?: boolean;
 }
 
 interface MappedRow {
@@ -23,6 +24,7 @@ export const CSVUploader = ({
   description = "or click to browse — maps legalName, taxNumber, address automatically",
   defaultOpen = false,
   onFileLoaded,
+  showPreviewTable = true,
 }: CSVUploaderProps) => {
   const [dragOver, setDragOver] = useState(false);
   const [rows, setRows] = useState<MappedRow[]>([]);
@@ -117,26 +119,28 @@ export const CSVUploader = ({
               </div>
             )}
           </div>
-          <div className="rounded-md border overflow-hidden">
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="bg-secondary">
-                  <th className="px-3 py-2 text-left font-medium text-field-label">Legal Name</th>
-                  <th className="px-3 py-2 text-left font-medium text-field-label">Tax Number</th>
-                  <th className="px-3 py-2 text-left font-medium text-field-label">Address</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.slice(0, 5).map((row, i) => (
-                  <tr key={i} className="border-t">
-                    <td className="px-3 py-2 text-field-value">{row.legalName || "—"}</td>
-                    <td className="px-3 py-2 font-mono text-field-value">{row.taxNumber || "—"}</td>
-                    <td className="px-3 py-2 text-field-value truncate max-w-[200px]">{row.address || "—"}</td>
+          {showPreviewTable ? (
+            <div className="rounded-md border overflow-hidden">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="bg-secondary">
+                    <th className="px-3 py-2 text-left font-medium text-field-label">Legal Name</th>
+                    <th className="px-3 py-2 text-left font-medium text-field-label">Tax Number</th>
+                    <th className="px-3 py-2 text-left font-medium text-field-label">Address</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {rows.slice(0, 5).map((row, i) => (
+                    <tr key={i} className="border-t">
+                      <td className="px-3 py-2 text-field-value">{row.legalName || "—"}</td>
+                      <td className="px-3 py-2 font-mono text-field-value">{row.taxNumber || "—"}</td>
+                      <td className="px-3 py-2 text-field-value truncate max-w-[200px]">{row.address || "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
           <Button
             variant="outline"
             size="sm"

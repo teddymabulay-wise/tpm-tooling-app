@@ -1,4 +1,5 @@
 import type { DerivedTagSet, QuestionAnswerMap, TagAnalysis, TagConditionAnalysis } from '../types/audit.types'
+import type { FlowTag } from '../../../../lib/flows-metadata-types'
 import { getBspMarketTier, parseCurrencyAnswer } from './constants/bankingMarketTiers'
 
 type Operator =
@@ -17,7 +18,10 @@ interface TagDefinition {
   tagName: string
   conditions: TagCondition[]
   conditionLogic?: 'AND' | 'OR'
+  conditionGroups?: TagCondition[][]
 }
+
+type FlowTagRuleSource = Pick<FlowTag, 'tagName' | 'tagConditions'>
 
 function dedupeConditions(conditions: TagCondition[]): TagCondition[] {
   const seen = new Set<string>()
@@ -29,11 +33,27 @@ function dedupeConditions(conditions: TagCondition[]): TagCondition[] {
   })
 }
 
-function makeTag(tagName: string, conditions: TagCondition[], conditionLogic: 'AND' | 'OR' = 'AND'): TagDefinition {
+function normalizeConditionGroups(conditionGroups?: TagCondition[][]): TagCondition[][] | undefined {
+  if (!conditionGroups || conditionGroups.length === 0) return undefined
+
+  const normalized = conditionGroups
+    .map((group) => dedupeConditions(group))
+    .filter((group) => group.length > 0)
+
+  return normalized.length > 0 ? normalized : undefined
+}
+
+function makeTag(
+  tagName: string,
+  conditions: TagCondition[],
+  conditionLogic: 'AND' | 'OR' = 'AND',
+  conditionGroups?: TagCondition[][],
+): TagDefinition {
   return {
     tagName,
     conditionLogic,
     conditions: dedupeConditions(conditions),
+    conditionGroups: normalizeConditionGroups(conditionGroups),
   }
 }
 
@@ -203,6 +223,192 @@ const TAG_DEFINITIONS: TagDefinition[] = [
     { questionId: '__infoSecScore__', operator: 'EQUAL', value: '0' },
   ]),
 ]
+
+function inferConditionLogicFromRawCondition(rawCondition: string): 'AND' | 'OR' {
+  try {
+    const parsed = JSON.parse(rawCondition) as { type?: unknown }
+    return parsed.type === 'OR' ? 'OR' : 'AND'
+  } catch {
+    return /\bOR\b/i.test(rawCondition) ? 'OR' : 'AND'
+  }
+}
+
+const PARSE_OPERATORS: Operator[] = [
+  'LESS_THAN_OR_EQUAL_TO',
+  'GREATER_THAN_OR_EQUAL_TO',
+  'NOT_CONTAINS',
+  'NOT_EQUAL',
+  'LESS_THAN',
+  'GREATER_THAN',
+  'CONTAINS',
+  'EQUAL',
+]
+
+function parseConditionToken(segment: string): TagCondition | null {
+  const token = segment.trim()
+  if (!token) return null
+
+  const operator = PARSE_OPERATORS.find((candidate) => token.includes(` ${candidate} `))
+  if (!operator) return null
+
+  const [left, ...rightParts] = token.split(` ${operator} `)
+  const questionId = left.trim()
+  const value = rightParts.join(` ${operator} `).trim()
+
+  if (!questionId || !value) return null
+
+  return {
+    questionId,
+    operator,
+    value,
+  }
+}
+
+function parseFlowTagConditionGroups(rawCondition: string): TagCondition[][] {
+  const finalizeGroups = (groups: TagCondition[][]): TagCondition[][] =>
+    normalizeConditionGroups(groups) ?? []
+
+  const parsePlainText = (): TagCondition[][] => {
+    const cleaned = rawCondition.replace(/[()]/g, ' ').replace(/\s+/g, ' ').trim()
+    if (!cleaned) return []
+
+    const groups = cleaned
+      .split(/\s+OR\s+/i)
+      .map((orSegment) =>
+        orSegment
+          .split(/\s+AND\s+/i)
+          .map((andSegment) => parseConditionToken(andSegment))
+          .filter((condition): condition is TagCondition => Boolean(condition))
+      )
+
+    return finalizeGroups(groups)
+  }
+
+  try {
+    const parsed = JSON.parse(rawCondition)
+
+    const combineAndGroups = (groupSets: TagCondition[][][]): TagCondition[][] => {
+      if (groupSets.length === 0) return []
+
+      return groupSets.reduce<TagCondition[][]>((accumulator, groupSet) => {
+        if (accumulator.length === 0) return groupSet
+        if (groupSet.length === 0) return accumulator
+
+        const combined: TagCondition[][] = []
+        accumulator.forEach((leftGroup) => {
+          groupSet.forEach((rightGroup) => {
+            combined.push([...leftGroup, ...rightGroup])
+          })
+        })
+        return combined
+      }, [])
+    }
+
+    const walk = (node: unknown): TagCondition[][] => {
+      if (!node || typeof node !== 'object') return []
+
+      const record = node as {
+        type?: unknown
+        operator?: unknown
+        primaryField?: Record<string, unknown>
+        secondaryField?: { value?: unknown; id?: unknown; source?: unknown }
+        items?: unknown
+        comparisons?: unknown
+      }
+
+      if (record.primaryField && typeof record.primaryField === 'object' && typeof record.operator === 'string') {
+        const questionId =
+          typeof record.primaryField.questionId === 'string' ? record.primaryField.questionId
+            : typeof record.primaryField.value === 'string' ? record.primaryField.value
+            : typeof record.primaryField.source === 'string' ? record.primaryField.source
+            : ''
+
+        const secondaryValue = record.secondaryField && typeof record.secondaryField === 'object'
+          ? record.secondaryField.value ?? record.secondaryField.id ?? record.secondaryField.source
+          : undefined
+
+        if (questionId && secondaryValue != null) {
+          return [[{
+            questionId,
+            operator: record.operator as Operator,
+            value: String(secondaryValue),
+          }]]
+        }
+
+        return []
+      }
+
+      const childrenRaw = [record.items, record.comparisons]
+      const childNodes: unknown[] = []
+      childrenRaw.forEach((child) => {
+        if (Array.isArray(child)) childNodes.push(...child)
+      })
+
+      if (childNodes.length === 0) return []
+
+      const childGroups = childNodes.map((child) => walk(child)).filter((groups) => groups.length > 0)
+      if (childGroups.length === 0) return []
+
+      if (record.type === 'OR') {
+        return finalizeGroups(childGroups.flat())
+      }
+
+      if (record.type === 'AND') {
+        return finalizeGroups(combineAndGroups(childGroups))
+      }
+
+      return finalizeGroups(childGroups.flat())
+    }
+
+    const groups = walk(parsed)
+    if (groups.length > 0) return groups
+  } catch {
+    // Fall back to plain-text parsing below.
+  }
+
+  return parsePlainText()
+}
+
+function parseFlowTagConditions(rawCondition: string): TagCondition[] {
+  return dedupeConditions(parseFlowTagConditionGroups(rawCondition).flat())
+}
+
+export function buildTagDefinitionsFromFlowTags(tags: FlowTagRuleSource[]): TagDefinition[] {
+  const failedTags: string[] = []
+
+  const definitions = tags
+    .map((tag) => {
+      const conditionGroups = parseFlowTagConditionGroups(tag.tagConditions)
+      const conditions = dedupeConditions(conditionGroups.flat())
+
+      if (conditions.length === 0) {
+        failedTags.push(tag.tagName)
+        return null
+      }
+
+      const inferredLogic =
+        conditionGroups.length > 1
+          ? 'OR'
+          : (conditionGroups[0]?.length ?? 0) > 1
+            ? 'AND'
+            : inferConditionLogicFromRawCondition(tag.tagConditions)
+
+      return makeTag(tag.tagName, conditions, inferredLogic, conditionGroups)
+    })
+    .filter((tag): tag is TagDefinition => Boolean(tag))
+
+  if (failedTags.length > 0) {
+    const preview = failedTags.slice(0, 8).join(', ')
+    const suffix = failedTags.length > 8 ? ` (+${failedTags.length - 8} more)` : ''
+    throw new Error(`Failed to parse tag conditions from Omnea Tag Meta data for: ${preview}${suffix}.`)
+  }
+
+  return definitions
+}
+
+function resolveTagDefinitions(overrideTagDefinitions?: TagDefinition[]): TagDefinition[] {
+  return overrideTagDefinitions ?? []
+}
 
 const CIF_SUB_FUNCTIONS: string[] = [
   'Account Balance Management',
@@ -449,6 +655,38 @@ function normalizeAnswer(raw: string | null | undefined): string {
   return trimmed
 }
 
+function normalizeQuestionKey(raw: string): string {
+  const trimmed = raw.trim()
+  if (!trimmed) return ''
+
+  const unwrapped =
+    (trimmed.startsWith('(') && trimmed.endsWith(')')) ||
+    (trimmed.startsWith('[') && trimmed.endsWith(']'))
+      ? trimmed.slice(1, -1)
+      : trimmed
+
+  return unwrapped.replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+function getAnswerValue(answers: QuestionAnswerMap, questionId: string): string {
+  const direct = answers[questionId]
+  if (direct != null) return direct
+
+  const lowered = answers[questionId.toLowerCase()]
+  if (lowered != null) return lowered
+
+  const target = normalizeQuestionKey(questionId)
+  if (!target) return ''
+
+  for (const [key, value] of Object.entries(answers)) {
+    if (normalizeQuestionKey(key) === target) {
+      return value
+    }
+  }
+
+  return ''
+}
+
 function formatAnswerForAnalysis(raw: string | null | undefined): string | null {
   const trimmed = (raw ?? '').trim()
   if (!trimmed) return null
@@ -484,7 +722,7 @@ function getMainAssessmentSubFunctionAnswers(answers: QuestionAnswerMap): string
 
   for (let index = 1; index <= 30; index += 1) {
     const key = `MainAssessmentQ${index}`
-    const value = normalizeAnswer(answers[key])
+    const value = normalizeAnswer(getAnswerValue(answers, key))
     if (value) {
       values.push(value)
     }
@@ -542,7 +780,7 @@ function formatOperator(operator: Operator): string {
 }
 
 function buildConditionAnalysis(condition: TagCondition, answers: QuestionAnswerMap): TagConditionAnalysis {
-  const actualValue = formatAnswerForAnalysis(answers[condition.questionId])
+  const actualValue = formatAnswerForAnalysis(getAnswerValue(answers, condition.questionId))
   const evaluation = evaluateCondition(condition, answers)
 
   return {
@@ -633,10 +871,13 @@ function buildSpecialTagAnalysis(
 
 export function analyzeTagDerivations(
   answers: QuestionAnswerMap,
+  overrideTagDefinitions?: TagDefinition[],
   infoSecCriticalityTier?: string | null,
   infoSecSensitivityTier?: string | null
 ): TagAnalysis[] {
-  return TAG_DEFINITIONS.map((tag) => {
+  const tagDefinitions = resolveTagDefinitions(overrideTagDefinitions)
+
+  return tagDefinitions.map((tag) => {
     if (tag.conditions.some((condition) => SPECIAL_QUESTION_IDS.has(condition.questionId))) {
       return buildSpecialTagAnalysis(tag, answers, infoSecCriticalityTier, infoSecSensitivityTier)
     }
@@ -670,7 +911,7 @@ export function evaluateCondition(condition: TagCondition, answers: QuestionAnsw
     return 'skip'
   }
 
-  const raw = normalizeAnswer(answers[condition.questionId])
+  const raw = normalizeAnswer(getAnswerValue(answers, condition.questionId))
   if (!raw) return 'skip'
 
   const rawLower = raw.toLowerCase()
@@ -716,6 +957,30 @@ export function evaluateCondition(condition: TagCondition, answers: QuestionAnsw
 }
 
 export function evaluateTag(tag: TagDefinition, answers: QuestionAnswerMap): 'true' | 'false' | 'cannot-derive' {
+  if (tag.conditionGroups && tag.conditionGroups.length > 0) {
+    let hasUnknownGroup = false
+
+    const evaluateGroup = (group: TagCondition[]): 'true' | 'false' | 'cannot-derive' => {
+      let hasSkip = false
+
+      for (const condition of group) {
+        const conditionResult = evaluateCondition(condition, answers)
+        if (conditionResult === false) return 'false'
+        if (conditionResult === 'skip') hasSkip = true
+      }
+
+      return hasSkip ? 'cannot-derive' : 'true'
+    }
+
+    for (const group of tag.conditionGroups) {
+      const groupResult = evaluateGroup(group)
+      if (groupResult === 'true') return 'true'
+      if (groupResult === 'cannot-derive') hasUnknownGroup = true
+    }
+
+    return hasUnknownGroup ? 'cannot-derive' : 'false'
+  }
+
   const logic = tag.conditionLogic ?? 'AND'
   const evaluated = tag.conditions.map((condition) => evaluateCondition(condition, answers))
   const nonSkip = evaluated.filter((result) => result !== 'skip')
@@ -737,28 +1002,30 @@ export function evaluateTag(tag: TagDefinition, answers: QuestionAnswerMap): 'tr
 
 export function deriveAllTags(
   answers: QuestionAnswerMap,
+  overrideTagDefinitions?: TagDefinition[],
   infoSecCriticalityTier?: string | null,
   infoSecSensitivityTier?: string | null
 ): DerivedTagSet {
+  const tagDefinitions = resolveTagDefinitions(overrideTagDefinitions)
   const results = new Map<string, 'true' | 'false' | 'cannot-derive'>()
 
-  TAG_DEFINITIONS.forEach((tag) => {
+  tagDefinitions.forEach((tag) => {
     results.set(tag.tagName, evaluateTag(tag, answers))
   })
 
-  const cannotDerive = TAG_DEFINITIONS
+  const cannotDerive = tagDefinitions
     .filter((tag) => results.get(tag.tagName) === 'cannot-derive' && !tag.conditions.some((condition) => SPECIAL_QUESTION_IDS.has(condition.questionId)))
     .map((tag) => tag.tagName)
 
-  const bspMarketTier = getBspMarketTier(parseCurrencyAnswer(answers['mainAssessmentBankingQuestion2'] ?? ''))
+  const bspMarketTier = getBspMarketTier(parseCurrencyAnswer(getAnswerValue(answers, 'mainAssessmentBankingQuestion2')))
   const cif = hasAnyMatchingSubFunction(answers, CIF_SUB_FUNCTIONS)
   const supportive = !cif && hasAnyMatchingSubFunction(answers, SUPPORTIVE_SUB_FUNCTIONS)
   const outsourcing = hasAnyMatchingSubFunction(answers, OUTSOURCING_SUB_FUNCTIONS)
 
   const tierLetter = getInfoSecTierLetter(infoSecCriticalityTier, infoSecSensitivityTier)
 
-  const bankingSubFunctions = splitMultiValueAnswer(answers['mainAssessmentBanking-MainAssessmentSection1-question-7'] ?? '')
-  const contractingEntity = (answers['buyerLegalEntity'] ?? answers['Which Wise Entity is the contracting party'] ?? '').trim() || null
+  const bankingSubFunctions = splitMultiValueAnswer(getAnswerValue(answers, 'mainAssessmentBanking-MainAssessmentSection1-question-7'))
+  const contractingEntity = (getAnswerValue(answers, 'buyerLegalEntity') || getAnswerValue(answers, 'Which Wise Entity is the contracting party')).trim() || null
 
   const criticalityTier =
     results.get('Criticality = Tier 1') === 'true' ? 1 :

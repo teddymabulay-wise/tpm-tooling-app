@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
-import { Check, Copy, Loader2, Search, Settings, TrendingUp, X, ZoomIn } from "lucide-react";
+import { AlertTriangle, Check, Copy, Loader2, Search, Settings, TrendingUp, X, ZoomIn } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 
 import { Badge } from "@/components/ui/badge";
@@ -12,8 +12,8 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { CollapsibleSection } from "@/components/CollapsibleSection";
-import type { FlowMetadata, FlowTag } from "@/lib/flows-metadata-types";
-import { parseFlowTagsCSV, parseFlowsMetadataCSV } from "@/lib/flows-metadata-utils";
+import type { FlowBlockStructure, FlowMetadata, FlowTag } from "@/lib/flows-metadata-types";
+import { parseFlowBlockStructureCSV, parseFlowTagsCSV, parseFlowsMetadataCSV } from "@/lib/flows-metadata-utils";
 
 type FilterField =
   | "workflow"
@@ -81,6 +81,78 @@ const FILTER_CARD_MAX_VISIBLE_ROWS = 5;
 const FILTER_CARD_ROW_HEIGHT = 64;
 
 type TagConditionReference = { questionId: string; value: string; operator: string; connector?: "AND" | "OR" };
+
+type LogicIssue = {
+  type: "single-select-and-conflict" | "single-select-or-negative-tautology" | "numeric-contradiction";
+  questionId: string;
+  questionTitle: string;
+  questionType: string;
+  values: string[];
+  message: string;
+};
+
+type DependencyBlockImpact = {
+  key: string;
+  workflow: string;
+  blockName: string;
+  blockType: string;
+  expression: string;
+  sourceQuestionIds: string[];
+  nextBlocks: string[];
+};
+
+type DependencyQuestionImpact = {
+  key: string;
+  workflow: string;
+  blockName: string;
+  formName: string;
+  formSection: string;
+  questionId: string;
+  questionTitle: string;
+  expression: string;
+  sourceQuestionIds: string[];
+};
+
+type DependencyRouteImpact = {
+  key: string;
+  workflow: string;
+  fromBlock: string;
+  toBlock: string;
+};
+
+type DependencyQuestionInBlock = {
+  key: string;
+  workflow: string;
+  blockName: string;
+  formName: string;
+  formSection: string;
+  questionId: string;
+  questionTitle: string;
+};
+
+type DependencyImpactModel = {
+  mode: "empty" | "question" | "block";
+  workflowScope: string | null;
+  focusQuestionId: string;
+  focusQuestionTitle: string;
+  focusBlockName: string;
+  focusBlockType: string;
+  visitedQuestionIds: string[];
+  drivingBlocks: DependencyBlockImpact[];
+  downstreamQuestions: DependencyQuestionImpact[];
+  upstreamQuestions: DependencyQuestionImpact[];
+  questionsInBlock: DependencyQuestionInBlock[];
+  relatedRoutes: DependencyRouteImpact[];
+};
+
+type ImpactCardItem = {
+  key: string;
+  title: string;
+  subtitle?: string;
+  body?: string;
+  badges?: string[];
+  onClick?: () => void;
+};
 
 function extractTagConditionReferences(rawCondition: string): Array<TagConditionReference> {
   const results: Array<TagConditionReference> = [];
@@ -262,14 +334,19 @@ function FlowsMetadataViewPage() {
   const navigate = useNavigate();
   const [data, setData] = useState<FlowMetadata[]>([]);
   const [tagData, setTagData] = useState<FlowTag[]>([]);
+  const [blockStructureData, setBlockStructureData] = useState<FlowBlockStructure[]>([]);
   const [loading, setLoading] = useState(true);
   const [filters, setFilters] = useState<Partial<Record<FilterField, string>>>({});
   const [searchText, setSearchText] = useState("");
   const [questionIdMultiFilter, setQuestionIdMultiFilter] = useState<string[]>([]);
   const [activeTagFilterKey, setActiveTagFilterKey] = useState<string | null>(null);
   const [activeLogicFilterKey, setActiveLogicFilterKey] = useState<string | null>(null);
+  const [showOnlyLogicIssues, setShowOnlyLogicIssues] = useState(false);
   const [copied, setCopied] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [dependencyQuestionId, setDependencyQuestionId] = useState<string>(ALL_VALUE);
+  const [dependencyBlockName, setDependencyBlockName] = useState<string>(ALL_VALUE);
+  const [activeTopTab, setActiveTopTab] = useState("editable-metadata-table");
   const [logicModal, setLogicModal] = useState<{
     title: string;
     groupLabel: string;
@@ -278,15 +355,17 @@ function FlowsMetadataViewPage() {
     rawLogic: string;
     parsed: unknown;
     details: { pairs: Array<{ question: string; value: string }>; questions: string[]; values: string[] };
+    issues?: LogicIssue[];
     tagReferences?: Array<{ questionId: string; value: string; operator: string; form: string; questionTitle: string }>;
   } | null>(null);
 
   useEffect(() => {
     const load = async () => {
       try {
-        const [metadataResponse, tagsResponse] = await Promise.all([
+        const [metadataResponse, tagsResponse, blockStructureResponse] = await Promise.all([
           fetch("/doc/Omnea Flow Meta Data.csv"),
           fetch("/doc/Omnea Tag Meta data.csv").catch(() => null),
+          fetch("/doc/Omnea Block Structure.csv").catch(() => null),
         ]);
 
         if (metadataResponse.ok) {
@@ -298,6 +377,11 @@ function FlowsMetadataViewPage() {
           const tagsText = await tagsResponse.text();
           setTagData(parseFlowTagsCSV(tagsText));
         }
+
+        if (blockStructureResponse && blockStructureResponse.ok) {
+          const blockStructureText = await blockStructureResponse.text();
+          setBlockStructureData(parseFlowBlockStructureCSV(blockStructureText));
+        }
       } catch (error) {
         console.error("Failed to load metadata view:", error);
       } finally {
@@ -308,7 +392,7 @@ function FlowsMetadataViewPage() {
     void load();
   }, []);
 
-  const filteredData = useMemo(() => {
+  const filteredDataBase = useMemo(() => {
     return data.filter((record) => {
       for (const [field, value] of Object.entries(filters) as Array<[FilterField, string]>) {
         if (!matchesField(record, field, value)) {
@@ -353,7 +437,7 @@ function FlowsMetadataViewPage() {
 
   // Card option lists should not collapse when questionIdMultiFilter is active —
   // use data filtered by all criteria except the multi-filter.
-  const filteredDataForCards = useMemo(() => {
+  const filteredDataForCardsBase = useMemo(() => {
     return data.filter((record) => {
       for (const [field, value] of Object.entries(filters) as Array<[FilterField, string]>) {
         if (!matchesField(record, field, value)) {
@@ -374,13 +458,13 @@ function FlowsMetadataViewPage() {
   }, [data, filters, searchText]);
 
   // For Block/Question Logic Condition cards: apply questionIdMultiFilter when any card-level filter is active.
-  const filteredDataForLogicCards = useMemo(() => {
-    if ((!activeTagFilterKey && !activeLogicFilterKey) || questionIdMultiFilter.length === 0) return filteredDataForCards;
-    return filteredDataForCards.filter((record) => {
+  const filteredDataForLogicCardsBase = useMemo(() => {
+    if ((!activeTagFilterKey && !activeLogicFilterKey) || questionIdMultiFilter.length === 0) return filteredDataForCardsBase;
+    return filteredDataForCardsBase.filter((record) => {
       const recId = getFieldValue(record, "questionId");
       return questionIdMultiFilter.includes(recId);
     });
-  }, [filteredDataForCards, activeTagFilterKey, activeLogicFilterKey, questionIdMultiFilter]);
+  }, [filteredDataForCardsBase, activeTagFilterKey, activeLogicFilterKey, questionIdMultiFilter]);
 
   const toolbarOptions = useMemo(() => {
     const buildOptions = (field: ToolbarField) => {
@@ -449,6 +533,82 @@ function FlowsMetadataViewPage() {
     { label: "Question ID", field: "questionId" },
     { label: "Core Data Source", field: "coreDataSource" },
   ];
+
+  const questionTitleMap = useMemo(() => {
+    const map = new Map<string, string>();
+    data.forEach((record) => {
+      const id = normalizeValue(record.questionId);
+      const title = normalizeValue(record.questionTitle);
+      if (id !== EMPTY_VALUE && title !== EMPTY_VALUE && !map.has(id)) {
+        map.set(id, title);
+      }
+    });
+    return map;
+  }, [data]);
+
+  const questionTypeMap = useMemo(() => {
+    const map = new Map<string, string>();
+    data.forEach((record) => {
+      const id = normalizeValue(record.questionId);
+      const type = normalizeValue(record.questionType);
+      if (id !== EMPTY_VALUE && type !== EMPTY_VALUE && !map.has(id)) {
+        map.set(id, type);
+      }
+    });
+    return map;
+  }, [data]);
+
+  const logicIssuesByJson = useMemo(() => {
+    const map = new Map<string, LogicIssue[]>();
+    data.forEach((record) => {
+      [record.blockLogicCondition, record.formSectionLogicCondition, record.questionLogicCondition].forEach((logicJson) => {
+        const raw = normalizeString(logicJson);
+        if (!raw || raw === "na" || map.has(raw)) return;
+
+        let parsed: unknown = null;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          parsed = null;
+        }
+
+        map.set(raw, detectLogicIssues(parsed, questionTypeMap, questionTitleMap));
+      });
+    });
+    return map;
+  }, [data, questionTitleMap, questionTypeMap]);
+
+  const getLogicIssuesForRawLogic = (rawLogic: string | undefined) => {
+    const raw = normalizeString(rawLogic);
+    if (!raw) return [] as LogicIssue[];
+    return logicIssuesByJson.get(raw) ?? [];
+  };
+
+  const filteredData = useMemo(
+    () => (showOnlyLogicIssues
+      ? filteredDataBase.filter((record) => getLogicIssuesForRawLogic(record.questionLogicCondition).length > 0)
+      : filteredDataBase),
+    [filteredDataBase, showOnlyLogicIssues, logicIssuesByJson],
+  );
+
+  const filteredDataForCards = useMemo(
+    () => (showOnlyLogicIssues
+      ? filteredDataForCardsBase.filter((record) => getLogicIssuesForRawLogic(record.questionLogicCondition).length > 0)
+      : filteredDataForCardsBase),
+    [filteredDataForCardsBase, showOnlyLogicIssues, logicIssuesByJson],
+  );
+
+  const filteredDataForLogicCards = useMemo(
+    () => (showOnlyLogicIssues
+      ? filteredDataForLogicCardsBase.filter((record) => getLogicIssuesForRawLogic(record.questionLogicCondition).length > 0)
+      : filteredDataForLogicCardsBase),
+    [filteredDataForLogicCardsBase, showOnlyLogicIssues, logicIssuesByJson],
+  );
+
+  const scopedLogicIssueCount = useMemo(
+    () => filteredDataBase.filter((record) => getLogicIssuesForRawLogic(record.questionLogicCondition).length > 0).length,
+    [filteredDataBase, logicIssuesByJson],
+  );
 
   const coreDataWithSource = useMemo(
     () => filteredData.filter((record) => normalizeString(record.coreDataSource) !== ""),
@@ -524,18 +684,6 @@ function FlowsMetadataViewPage() {
     [coreDataWithSource, filteredData],
   );
 
-  const questionTitleMap = useMemo(() => {
-    const map = new Map<string, string>();
-    data.forEach((record) => {
-      const id = normalizeValue(record.questionId);
-      const title = normalizeValue(record.questionTitle);
-      if (id !== EMPTY_VALUE && title !== EMPTY_VALUE && !map.has(id)) {
-        map.set(id, title);
-      }
-    });
-    return map;
-  }, [data]);
-
   const questionDescriptionMap = useMemo(() => {
     const map = new Map<string, string>();
     data.forEach((record) => {
@@ -567,7 +715,7 @@ function FlowsMetadataViewPage() {
     });
   }, [filters.workflow, tagData]);
 
-  const activeFilterCount = Object.keys(filters).length + (searchText ? 1 : 0) + (questionIdMultiFilter.length > 0 ? 1 : 0);
+  const activeFilterCount = Object.keys(filters).length + (searchText ? 1 : 0) + (questionIdMultiFilter.length > 0 ? 1 : 0) + (showOnlyLogicIssues ? 1 : 0);
   const blockCount = new Set(filteredData.map((record) => normalizeValue(record.blockName)).filter((value) => value !== EMPTY_VALUE)).size;
   const formCount = new Set(filteredData.map((record) => normalizeValue(record.formName)).filter((value) => value !== EMPTY_VALUE)).size;
   const questionCount = new Set(filteredData.map((record) => normalizeValue(record.questionId)).filter((value) => value !== EMPTY_VALUE)).size;
@@ -600,6 +748,36 @@ function FlowsMetadataViewPage() {
     setQuestionIdMultiFilter([]);
     setActiveTagFilterKey(null);
     setActiveLogicFilterKey(null);
+    setShowOnlyLogicIssues(false);
+  };
+
+  const openTableForQuestion = (questionId: string, workflow?: string) => {
+    setActiveTopTab("editable-metadata-table");
+    setActiveTagFilterKey(null);
+    setActiveLogicFilterKey(null);
+    setSearchText("");
+    setShowOnlyLogicIssues(false);
+    setQuestionIdMultiFilter([questionId]);
+    setFilterValue("questionId", ALL_VALUE);
+
+    if (workflow && workflow !== EMPTY_VALUE) {
+      setFilterValue("workflow", workflow);
+    }
+  };
+
+  const openTableForBlock = (blockName: string, workflow?: string) => {
+    setActiveTopTab("editable-metadata-table");
+    setActiveTagFilterKey(null);
+    setActiveLogicFilterKey(null);
+    setSearchText("");
+    setShowOnlyLogicIssues(false);
+    setQuestionIdMultiFilter([]);
+    setFilterValue("blockName", blockName);
+    setFilterValue("questionId", ALL_VALUE);
+
+    if (workflow && workflow !== EMPTY_VALUE) {
+      setFilterValue("workflow", workflow);
+    }
   };
 
   const renderCardEmptyState = () => {
@@ -927,6 +1105,91 @@ function FlowsMetadataViewPage() {
     }
   };
 
+  useEffect(() => {
+    if (questionIdMultiFilter.length === 1) {
+      setDependencyQuestionId(questionIdMultiFilter[0]);
+    }
+  }, [questionIdMultiFilter]);
+
+  useEffect(() => {
+    const blockName = filters.blockName;
+    if (blockName && blockName !== ALL_VALUE) {
+      setDependencyBlockName(blockName);
+    }
+  }, [filters.blockName]);
+
+  const dependencyWorkflowScope = filters.workflow && filters.workflow !== ALL_VALUE ? filters.workflow : null;
+
+  const dependencyScopedData = useMemo(
+    () => (dependencyWorkflowScope
+      ? data.filter((record) => normalizeValue(record.workflow) === dependencyWorkflowScope)
+      : data),
+    [data, dependencyWorkflowScope],
+  );
+
+  const dependencyScopedBlockStructures = useMemo(
+    () => (dependencyWorkflowScope
+      ? blockStructureData.filter((record) => normalizeValue(record.workflow) === dependencyWorkflowScope)
+      : blockStructureData),
+    [blockStructureData, dependencyWorkflowScope],
+  );
+
+  const dependencyQuestionOptions = useMemo(() => {
+    const map = new Map<string, string>();
+
+    dependencyScopedData.forEach((record) => {
+      const questionId = normalizeValue(record.questionId);
+      if (questionId === EMPTY_VALUE || map.has(questionId)) {
+        return;
+      }
+
+      const questionTitle = normalizeValue(record.questionTitle);
+      map.set(questionId, questionTitle !== EMPTY_VALUE ? questionTitle : questionId);
+    });
+
+    return Array.from(map.entries())
+      .map(([id, title]) => ({ id, title }))
+      .sort((left, right) => left.title.localeCompare(right.title));
+  }, [dependencyScopedData]);
+
+  const dependencyBlockOptions = useMemo(() => {
+    const map = new Map<string, string>();
+
+    dependencyScopedData.forEach((record) => {
+      const blockName = normalizeValue(record.blockName);
+      if (blockName === EMPTY_VALUE || map.has(blockName)) {
+        return;
+      }
+
+      map.set(blockName, normalizeValue(record.blockType));
+    });
+
+    return Array.from(map.entries())
+      .map(([name, type]) => ({ name, type }))
+      .sort((left, right) => left.name.localeCompare(right.name));
+  }, [dependencyScopedData]);
+
+  const resolvedDependencyQuestionId = dependencyQuestionId !== ALL_VALUE ? dependencyQuestionId : "";
+  const resolvedDependencyBlockName = dependencyBlockName !== ALL_VALUE ? dependencyBlockName : "";
+
+  const dependencyModel = useMemo(
+    () => buildDependencyImpactModel({
+      records: dependencyScopedData,
+      blockStructures: dependencyScopedBlockStructures,
+      focusQuestionId: resolvedDependencyQuestionId,
+      focusBlockName: resolvedDependencyBlockName,
+      questionTitleMap,
+      extractLogicExpression,
+    }),
+    [
+      dependencyScopedData,
+      dependencyScopedBlockStructures,
+      resolvedDependencyQuestionId,
+      resolvedDependencyBlockName,
+      questionTitleMap,
+    ],
+  );
+
   return (
     <div className="overflow-y-auto h-full bg-[linear-gradient(180deg,#f8fafc_0%,#eef2f7_100%)] px-4 py-4 md:px-5">
       <div className="mx-auto flex max-w-[1760px] flex-col gap-4 pb-6">
@@ -952,10 +1215,14 @@ function FlowsMetadataViewPage() {
           </Button>
         </div>
 
-        {/* Tabs section - moved to top */}
+        <Tabs className="w-full" onValueChange={setActiveTopTab} value={activeTopTab}>
+          <TabsList className="h-auto w-full justify-start gap-2 rounded-lg border border-slate-200 bg-white p-1">
+            <TabsTrigger className="px-3 py-1.5 text-xs" value="editable-metadata-table">Editable Metadata Table</TabsTrigger>
+            <TabsTrigger className="px-3 py-1.5 text-xs" value="dependency-impact-diagram">Dependency Impact Diagram</TabsTrigger>
+          </TabsList>
 
-        {/* Filter toolbar and cards content */}
-        <div className="w-full">
+          <TabsContent className="mt-4 space-y-4" value="editable-metadata-table">
+            <div className="w-full">
           <Card className="border-slate-200 bg-white shadow-sm mt-4">
             <CardContent className="space-y-3 p-3 md:p-4">
               <div className="flex items-end gap-3">
@@ -1060,6 +1327,16 @@ function FlowsMetadataViewPage() {
                   </div>
                 </div>
 
+                <Button
+                  className={`h-9 text-xs shrink-0 ${showOnlyLogicIssues ? "border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100" : ""}`}
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setShowOnlyLogicIssues((previous) => !previous)}
+                >
+                  <AlertTriangle className="mr-1 h-3.5 w-3.5" />
+                  Logic issues {scopedLogicIssueCount > 0 ? `(${scopedLogicIssueCount})` : ""}
+                </Button>
+
                 {/* Reset button */}
                 {activeFilterCount > 0 ? (
                   <Button className="h-9 text-xs shrink-0" size="sm" variant="outline" onClick={clearFilters}>
@@ -1110,6 +1387,16 @@ function FlowsMetadataViewPage() {
                   }}
                 >
                   Logic filter: {questionIdMultiFilter.length} question{questionIdMultiFilter.length > 1 ? "s" : ""}
+                  <X className="ml-1 h-3 w-3" />
+                </Badge>
+              ) : null}
+              {showOnlyLogicIssues ? (
+                <Badge
+                  className="h-6 cursor-pointer rounded-md bg-amber-50 px-2 text-[11px] font-medium text-amber-800 hover:bg-amber-100"
+                  variant="secondary"
+                  onClick={() => setShowOnlyLogicIssues(false)}
+                >
+                  Logic issues only
                   <X className="ml-1 h-3 w-3" />
                 </Badge>
               ) : null}
@@ -1374,6 +1661,7 @@ function FlowsMetadataViewPage() {
                               logicKey: string;
                               workflow: string;
                               details: { pairs: Array<{ question: string; value: string }>; questions: string[]; values: string[] };
+                              issues: LogicIssue[];
                             }>>();
                             filteredDataForLogicCards.forEach(record => {
                               const expression = extractLogicExpression(record.blockLogicCondition);
@@ -1397,6 +1685,7 @@ function FlowsMetadataViewPage() {
                                   logicKey,
                                   workflow,
                                   details: extractLogicDetails(record.blockLogicCondition),
+                                  issues: getLogicIssuesForRawLogic(record.blockLogicCondition),
                                 });
                               }
                             });
@@ -1423,11 +1712,28 @@ function FlowsMetadataViewPage() {
                                         applyLogicCardFilter("blockLogicCondition", row.logicKey, row.parsed, row.questionId, row.workflow);
                                       }
                                     }}
-                                    className={`block w-full rounded border p-2 text-left transition-colors ${active ? "border-indigo-300 bg-indigo-50" : "border-slate-200 bg-slate-50 hover:bg-indigo-50"}`}
+                                    className={`block w-full rounded border p-2 text-left transition-colors ${row.issues.length > 0 ? "border-amber-300 bg-amber-50 hover:bg-amber-100" : active ? "border-indigo-300 bg-indigo-50" : "border-slate-200 bg-slate-50 hover:bg-indigo-50"}`}
                                     title={row.expression}
                                   >
                                     <div className="flex items-start justify-between gap-2">
                                       <div className="min-w-0 flex-1 space-y-1">
+                                        {row.issues.length > 0 && (
+                                          <div className="space-y-1">
+                                            <div className="flex flex-wrap gap-1">
+                                              <span className="inline-flex items-center gap-1 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800">
+                                                <AlertTriangle className="h-3 w-3" />
+                                                {row.issues.length} logic issue{row.issues.length === 1 ? "" : "s"}
+                                              </span>
+                                            </div>
+                                            <div className="space-y-1">
+                                              {row.issues.slice(0, 2).map((issue) => (
+                                                <p key={`${row.logicJson}-${issue.type}-${issue.questionId}`} className="text-[10px] leading-snug text-amber-900">
+                                                  <span className="font-semibold">Reason:</span> {issue.message}
+                                                </p>
+                                              ))}
+                                            </div>
+                                          </div>
+                                        )}
                                         <div className="flex flex-wrap gap-1">
                                           {row.details.pairs.length === 0 ? (
                                             <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">No question/value pairs</span>
@@ -1470,6 +1776,7 @@ function FlowsMetadataViewPage() {
                                               rawLogic: row.logicJson,
                                               parsed: row.parsed,
                                               details: row.details,
+                                              issues: row.issues,
                                             });
                                           }}
                                           className="rounded border border-slate-200 bg-white p-1 text-slate-600 hover:bg-slate-100"
@@ -1916,6 +2223,7 @@ function FlowsMetadataViewPage() {
                                   logicKey,
                                   workflow,
                                   details: extractLogicDetails(record.questionLogicCondition),
+                                  issues: getLogicIssuesForRawLogic(record.questionLogicCondition),
                                 });
                               }
                             });
@@ -1942,11 +2250,28 @@ function FlowsMetadataViewPage() {
                                         applyLogicCardFilter("questionLogicCondition", row.logicKey, row.parsed, row.questionId, row.workflow);
                                       }
                                     }}
-                                    className={`block w-full rounded border p-2 text-left transition-colors ${active ? "border-indigo-300 bg-indigo-50" : "border-slate-200 bg-slate-50 hover:bg-indigo-50"}`}
+                                    className={`block w-full rounded border p-2 text-left transition-colors ${row.issues.length > 0 ? "border-amber-300 bg-amber-50 hover:bg-amber-100" : active ? "border-indigo-300 bg-indigo-50" : "border-slate-200 bg-slate-50 hover:bg-indigo-50"}`}
                                     title={row.expression}
                                   >
                                     <div className="flex items-start justify-between gap-2">
                                       <div className="min-w-0 flex-1 space-y-1">
+                                        {row.issues.length > 0 && (
+                                          <div className="space-y-1">
+                                            <div className="flex flex-wrap gap-1">
+                                              <span className="inline-flex items-center gap-1 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800">
+                                                <AlertTriangle className="h-3 w-3" />
+                                                {row.issues.length} logic issue{row.issues.length === 1 ? "" : "s"}
+                                              </span>
+                                            </div>
+                                            <div className="space-y-1">
+                                              {row.issues.slice(0, 2).map((issue) => (
+                                                <p key={`${row.logicJson}-${issue.type}-${issue.questionId}`} className="text-[10px] leading-snug text-amber-900">
+                                                  <span className="font-semibold">Reason:</span> {issue.message}
+                                                </p>
+                                              ))}
+                                            </div>
+                                          </div>
+                                        )}
                                         <div className="flex flex-wrap gap-1">
                                           {row.details.pairs.length === 0 ? (
                                             <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">No question/value pairs</span>
@@ -1989,6 +2314,7 @@ function FlowsMetadataViewPage() {
                                               rawLogic: row.logicJson,
                                               parsed: row.parsed,
                                               details: row.details,
+                                              issues: row.issues,
                                             });
                                           }}
                                           className="rounded border border-slate-200 bg-white p-1 text-slate-600 hover:bg-slate-100"
@@ -2083,7 +2409,7 @@ function FlowsMetadataViewPage() {
                       <div className="border-b border-slate-200 px-2.5 py-1.5 flex items-start justify-between gap-2">
                         <div>
                           <h4 className="text-xs font-semibold text-slate-900">Tags</h4>
-                          <p className="text-[9px] text-slate-500">Same structure as Configuration TAGS column</p>
+                          <p className="text-[9px] text-slate-500">Grouped by block and form. Click any tag to filter related questions across cards.</p>
                         </div>
                       </div>
 
@@ -2259,6 +2585,29 @@ function FlowsMetadataViewPage() {
             </div>
           </CardContent>
         </Card>
+          </TabsContent>
+
+          <TabsContent className="mt-4" value="dependency-impact-diagram">
+            <DependencyImpactDiagram
+              blockOptions={dependencyBlockOptions}
+              model={dependencyModel}
+              onApplyBlockFilter={openTableForBlock}
+              onApplyQuestionFilter={openTableForQuestion}
+              onBlockChange={(value) => {
+                setDependencyBlockName(value);
+                setDependencyQuestionId(ALL_VALUE);
+              }}
+              onQuestionChange={(value) => {
+                setDependencyQuestionId(value);
+                setDependencyBlockName(ALL_VALUE);
+              }}
+              questionOptions={dependencyQuestionOptions}
+              selectedBlockName={dependencyBlockName}
+              selectedQuestionId={dependencyQuestionId}
+              workflowScope={dependencyWorkflowScope}
+            />
+          </TabsContent>
+        </Tabs>
 
         <Dialog open={Boolean(logicModal)} onOpenChange={(open) => !open && setLogicModal(null)}>
           <DialogContent className="max-w-4xl border-slate-200 bg-white">
@@ -2273,6 +2622,23 @@ function FlowsMetadataViewPage() {
                     <span>Workflow: {logicModal.workflow}</span>
                   </div>
                 </DialogHeader>
+
+                {logicModal.issues && logicModal.issues.length > 0 && (
+                  <div className="rounded border border-amber-200 bg-amber-50 p-3 text-[11px] text-amber-900">
+                    <div className="mb-2 flex items-center gap-1.5 font-semibold">
+                      <AlertTriangle className="h-4 w-4" />
+                      Potential logic issues
+                    </div>
+                    <div className="space-y-1.5">
+                      {logicModal.issues.map((issue) => (
+                        <div key={`${issue.questionId}-${issue.values.join("|")}`} className="rounded border border-amber-200 bg-white px-2 py-1.5">
+                          <div className="font-medium text-slate-800">{issue.questionTitle}</div>
+                          <div className="text-slate-600"><span className="font-semibold">Reason:</span> {issue.message}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {logicModal.title === "Question Logic Condition" ? (
                   <Tabs defaultValue="tree" className="mt-2">
@@ -2440,6 +2806,777 @@ function FlowsMetadataViewPage() {
       </div>
     </div>
   );
+}
+
+function DependencyImpactDiagram({
+  blockOptions,
+  model,
+  onApplyBlockFilter,
+  onApplyQuestionFilter,
+  onBlockChange,
+  onQuestionChange,
+  questionOptions,
+  selectedBlockName,
+  selectedQuestionId,
+  workflowScope,
+}: {
+  blockOptions: Array<{ name: string; type: string }>;
+  model: DependencyImpactModel;
+  onApplyBlockFilter: (blockName: string, workflow?: string) => void;
+  onApplyQuestionFilter: (questionId: string, workflow?: string) => void;
+  onBlockChange: (value: string) => void;
+  onQuestionChange: (value: string) => void;
+  questionOptions: Array<{ id: string; title: string }>;
+  selectedBlockName: string;
+  selectedQuestionId: string;
+  workflowScope: string | null;
+}) {
+  const hasSelection = selectedQuestionId !== ALL_VALUE || selectedBlockName !== ALL_VALUE;
+
+  return (
+    <div className="space-y-4">
+      <Card className="border-slate-200 bg-white shadow-sm">
+        <CardContent className="space-y-4 p-4">
+          <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-900">Dependency Impact Diagram</h2>
+              <p className="text-[11px] text-slate-500">
+                See which blocks, questions, and next-step blocks are affected by a selected driver question or block.
+              </p>
+            </div>
+            <Badge className="rounded-md bg-slate-100 px-2 py-1 text-[10px] font-medium text-slate-700" variant="secondary">
+              {workflowScope ? `Workflow scope: ${workflowScope}` : "Workflow scope: all workflows"}
+            </Badge>
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="space-y-1.5">
+              <FilterLabel label="Focus Question" />
+              <Select
+                onValueChange={(value) => onQuestionChange(value)}
+                value={selectedQuestionId}
+              >
+                <SelectTrigger className="h-9 border-slate-200 text-xs">
+                  <SelectValue placeholder="Select a driver question" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ALL_VALUE}>No question focus</SelectItem>
+                  {questionOptions.map((option) => (
+                    <SelectItem key={option.id} value={option.id}>
+                      {option.title} ({option.id})
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="space-y-1.5">
+              <FilterLabel label="Focus Block" />
+              <Select
+                onValueChange={(value) => onBlockChange(value)}
+                value={selectedBlockName}
+              >
+                <SelectTrigger className="h-9 border-slate-200 text-xs">
+                  <SelectValue placeholder="Select a block" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ALL_VALUE}>No block focus</SelectItem>
+                  {blockOptions.map((option) => (
+                    <SelectItem key={option.name} value={option.name}>
+                      {option.type && option.type !== EMPTY_VALUE ? `${option.name} (${option.type})` : option.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-4">
+            <ImpactMetricCard label="Driver Blocks" value={model.drivingBlocks.length} />
+            <ImpactMetricCard label="Driven Questions" value={model.downstreamQuestions.length} />
+            <ImpactMetricCard label="Upstream Questions" value={model.upstreamQuestions.length} />
+            <ImpactMetricCard label="Related Routes" value={model.relatedRoutes.length} />
+          </div>
+        </CardContent>
+      </Card>
+
+      {!hasSelection ? (
+        <Card className="border-dashed border-slate-300 bg-white/80 shadow-sm">
+          <CardContent className="p-6 text-center text-sm text-slate-500">
+            Select a question to see every block and subquestion it can trigger, or select a block to inspect what drives it and where it routes next.
+          </CardContent>
+        </Card>
+      ) : (
+        model.mode === "question" ? (
+          <QuestionDependencyDiagram
+            blocks={buildDrivingBlockItems(model.drivingBlocks, onApplyBlockFilter)}
+            focusItems={buildImpactFocusItems(model, onApplyQuestionFilter, onApplyBlockFilter)}
+            routes={buildRouteItems(model.relatedRoutes, model.drivingBlocks, onApplyBlockFilter)}
+            upstreamQuestions={buildUpstreamQuestionItems(model.upstreamQuestions, onApplyQuestionFilter)}
+            downstreamQuestions={buildDownstreamQuestionItems(model.downstreamQuestions, onApplyQuestionFilter)}
+          />
+        ) : (
+          <BlockDependencyDiagram
+            focusItems={buildImpactFocusItems(model, onApplyQuestionFilter, onApplyBlockFilter)}
+            logicQuestions={buildQuestionsInBlockItems(model.questionsInBlock, onApplyQuestionFilter)}
+            routes={buildRouteItems(model.relatedRoutes, model.drivingBlocks, onApplyBlockFilter)}
+            upstreamQuestions={buildUpstreamQuestionItems(model.upstreamQuestions, onApplyQuestionFilter)}
+          />
+        )
+      )}
+    </div>
+  );
+}
+
+function ImpactMetricCard({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+      <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-500">{label}</div>
+      <div className="mt-1 text-lg font-semibold text-slate-900">{value}</div>
+    </div>
+  );
+}
+
+function QuestionDependencyDiagram({
+  blocks,
+  downstreamQuestions,
+  focusItems,
+  routes,
+  upstreamQuestions,
+}: {
+  blocks: ImpactCardItem[];
+  downstreamQuestions: ImpactCardItem[];
+  focusItems: ImpactCardItem[];
+  routes: ImpactCardItem[];
+  upstreamQuestions: ImpactCardItem[];
+}) {
+  const summaryItems = [
+    `${upstreamQuestions.length} upstream questions`,
+    `${downstreamQuestions.length} downstream questions`,
+    `${blocks.length} related blocks`,
+  ];
+
+  if (routes.length > 0) {
+    summaryItems.push(`${routes.length} next blocks`);
+  }
+
+  return (
+    <div className="space-y-5">
+      <DiagramLegend items={summaryItems} />
+
+      <DiagramFlowRow
+        left={
+          <DiagramLane
+            align="right"
+            items={upstreamQuestions}
+            label="1. Upstream Questions"
+            subtitle="Questions referenced in the selected question logic"
+          />
+        }
+        leftArrowLabel="drives"
+        center={<DiagramFocus items={focusItems} title="Selected Question" />}
+        right={
+          <DiagramLane
+            align="left"
+            items={downstreamQuestions}
+            label="2. Downstream Questions"
+            subtitle="Questions directly triggered by the selected question"
+          />
+        }
+        rightArrowLabel="reveals"
+      />
+
+      {(blocks.length > 0 || routes.length > 0) ? (
+        <DiagramFlowRow
+          center={
+            <DiagramLane
+              align="center"
+              items={blocks}
+              label="3. Related Blocks"
+              subtitle="Blocks whose logic references the selected question"
+            />
+          }
+          right={routes.length > 0 ? (
+            <DiagramLane
+              align="center"
+              items={routes}
+              label="4. Next Blocks"
+              subtitle="Follow-on blocks reached from the related blocks via the block structure CSV"
+            />
+          ) : undefined}
+          rightArrowLabel={routes.length > 0 ? "routes to" : undefined}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function BlockDependencyDiagram({
+  focusItems,
+  logicQuestions,
+  routes,
+  upstreamQuestions,
+}: {
+  focusItems: ImpactCardItem[];
+  logicQuestions: ImpactCardItem[];
+  routes: ImpactCardItem[];
+  upstreamQuestions: ImpactCardItem[];
+}) {
+  const summaryItems = [
+    `${upstreamQuestions.length} upstream questions`,
+    `${logicQuestions.length} logic questions`,
+  ];
+
+  if (routes.length > 0) {
+    summaryItems.push(`${routes.length} next blocks`);
+  }
+
+  return (
+    <div className="space-y-5">
+      <DiagramLegend items={summaryItems} />
+
+      <DiagramFlowRow
+        left={
+          <DiagramLane
+            align="right"
+            items={upstreamQuestions}
+            label="1. Upstream Questions"
+            subtitle="Questions involved in the selected block logic"
+          />
+        }
+        leftArrowLabel="drives"
+        center={<DiagramFocus items={focusItems} title="Selected Block" />}
+        right={
+          <DiagramLane
+            align="left"
+            items={logicQuestions}
+            label="2. Logic Questions"
+            subtitle="Only questions involved in logic inside this block"
+          />
+        }
+        rightArrowLabel="contains"
+      />
+
+      {routes.length > 0 ? (
+        <DiagramFlowRow
+          center={
+            <DiagramLane
+              align="center"
+              items={routes}
+              label="3. Next Blocks"
+              subtitle="Follow-on blocks reached from the selected block via the block structure CSV"
+            />
+          }
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function DiagramLegend({ items }: { items: string[] }) {
+  return (
+    <div className="flex flex-wrap gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 shadow-sm">
+      {items.map((item) => (
+        <Badge className="rounded-md bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-700" key={item} variant="secondary">
+          {item}
+        </Badge>
+      ))}
+    </div>
+  );
+}
+
+function DiagramFlowRow({
+  left,
+  leftArrowLabel,
+  center,
+  right,
+  rightArrowLabel,
+}: {
+  left?: ReactNode;
+  leftArrowLabel?: string;
+  center: ReactNode;
+  right?: ReactNode;
+  rightArrowLabel?: string;
+}) {
+  const hasLeft = Boolean(left);
+  const hasRight = Boolean(right);
+  const layoutClass = hasLeft && hasRight
+    ? "grid gap-3 xl:grid-cols-[minmax(0,1fr)_120px_minmax(280px,360px)_120px_minmax(0,1fr)] xl:items-start"
+    : hasRight
+      ? "grid gap-3 xl:grid-cols-[minmax(280px,360px)_120px_minmax(0,1fr)] xl:items-start"
+      : hasLeft
+        ? "grid gap-3 xl:grid-cols-[minmax(0,1fr)_120px_minmax(280px,360px)] xl:items-start"
+        : "grid gap-3";
+
+  return (
+    <div className={layoutClass}>
+      {hasLeft ? <div>{left}</div> : null}
+      {hasLeft ? <DiagramArrow label={leftArrowLabel} /> : null}
+      <div>{center}</div>
+      {hasRight ? <DiagramArrow label={rightArrowLabel} /> : null}
+      {hasRight ? <div>{right}</div> : null}
+    </div>
+  );
+}
+
+function DiagramArrow({ label }: { label?: string }) {
+  return (
+    <div className="hidden xl:flex xl:h-full xl:min-h-[160px] xl:flex-col xl:items-center xl:justify-center">
+      {label ? (
+        <div className="mb-2 rounded-full border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-500 shadow-sm">
+          {label}
+        </div>
+      ) : null}
+      <div className="flex w-full items-center gap-2 px-2">
+        <div className="h-px flex-1 bg-slate-300" />
+        <div className="text-slate-400">→</div>
+      </div>
+    </div>
+  );
+}
+
+function DiagramFocus({ items, title, compact = false }: { items: ImpactCardItem[]; title: string; compact?: boolean }) {
+  return (
+    <div className={`rounded-2xl border border-slate-300 bg-[linear-gradient(180deg,#ffffff_0%,#f8fafc_100%)] shadow-sm ${compact ? "p-3" : "p-4"}`}>
+      <div className="mb-3 text-center text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-500">{title}</div>
+      {items.length === 0 ? (
+        <div className="text-sm text-slate-500">No focus item selected.</div>
+      ) : (
+        <div className="space-y-3">
+          {items.map((item) => (
+            <DiagramNode key={item.key} item={item} tone="focus" />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DiagramLane({
+  items,
+  align,
+  subtitle,
+  label,
+}: {
+  items: ImpactCardItem[];
+  align: "left" | "right" | "center";
+  subtitle: string;
+  label: string;
+}) {
+  return (
+    <Card className="border-slate-200 bg-white shadow-sm">
+      <CardContent className="space-y-3 p-4">
+        <div>
+          <h3 className="text-sm font-semibold text-slate-900">{label}</h3>
+          <p className="text-[11px] text-slate-500">{subtitle}</p>
+        </div>
+
+        {items.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-slate-200 bg-slate-50 px-3 py-4 text-[11px] text-slate-500">
+            No connected items found for this selection.
+          </div>
+        ) : (
+          <div className={`space-y-2 ${align === "right" ? "xl:pr-4" : align === "left" ? "xl:pl-4" : ""}`}>
+            {items.map((item) => (
+              <DiagramNode item={item} key={item.key} tone="default" />
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function DiagramNode({ item, tone }: { item: ImpactCardItem; tone: "default" | "focus" }) {
+  return (
+    <button
+      className={`w-full rounded-xl border px-3 py-2 text-left ${tone === "focus" ? "border-slate-900 bg-slate-900 text-white" : item.onClick ? "border-slate-200 bg-slate-50 transition-colors hover:border-slate-300 hover:bg-white" : "border-slate-200 bg-slate-50"}`}
+      disabled={!item.onClick}
+      onClick={item.onClick}
+      type="button"
+    >
+      <div className={`text-[11px] font-semibold ${tone === "focus" ? "text-white" : "text-slate-900"}`}>{item.title}</div>
+      {item.subtitle ? <div className={`mt-0.5 text-[11px] ${tone === "focus" ? "text-slate-200" : "text-slate-600"}`}>{item.subtitle}</div> : null}
+      {item.body ? <div className={`mt-1 text-[11px] ${tone === "focus" ? "text-slate-300" : "text-slate-500"}`}>{item.body}</div> : null}
+      {item.badges && item.badges.length > 0 ? (
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {item.badges.map((badge) => (
+            <Badge className={`rounded-md px-2 py-0.5 text-[10px] font-medium ${tone === "focus" ? "bg-white/10 text-white" : "bg-white text-slate-700"}`} key={badge} variant="secondary">
+              {badge}
+            </Badge>
+          ))}
+        </div>
+      ) : null}
+    </button>
+  );
+}
+
+function buildImpactFocusItems(
+  model: DependencyImpactModel,
+  onApplyQuestionFilter: (questionId: string, workflow?: string) => void,
+  onApplyBlockFilter: (blockName: string, workflow?: string) => void,
+): ImpactCardItem[] {
+  if (model.mode === "question") {
+    return [{
+      key: model.focusQuestionId,
+      title: `${model.focusQuestionTitle} (${model.focusQuestionId})`,
+      subtitle: model.workflowScope ? `Workflow: ${model.workflowScope}` : "Across all workflows",
+      body: model.visitedQuestionIds.length > 1 ? `Recursive reach includes ${model.visitedQuestionIds.length} question nodes.` : undefined,
+      onClick: () => onApplyQuestionFilter(model.focusQuestionId, model.workflowScope ?? undefined),
+    }];
+  }
+
+  if (model.mode === "block") {
+    return [{
+      key: model.focusBlockName,
+      title: model.focusBlockName,
+      subtitle: model.focusBlockType !== EMPTY_VALUE ? model.focusBlockType : undefined,
+      body: model.workflowScope ? `Workflow: ${model.workflowScope}` : "Across all workflows",
+      onClick: () => onApplyBlockFilter(model.focusBlockName, model.workflowScope ?? undefined),
+    }];
+  }
+
+  return [];
+}
+
+function buildDrivingBlockItems(
+  items: DependencyBlockImpact[],
+  onApplyBlockFilter: (blockName: string, workflow?: string) => void,
+): ImpactCardItem[] {
+  return items.map((item) => ({
+    key: item.key,
+    title: item.blockName,
+    subtitle: item.blockType !== EMPTY_VALUE ? `${item.blockType} • ${item.workflow}` : item.workflow,
+    body: item.expression !== EMPTY_VALUE ? item.expression : undefined,
+    badges: item.sourceQuestionIds,
+    onClick: () => onApplyBlockFilter(item.blockName, item.workflow),
+  }));
+}
+
+function buildDownstreamQuestionItems(
+  items: DependencyQuestionImpact[],
+  onApplyQuestionFilter: (questionId: string, workflow?: string) => void,
+): ImpactCardItem[] {
+  return items.map((item) => ({
+    key: item.key,
+    title: `${item.questionTitle} (${item.questionId})`,
+    subtitle: [item.blockName, item.formName, item.formSection].filter((value) => value && value !== EMPTY_VALUE).join(" • "),
+    body: item.expression !== EMPTY_VALUE ? item.expression : undefined,
+    badges: item.sourceQuestionIds,
+    onClick: () => onApplyQuestionFilter(item.questionId, item.workflow),
+  }));
+}
+
+function buildUpstreamQuestionItems(
+  items: DependencyQuestionImpact[],
+  onApplyQuestionFilter: (questionId: string, workflow?: string) => void,
+): ImpactCardItem[] {
+  return items.map((item) => ({
+    key: item.key,
+    title: `${item.questionTitle} (${item.questionId})`,
+    subtitle: item.workflow,
+    body: item.expression !== EMPTY_VALUE ? item.expression : undefined,
+    badges: item.sourceQuestionIds,
+    onClick: () => onApplyQuestionFilter(item.questionId, item.workflow),
+  }));
+}
+
+function buildQuestionsInBlockItems(
+  items: DependencyQuestionInBlock[],
+  onApplyQuestionFilter: (questionId: string, workflow?: string) => void,
+): ImpactCardItem[] {
+  return items.map((item) => ({
+    key: item.key,
+    title: `${item.questionTitle} (${item.questionId})`,
+    subtitle: [item.blockName, item.formName, item.formSection].filter((value) => value && value !== EMPTY_VALUE).join(" • "),
+    onClick: () => onApplyQuestionFilter(item.questionId, item.workflow),
+  }));
+}
+
+function buildRouteItems(
+  routes: DependencyRouteImpact[],
+  blocks: DependencyBlockImpact[],
+  onApplyBlockFilter: (blockName: string, workflow?: string) => void,
+): ImpactCardItem[] {
+  const routeItems = routes.map((route) => ({
+    key: route.key,
+    title: route.toBlock,
+    subtitle: `${route.fromBlock} -> ${route.toBlock}`,
+    body: route.workflow,
+    onClick: () => onApplyBlockFilter(route.toBlock, route.workflow),
+  }));
+
+  if (routeItems.length > 0) {
+    return routeItems;
+  }
+
+  return blocks.flatMap((block) =>
+    block.nextBlocks.map((nextBlock) => ({
+      key: `${block.key}::${nextBlock}`,
+      title: nextBlock,
+      subtitle: `${block.blockName} -> ${nextBlock}`,
+      body: block.workflow,
+      onClick: () => onApplyBlockFilter(nextBlock, block.workflow),
+    })),
+  );
+}
+
+function buildDependencyImpactModel({
+  records,
+  blockStructures,
+  focusQuestionId,
+  focusBlockName,
+  questionTitleMap,
+  extractLogicExpression,
+}: {
+  records: FlowMetadata[];
+  blockStructures: FlowBlockStructure[];
+  focusQuestionId: string;
+  focusBlockName: string;
+  questionTitleMap: Map<string, string>;
+  extractLogicExpression: (logicJson: string | undefined) => string;
+}): DependencyImpactModel {
+  const routeMap = new Map<string, string[]>();
+
+  blockStructures.forEach((record) => {
+    const workflow = normalizeValue(record.workflow);
+    const block = normalizeValue(record.block);
+    if (workflow === EMPTY_VALUE || block === EMPTY_VALUE) {
+      return;
+    }
+    routeMap.set(`${workflow}::${block}`, record.nextBlocks.map((value) => normalizeValue(value)).filter((value) => value !== EMPTY_VALUE));
+  });
+
+  const emptyModel: DependencyImpactModel = {
+    mode: "empty",
+    workflowScope: records.length > 0 ? normalizeValue(records[0]?.workflow) : null,
+    focusQuestionId,
+    focusQuestionTitle: focusQuestionId ? questionTitleMap.get(focusQuestionId) || focusQuestionId : "",
+    focusBlockName,
+    focusBlockType: EMPTY_VALUE,
+    visitedQuestionIds: [],
+    drivingBlocks: [],
+    downstreamQuestions: [],
+    upstreamQuestions: [],
+    questionsInBlock: [],
+    relatedRoutes: [],
+  };
+
+  if (!focusQuestionId && !focusBlockName) {
+    return emptyModel;
+  }
+
+  const workflowScope = records.length > 0 ? normalizeValue(records[0]?.workflow) : null;
+
+  if (focusQuestionId) {
+    const upstreamQuestions = new Map<string, DependencyQuestionImpact>();
+    const drivingBlocks = new Map<string, DependencyBlockImpact>();
+    const downstreamQuestions = new Map<string, DependencyQuestionImpact>();
+    records.forEach((record) => {
+      const workflow = normalizeValue(record.workflow);
+      const blockName = normalizeValue(record.blockName);
+      const blockType = normalizeValue(record.blockType);
+      const questionId = normalizeValue(record.questionId);
+      const questionLogicSourceQuestionIds = getLogicQuestionIds(record.questionLogicCondition || "");
+
+      if (
+        questionId === focusQuestionId
+        && questionLogicSourceQuestionIds.length > 0
+        && normalizeString(record.questionLogicCondition)
+      ) {
+        questionLogicSourceQuestionIds.forEach((sourceQuestionId) => {
+          const key = `${workflow}::${blockName}::${questionId}::${sourceQuestionId}`;
+          if (!upstreamQuestions.has(key)) {
+            upstreamQuestions.set(key, {
+              key,
+              workflow,
+              blockName,
+              formName: normalizeValue(record.formName),
+              formSection: normalizeValue(record.formSection),
+              questionId: sourceQuestionId,
+              questionTitle: questionTitleMap.get(sourceQuestionId) || sourceQuestionId,
+              expression: extractLogicExpression(record.questionLogicCondition),
+              sourceQuestionIds: questionLogicSourceQuestionIds,
+            });
+          }
+        });
+      }
+
+      if (
+        questionId !== EMPTY_VALUE
+        && questionId !== focusQuestionId
+        && questionLogicSourceQuestionIds.includes(focusQuestionId)
+        && normalizeString(record.questionLogicCondition)
+      ) {
+        const key = `${workflow}::${questionId}::${blockName}::${normalizeValue(record.formSection)}`;
+        if (!downstreamQuestions.has(key)) {
+          downstreamQuestions.set(key, {
+            key,
+            workflow,
+            blockName,
+            formName: normalizeValue(record.formName),
+            formSection: normalizeValue(record.formSection),
+            questionId,
+            questionTitle: normalizeValue(record.questionTitle) !== EMPTY_VALUE ? normalizeValue(record.questionTitle) : questionTitleMap.get(questionId) || questionId,
+            expression: extractLogicExpression(record.questionLogicCondition),
+            sourceQuestionIds: questionLogicSourceQuestionIds,
+          });
+        }
+      }
+
+      const blockLogicSourceQuestionIds = getLogicQuestionIds(record.blockLogicCondition || "");
+      if (blockLogicSourceQuestionIds.includes(focusQuestionId) && blockName !== EMPTY_VALUE) {
+        const key = `${workflow}::${blockName}`;
+        if (!drivingBlocks.has(key)) {
+          drivingBlocks.set(key, {
+            key,
+            workflow,
+            blockName,
+            blockType,
+            expression: extractLogicExpression(record.blockLogicCondition),
+            sourceQuestionIds: blockLogicSourceQuestionIds,
+            nextBlocks: routeMap.get(`${workflow}::${blockName}`) ?? [],
+          });
+        }
+      }
+    });
+
+    const relatedRoutes = new Map<string, DependencyRouteImpact>();
+    drivingBlocks.forEach((block) => {
+      block.nextBlocks.forEach((nextBlock) => {
+        const key = `${block.workflow}::${block.blockName}::${nextBlock}`;
+        relatedRoutes.set(key, {
+          key,
+          workflow: block.workflow,
+          fromBlock: block.blockName,
+          toBlock: nextBlock,
+        });
+      });
+    });
+
+    return {
+      mode: "question",
+      workflowScope,
+      focusQuestionId,
+      focusQuestionTitle: questionTitleMap.get(focusQuestionId) || focusQuestionId,
+      focusBlockName: "",
+      focusBlockType: EMPTY_VALUE,
+      visitedQuestionIds: [focusQuestionId],
+      drivingBlocks: Array.from(drivingBlocks.values()).sort((left, right) => left.blockName.localeCompare(right.blockName)),
+      downstreamQuestions: Array.from(downstreamQuestions.values()).sort((left, right) => left.questionTitle.localeCompare(right.questionTitle)),
+      upstreamQuestions: Array.from(upstreamQuestions.values()).sort((left, right) => left.questionTitle.localeCompare(right.questionTitle)),
+      questionsInBlock: [],
+      relatedRoutes: Array.from(relatedRoutes.values()).sort((left, right) => left.toBlock.localeCompare(right.toBlock)),
+    };
+  }
+
+  const upstreamQuestions = new Map<string, DependencyQuestionImpact>();
+  const questionsInBlock = new Map<string, DependencyQuestionInBlock>();
+  const logicQuestionIdsInBlock = new Set<string>();
+  let focusBlockType = EMPTY_VALUE;
+
+  records.forEach((record) => {
+    const workflow = normalizeValue(record.workflow);
+    const blockName = normalizeValue(record.blockName);
+    if (blockName !== focusBlockName) {
+      return;
+    }
+
+    focusBlockType = focusBlockType !== EMPTY_VALUE ? focusBlockType : normalizeValue(record.blockType);
+
+    const questionId = normalizeValue(record.questionId);
+    const questionLogicSourceQuestionIds = getLogicQuestionIds(record.questionLogicCondition || "");
+    if (questionId !== EMPTY_VALUE && normalizeString(record.questionLogicCondition)) {
+      logicQuestionIdsInBlock.add(questionId);
+      questionLogicSourceQuestionIds.forEach((sourceQuestionId) => logicQuestionIdsInBlock.add(sourceQuestionId));
+    }
+
+    const blockLogicSourceQuestionIds = getLogicQuestionIds(record.blockLogicCondition || "");
+    if (blockLogicSourceQuestionIds.length > 0) {
+      blockLogicSourceQuestionIds.forEach((sourceQuestionId) => {
+        logicQuestionIdsInBlock.add(sourceQuestionId);
+        const key = `${workflow}::${blockName}::${sourceQuestionId}`;
+        if (!upstreamQuestions.has(key)) {
+          upstreamQuestions.set(key, {
+            key,
+            workflow,
+            blockName,
+            formName: normalizeValue(record.formName),
+            formSection: normalizeValue(record.formSection),
+            questionId: sourceQuestionId,
+            questionTitle: questionTitleMap.get(sourceQuestionId) || sourceQuestionId,
+            expression: extractLogicExpression(record.blockLogicCondition),
+            sourceQuestionIds: blockLogicSourceQuestionIds,
+          });
+        }
+      });
+    }
+  });
+
+  records.forEach((record) => {
+    const workflow = normalizeValue(record.workflow);
+    const blockName = normalizeValue(record.blockName);
+    const questionId = normalizeValue(record.questionId);
+    if (blockName !== focusBlockName || questionId === EMPTY_VALUE || !logicQuestionIdsInBlock.has(questionId)) {
+      return;
+    }
+
+    const key = `${workflow}::${blockName}::${questionId}`;
+    if (!questionsInBlock.has(key)) {
+      questionsInBlock.set(key, {
+        key,
+        workflow,
+        blockName,
+        formName: normalizeValue(record.formName),
+        formSection: normalizeValue(record.formSection),
+        questionId,
+        questionTitle: normalizeValue(record.questionTitle) !== EMPTY_VALUE ? normalizeValue(record.questionTitle) : questionTitleMap.get(questionId) || questionId,
+      });
+    }
+  });
+
+  const relatedRoutes = (
+    records.length === 0
+      ? []
+      : Array.from(new Set(records.map((record) => normalizeValue(record.workflow)))).flatMap((workflow) => {
+        const nextBlocks = routeMap.get(`${workflow}::${focusBlockName}`) ?? [];
+        return nextBlocks.map((nextBlock) => ({
+          key: `${workflow}::${focusBlockName}::${nextBlock}`,
+          workflow,
+          fromBlock: focusBlockName,
+          toBlock: nextBlock,
+        }));
+      })
+  ).sort((left, right) => left.toBlock.localeCompare(right.toBlock));
+
+  return {
+    mode: "block",
+    workflowScope,
+    focusQuestionId: "",
+    focusQuestionTitle: "",
+    focusBlockName,
+    focusBlockType,
+    visitedQuestionIds: [],
+    drivingBlocks: [],
+    downstreamQuestions: [],
+    upstreamQuestions: Array.from(upstreamQuestions.values()).sort((left, right) => left.questionTitle.localeCompare(right.questionTitle)),
+    questionsInBlock: Array.from(questionsInBlock.values()).sort((left, right) => left.questionTitle.localeCompare(right.questionTitle)),
+    relatedRoutes,
+  };
+}
+
+function getLogicQuestionIds(rawLogic: string): string[] {
+  const logic = normalizeString(rawLogic);
+  if (!logic || logic.toLowerCase() === "na") {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(logic);
+    return Array.from(new Set(extractAllQuestionIds(parsed).map((value) => normalizeString(value)).filter(Boolean)));
+  } catch {
+    return [];
+  }
 }
 
 function normalizeString(value: string | undefined): string {
@@ -2832,6 +3969,250 @@ function firstNonEmpty(values: Array<string | null | undefined>): string | null 
     }
   }
   return null;
+}
+
+function isSingleSelectQuestionType(questionType: string | undefined): boolean {
+  const normalized = normalizeString(questionType).toLowerCase();
+  if (!normalized) return false;
+  if (normalized.includes("multi") || normalized.includes("checkbox") || normalized.includes("check box")) {
+    return false;
+  }
+  return ["radio", "single select", "single-select", "dropdown", "select", "pick one"].some((token) => normalized.includes(token));
+}
+
+function parseNumericLogicValue(value: string | undefined): number | null {
+  const normalized = normalizeString(value).replace(/,/g, "");
+  if (!normalized) return null;
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function buildNumericContradictionMessage(comparisons: Array<{ operator: string; value: number }>): string | null {
+  const normalizedComparisons = comparisons.map((comparison) => ({
+    operator: comparison.operator.toUpperCase(),
+    value: comparison.value,
+  }));
+
+  const equals = Array.from(new Set(normalizedComparisons.filter((comparison) => ["EQUAL", "=="].includes(comparison.operator)).map((comparison) => comparison.value)));
+  const notEquals = new Set(normalizedComparisons.filter((comparison) => comparison.operator === "NOT_EQUAL").map((comparison) => comparison.value));
+
+  if (equals.length > 1) {
+    return `Conflicting numeric equality checks require multiple different exact values: ${equals.join(", ")}.`;
+  }
+
+  let lowerBound = -Infinity;
+  let lowerInclusive = true;
+  let upperBound = Infinity;
+  let upperInclusive = true;
+
+  normalizedComparisons.forEach((comparison) => {
+    if (comparison.operator === "GREATER_THAN") {
+      if (comparison.value > lowerBound || (comparison.value === lowerBound && lowerInclusive)) {
+        lowerBound = comparison.value;
+        lowerInclusive = false;
+      }
+    }
+    if (comparison.operator === "GREATER_THAN_OR_EQUAL_TO") {
+      if (comparison.value > lowerBound || (comparison.value === lowerBound && !lowerInclusive)) {
+        lowerBound = comparison.value;
+        lowerInclusive = true;
+      }
+    }
+    if (comparison.operator === "LESS_THAN") {
+      if (comparison.value < upperBound || (comparison.value === upperBound && upperInclusive)) {
+        upperBound = comparison.value;
+        upperInclusive = false;
+      }
+    }
+    if (comparison.operator === "LESS_THAN_OR_EQUAL_TO") {
+      if (comparison.value < upperBound || (comparison.value === upperBound && !upperInclusive)) {
+        upperBound = comparison.value;
+        upperInclusive = true;
+      }
+    }
+  });
+
+  const exactValue = equals[0];
+  if (exactValue != null) {
+    if (notEquals.has(exactValue)) {
+      return `Conflicting numeric checks require ${exactValue} and not ${exactValue} at the same time.`;
+    }
+    if (exactValue < lowerBound || (exactValue === lowerBound && !lowerInclusive)) {
+      return `Conflicting numeric checks require ${exactValue}, but another condition also requires a value greater than ${lowerBound}.`;
+    }
+    if (exactValue > upperBound || (exactValue === upperBound && !upperInclusive)) {
+      return `Conflicting numeric checks require ${exactValue}, but another condition also requires a value less than ${upperBound}.`;
+    }
+  }
+
+  if (lowerBound > upperBound) {
+    return `Conflicting numeric bounds require a value greater than ${lowerBound} and less than ${upperBound}.`;
+  }
+  if (lowerBound === upperBound && (!lowerInclusive || !upperInclusive)) {
+    return `Conflicting numeric bounds exclude the only possible value ${lowerBound}.`;
+  }
+
+  return null;
+}
+
+function detectLogicIssues(
+  parsed: unknown,
+  questionTypeMap: Map<string, string>,
+  questionTitleMap: Map<string, string>,
+): LogicIssue[] {
+  const issues: LogicIssue[] = [];
+  const seen = new Set<string>();
+
+  const visit = (node: unknown) => {
+    if (!node || typeof node !== "object") return;
+    const obj = node as Record<string, unknown>;
+
+    const children: unknown[] = [];
+    if (Array.isArray(obj.items)) children.push(...obj.items);
+    if (Array.isArray(obj.comparisons)) children.push(...obj.comparisons);
+
+    const groupType = typeof obj.type === "string" ? obj.type.toUpperCase() : "";
+    if (groupType === "AND" && children.length > 1) {
+      const byQuestion = new Map<string, { values: Set<string>; operators: Set<string> }>();
+      const numericByQuestion = new Map<string, Array<{ operator: string; value: number }>>();
+
+      children.forEach((child) => {
+        if (!child || typeof child !== "object") return;
+        const childObj = child as Record<string, unknown>;
+        const childChildren = [childObj.items, childObj.comparisons].filter(Array.isArray).flat() as unknown[];
+        if (childChildren.length > 0) return;
+
+        const primary = asObject(childObj.primaryField);
+        const secondary = asObject(childObj.secondaryField);
+        const questionId = firstNonEmpty([
+          toDisplay(primary?.questionId),
+          toDisplay(primary?.value),
+          toDisplay(primary?.source),
+        ]);
+        const operator = (typeof childObj.operator === "string" ? childObj.operator : "EQUAL").toUpperCase();
+        const value = firstNonEmpty([
+          toDisplay(secondary?.value),
+          toDisplay(secondary?.id),
+          toDisplay(secondary?.source),
+          toDisplay(childObj.value),
+        ]);
+
+        if (!questionId || !value) return;
+        const bucket = byQuestion.get(questionId) ?? { values: new Set<string>(), operators: new Set<string>() };
+        bucket.values.add(value);
+        bucket.operators.add(operator);
+        byQuestion.set(questionId, bucket);
+
+        const numericValue = parseNumericLogicValue(value);
+        if (numericValue != null) {
+          const numericComparisons = numericByQuestion.get(questionId) ?? [];
+          numericComparisons.push({ operator, value: numericValue });
+          numericByQuestion.set(questionId, numericComparisons);
+        }
+      });
+
+      byQuestion.forEach((bucket, questionId) => {
+        const questionType = questionTypeMap.get(questionId) ?? "";
+        const values = Array.from(bucket.values);
+        const operators = Array.from(bucket.operators);
+        if (!isSingleSelectQuestionType(questionType)) return;
+        if (values.length < 2) return;
+        if (!operators.every((operator) => operator === "EQUAL" || operator === "==")) return;
+
+        const key = `${questionId}::${values.slice().sort().join("||")}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+
+        const questionTitle = questionTitleMap.get(questionId) ?? questionId;
+        issues.push({
+          type: "single-select-and-conflict",
+          questionId,
+          questionTitle,
+          questionType,
+          values: values.sort((left, right) => left.localeCompare(right)),
+          message: `Single-select question uses AND across mutually exclusive values: ${values.join(", ")}. This condition can never be true.`,
+        });
+      });
+
+      numericByQuestion.forEach((comparisons, questionId) => {
+        if (comparisons.length < 2) return;
+        const message = buildNumericContradictionMessage(comparisons);
+        if (!message) return;
+
+        const key = `numeric::${questionId}::${comparisons.map((comparison) => `${comparison.operator}:${comparison.value}`).sort().join("||")}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+
+        issues.push({
+          type: "numeric-contradiction",
+          questionId,
+          questionTitle: questionTitleMap.get(questionId) ?? questionId,
+          questionType: questionTypeMap.get(questionId) ?? "",
+          values: comparisons.map((comparison) => `${comparison.operator} ${comparison.value}`),
+          message,
+        });
+      });
+    }
+
+    if (groupType === "OR" && children.length > 1) {
+      const byQuestion = new Map<string, { values: Set<string>; operators: Set<string> }>();
+
+      children.forEach((child) => {
+        if (!child || typeof child !== "object") return;
+        const childObj = child as Record<string, unknown>;
+        const childChildren = [childObj.items, childObj.comparisons].filter(Array.isArray).flat() as unknown[];
+        if (childChildren.length > 0) return;
+
+        const primary = asObject(childObj.primaryField);
+        const secondary = asObject(childObj.secondaryField);
+        const questionId = firstNonEmpty([
+          toDisplay(primary?.questionId),
+          toDisplay(primary?.value),
+          toDisplay(primary?.source),
+        ]);
+        const operator = (typeof childObj.operator === "string" ? childObj.operator : "EQUAL").toUpperCase();
+        const value = firstNonEmpty([
+          toDisplay(secondary?.value),
+          toDisplay(secondary?.id),
+          toDisplay(secondary?.source),
+          toDisplay(childObj.value),
+        ]);
+
+        if (!questionId || !value) return;
+        const bucket = byQuestion.get(questionId) ?? { values: new Set<string>(), operators: new Set<string>() };
+        bucket.values.add(value);
+        bucket.operators.add(operator);
+        byQuestion.set(questionId, bucket);
+      });
+
+      byQuestion.forEach((bucket, questionId) => {
+        const questionType = questionTypeMap.get(questionId) ?? "";
+        const values = Array.from(bucket.values);
+        const operators = Array.from(bucket.operators);
+        if (!isSingleSelectQuestionType(questionType)) return;
+        if (values.length < 2) return;
+        if (!operators.every((operator) => operator === "NOT_EQUAL")) return;
+
+        const key = `or-not-equal::${questionId}::${values.slice().sort().join("||")}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+
+        issues.push({
+          type: "single-select-or-negative-tautology",
+          questionId,
+          questionTitle: questionTitleMap.get(questionId) ?? questionId,
+          questionType,
+          values: values.sort((left, right) => left.localeCompare(right)),
+          message: `Single-select question uses OR across multiple NOT_EQUAL checks (${values.join(", ")}). This condition is effectively always true.`,
+        });
+      });
+    }
+
+    children.forEach(visit);
+  };
+
+  visit(parsed);
+  return issues;
 }
 
 function extractAllQuestionIds(node: unknown, bucket: string[] = []): string[] {

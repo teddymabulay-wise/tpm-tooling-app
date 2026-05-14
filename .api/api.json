@@ -1,0 +1,11 @@
+{
+  "version": "1.0",
+  "apis": [
+    {
+      "identifier": "omnea-public-api-ultm",
+      "source": "@omnea-public-api-ultm/v1.0#16zu8t8omollywkc",
+      "integrity": "sha512-JENmtfpbSOZ1rloBXHtqljaCIjy1wx3k3AXQLO3qpTMSgdli83wc9W4fxR4qQLellAxZYlR5OdY5grzkW7C0Uw==",
+      "installerVersion": "6.1.3"
+    }
+  ]
+}

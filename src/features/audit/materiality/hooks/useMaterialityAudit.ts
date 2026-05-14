@@ -1,12 +1,13 @@
 import { useState } from 'react'
 
+import { parseFlowTagsCSV } from '../../../../lib/flows-metadata-utils'
 import { fetchAllOmneaPages, makeOmneaRequest } from '../../../../lib/omnea-api-utils'
 import { getOmneaEnvironmentConfig } from '../../../../lib/omnea-environment'
 import { parseRequestStepsCsv } from '../lib/csvParser'
 import { classifyMateriality } from '../lib/materialityClassifier'
 import { mapSupplierDetailToSnapshot, type SupplierAuditSnapshot } from '../lib/supplierSnapshot'
-import { buildTagDiffs, parseActualTagSet } from '../lib/tagComparison'
-import { analyzeTagDerivations, deriveAllTags } from '../lib/tagRuleEngine'
+import { buildTagDiffs } from '../lib/tagComparison'
+import { analyzeTagDerivations, buildTagDefinitionsFromFlowTags, deriveAllTags } from '../lib/tagRuleEngine'
 import type {
   AuditRow,
   AuditState,
@@ -126,9 +127,8 @@ function buildMaterialityDiff(derived: string, actual: string | null) {
 
 function countTagMismatches(rows: AuditRow[]): number {
   return rows.reduce((total, row) => {
-    const requestDiffs = row.tagDiffs?.filter((diff) => !diff.match).length ?? 0
     const apiDiffs = row.apiTagDiffs?.filter((diff) => !diff.match).length ?? 0
-    return total + requestDiffs + apiDiffs
+    return total + apiDiffs
   }, 0)
 }
 
@@ -151,12 +151,6 @@ function buildAuditRow(
   tagAnalysis: TagAnalysis[]
 ): AuditRow {
   const classificationResult = classifyMateriality(derivedTags, request.answers)
-  const actualTagsFromRequest = parseActualTagSet(request.actualTagsRaw)
-  const tagDiffs = buildTagDiffs(derivedTags, actualTagsFromRequest)
-  const materialityDiff = buildMaterialityDiff(classificationResult.classification, request.actualMaterialityFromRequest)
-  const hasAnyMismatch =
-    materialityDiff?.match === false ||
-    (tagDiffs?.some((diff) => !diff.match) ?? false)
 
   return {
     requestUuid: request.requestUuid,
@@ -170,15 +164,15 @@ function buildAuditRow(
     derivedMaterialityMatchedGroup: classificationResult.matchedGroup,
     derivedMaterialityRule: classificationResult.rule,
     actualTagsRaw: request.actualTagsRaw,
-    actualTagsFromRequest,
+    actualTagsFromRequest: null,
     actualMaterialityFromRequest: request.actualMaterialityFromRequest,
     actualTagsFromApi: null,
     actualMaterialityFromApi: null,
-    tagDiffs,
+    tagDiffs: null,
     apiTagDiffs: null,
-    materialityDiff,
+    materialityDiff: null,
     apiMaterialityDiff: null,
-    hasAnyMismatch,
+    hasAnyMismatch: null,
     matchedSupplierId: null,
     matchedSupplierName: null,
     enrichmentStatus: 'pending',
@@ -230,6 +224,30 @@ function findSupplierMatch(
   return null
 }
 
+function normalizeWorkflow(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, ' ')
+}
+
+async function fetchWorkflowTagMap(): Promise<Map<string, ReturnType<typeof parseFlowTagsCSV>>> {
+  const response = await fetch(encodeURI('/doc/Omnea Tag Meta data.csv'))
+  if (!response.ok) {
+    throw new Error(`Failed to load tag metadata CSV (${response.status})`)
+  }
+
+  const csvText = await response.text()
+  const parsedTags = parseFlowTagsCSV(csvText)
+  const tagMap = new Map<string, ReturnType<typeof parseFlowTagsCSV>>()
+
+  parsedTags.forEach((tag) => {
+    const key = normalizeWorkflow(tag.workflow)
+    const existing = tagMap.get(key) ?? []
+    existing.push(tag)
+    tagMap.set(key, existing)
+  })
+
+  return tagMap
+}
+
 async function fetchSupplierSnapshots(requests: ParsedRequest[]): Promise<Map<string, SupplierAuditSnapshot>> {
   const config = getOmneaEnvironmentConfig()
   if (!config.clientId || !config.clientSecret) {
@@ -277,14 +295,30 @@ export function useMaterialityAudit(): UseMaterialityAuditReturn {
     void (async () => {
       try {
         const parsedRequests: ParsedRequest[] = parseRequestStepsCsv(csvText)
+        const workflowTagMap = await fetchWorkflowTagMap()
+
         const initialRows: AuditRow[] = parsedRequests.map((request) => {
+          const workflowKey = normalizeWorkflow(request.workflow)
+          const workflowTags = workflowTagMap.get(workflowKey) ?? []
+
+          if (workflowTags.length === 0) {
+            throw new Error(`No tag metadata found for workflow "${request.workflow}" (request ${request.requestId || request.requestUuid}).`)
+          }
+
+          const workflowTagDefinitions = buildTagDefinitionsFromFlowTags(workflowTags)
+          if (workflowTagDefinitions.length === 0) {
+            throw new Error(`Unable to parse tag conditions for workflow "${request.workflow}" (request ${request.requestId || request.requestUuid}).`)
+          }
+
           const derivedTags = deriveAllTags(
             request.answers,
+            workflowTagDefinitions,
             request.infoSecCriticalityTier,
             request.infoSecSensitivityTier
           )
           const tagAnalysis = analyzeTagDerivations(
             request.answers,
+            workflowTagDefinitions,
             request.infoSecCriticalityTier,
             request.infoSecSensitivityTier
           )
@@ -298,20 +332,15 @@ export function useMaterialityAudit(): UseMaterialityAuditReturn {
           ...updateSummary(initialRows),
         })
 
+        setAuditState({
+          phase: 3,
+          rows: initialRows,
+          ...updateSummary(initialRows),
+        })
+
         const config = getOmneaEnvironmentConfig()
         if (!config.clientId || !config.clientSecret) {
-          const skippedRows = initialRows.map((row) => ({
-            ...row,
-            enrichmentStatus: 'skipped' as const,
-          }))
-
-          setAuditState({
-            phase: 5,
-            rows: skippedRows,
-            ...updateSummary(skippedRows),
-          })
-          setIsProcessing(false)
-          return
+          throw new Error('Omnea credentials are not configured. Add VITE_OMNEA_CLIENT_ID and VITE_OMNEA_CLIENT_SECRET.')
         }
 
         const loadingRows = initialRows.map((row) => ({
@@ -319,7 +348,7 @@ export function useMaterialityAudit(): UseMaterialityAuditReturn {
           enrichmentStatus: row.supplier ? 'loading' as const : 'skipped' as const,
         }))
         setAuditState({
-          phase: 3,
+          phase: 4,
           rows: loadingRows,
           ...updateSummary(loadingRows),
         })
@@ -336,8 +365,8 @@ export function useMaterialityAudit(): UseMaterialityAuditReturn {
           const apiTagDiffs = snapshot ? buildTagDiffs(row.derivedTags, snapshot.actualTags) : null
           const apiMaterialityDiff = buildMaterialityDiff(row.derivedMateriality, snapshot?.materialityLevel ?? null)
           const hasAnyMismatch =
-            row.materialityDiff?.match === false ||
-            (row.tagDiffs?.some((diff) => !diff.match) ?? false) ||
+            !matchedSupplier ||
+            !snapshot ||
             (apiTagDiffs?.some((diff) => !diff.match) ?? false) ||
             apiMaterialityDiff?.match === false
 
@@ -356,6 +385,18 @@ export function useMaterialityAudit(): UseMaterialityAuditReturn {
 
         setAuditState({
           phase: 5,
+          rows: enrichedRows,
+          ...updateSummary(enrichedRows),
+        })
+
+        setAuditState({
+          phase: 6,
+          rows: enrichedRows,
+          ...updateSummary(enrichedRows),
+        })
+
+        setAuditState({
+          phase: 7,
           rows: enrichedRows,
           ...updateSummary(enrichedRows),
         })

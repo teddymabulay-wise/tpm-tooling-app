@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -24,11 +24,10 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { fetchAllOmneaPages, makeOmneaRequest } from "@/lib/omnea-api-utils";
+import { makeOmneaRequest } from "@/lib/omnea-api-utils";
 import { getOmneaEnvironmentConfig } from "@/lib/omnea-environment";
 import {
   Loader2,
-  Upload,
   Download,
   FileText,
   RefreshCw,
@@ -39,6 +38,7 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { toast } from "sonner";
+import { CSVUploader } from "@/components/CSVUploader";
 
 type OmneaSupplierListItem = {
   id: string;
@@ -71,10 +71,9 @@ type SupplierRecord = {
 
 type RequestAuditRow = {
   requestId: string;
-  supplierRef: string;
   supplierName: string;
-  workflow: string;
-  highlightedWorkflow: boolean;
+  requestState: string;
+  serviceDescription: string;
   rawRow: CsvRow;
 };
 
@@ -118,19 +117,10 @@ type FieldAudit = {
 type AuditResultRow = {
   requestId: string;
   supplierName: string;
-  workflow: string;
-  highlightedWorkflow: boolean;
+  serviceDescription: string;
   matchedSupplier: SupplierRecord | null;
   checks: FieldAudit[];
   mismatchCount: number;
-};
-
-type QuickFilters = {
-  emptyDescription: boolean;
-  materialityStandard: boolean;
-  materialityNonMaterial: boolean;
-  matchedRequests: boolean;
-  requestsWithMismatches: boolean;
 };
 
 const splitCsvLine = (line: string): string[] => {
@@ -244,6 +234,11 @@ const parseCsv = (raw: string): { headers: string[]; rows: CsvRow[] } => {
   return { headers, rows };
 };
 
+const hasHeader = (headers: string[], ...keys: string[]): boolean => {
+  const normalizedHeaders = new Set(headers.map((header) => normalizeHeader(header)));
+  return keys.some((key) => normalizedHeaders.has(normalizeHeader(key)));
+};
+
 const getCsvValue = (row: CsvRow, ...keys: string[]): string => {
   const normalizedMap = new Map(
     Object.entries(row).map(([key, value]) => [normalizeHeader(key), value])
@@ -258,22 +253,21 @@ const getCsvValue = (row: CsvRow, ...keys: string[]): string => {
 };
 
 const mapCsvRowToRequestAuditRow = (row: CsvRow, index: number): RequestAuditRow => {
-  const workflow =
+  const serviceDescription =
     getCsvValue(
       row,
-      "workflow",
-      "request please indicate which type of service this is utquestion1",
-      "type"
+      "service description",
+      "request: please provide a description of the product(s) and/or service(s) that are being (or will be) provided to wise with a breakdown of their use cases. (baselineservicespecifictext1)",
+      "description"
     ) || "—";
 
   return {
     requestId:
-      getCsvValue(row, "request id", "request uuid", "request name", "name") ||
+      getCsvValue(row, "request id", "request uuid") ||
       `REQ-${index + 1}`,
-    supplierRef: getCsvValue(row, "omnea id", "supplier id", "supplier uuid"),
-    supplierName: getCsvValue(row, "supplier", "supplier name", "name", "legal name"),
-    workflow,
-    highlightedWorkflow: isHighlightedWorkflow(workflow),
+    supplierName: getCsvValue(row, "supplier", "supplier name"),
+    requestState: getCsvValue(row, "request state", "state", "status"),
+    serviceDescription,
     rawRow: row,
   };
 };
@@ -413,15 +407,8 @@ const MAPPING_FILE_PATH = "/doc/supplier_request_mapping.csv";
 const DEFAULT_FIELD_MAPPINGS: FieldMappingRow[] = [
   {
     supplierField: "description",
-    requestField:
-      "Request: Please provide a description of the product(s) and/or service(s) that are being (or will be) provided to Wise with a breakdown of their use cases. (baselineServiceSpecifictext1)",
+    requestField: "Service Description",
   },
-  { supplierField: "website", requestField: "Website" },
-  { supplierField: "entityType", requestField: "Entity type" },
-  { supplierField: "subsidiaries", requestField: "Subsidiaries" },
-  { supplierField: "lastAssessmentDate", requestField: "Last assessment date" },
-  { supplierField: "department", requestField: "Department" },
-  { supplierField: "address", requestField: "Address" },
 ];
 
 const BUILTIN_SUPPLIER_FIELD_OPTIONS = Object.entries(BUILTIN_SUPPLIER_FIELDS).map(([id, config]) => ({
@@ -453,8 +440,6 @@ const createInitialMappingDraft = (rows: FieldMappingRow[]): FieldMappingDraftRo
   return [...rows, { supplierField: "", requestField: "" }];
 };
 
-const SUPPLIER_CACHE_TTL_MS = 10 * 60 * 1000;
-
 const extractRequestFieldQuestionId = (header: string): string | null => {
   const match = header.match(/\(([^)]+)\)\s*$/);
   return match ? match[1] : null;
@@ -470,11 +455,6 @@ const formatRequestFieldDisplayLabel = (header: string): { label: string; questi
     label: `${labelWithoutId}\n(${questionId})`,
     questionId,
   };
-};
-
-const isHighlightedWorkflow = (value: string): boolean => {
-  const normalized = normalizeComparable(value);
-  return normalized.includes("new service") || normalized.includes("third party onboarding");
 };
 
 export default function SupplierRecordAuditPage() {
@@ -495,16 +475,9 @@ export default function SupplierRecordAuditPage() {
   const [supplierFieldSearch, setSupplierFieldSearch] = useState("");
 
   const [auditResults, setAuditResults] = useState<AuditResultRow[]>([]);
-  const [quickFilters, setQuickFilters] = useState<QuickFilters>({
-    emptyDescription: false,
-    materialityStandard: false,
-    materialityNonMaterial: false,
-    matchedRequests: false,
-    requestsWithMismatches: false,
-  });
-
   const [applyInProgress, setApplyInProgress] = useState<Record<string, boolean>>({});
-  const [expandedSupplierIds, setExpandedSupplierIds] = useState<string[]>([]);
+  const [auditFlowStep, setAuditFlowStep] = useState<1 | 2 | 3 | 4>(1);
+  const [isComparingData, setIsComparingData] = useState(false);
 
   const supplierFieldOptions = useMemo(() => {
     const customOptionMap = new Map<string, SupplierFieldOption>();
@@ -540,8 +513,6 @@ export default function SupplierRecordAuditPage() {
     autoLoadSuppliers: boolean;
     onSuccess?: () => void;
   } | null>(null);
-  const supplierCacheRef = useRef<{ data: SupplierRecord[]; ts: number } | null>(null);
-  const supplierListCacheRef = useRef<{ data: OmneaSupplierListItem[]; ts: number } | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -568,107 +539,46 @@ export default function SupplierRecordAuditPage() {
     };
   }, []);
 
-  const supplierMatchesQuickFilters = (supplier: SupplierRecord): boolean => {
-    if (quickFilters.emptyDescription && supplier.description.trim()) return false;
+  const parseSupplierSearchResponse = (data: unknown): OmneaSupplierListItem[] => {
+    if (!data || typeof data !== "object") return [];
 
-    const normalizedMateriality = normalizeComparable(supplier.materialityLevel);
-    if (quickFilters.materialityStandard && normalizedMateriality !== "standard") return false;
-    if (quickFilters.materialityNonMaterial && normalizedMateriality !== "non material" && normalizedMateriality !== "non-material" && normalizedMateriality !== "nonmaterial") return false;
+    const payload = (data as Record<string, unknown>).data ?? data;
+    if (Array.isArray(payload)) return payload as OmneaSupplierListItem[];
 
-    return true;
-  };
-
-  const toggleQuickFilter = (key: keyof QuickFilters) => {
-    setQuickFilters((prev) => ({ ...prev, [key]: !prev[key] }));
-  };
-
-  const clearQuickFilters = () => {
-    setQuickFilters({
-      emptyDescription: false,
-      materialityStandard: false,
-      materialityNonMaterial: false,
-      matchedRequests: false,
-      requestsWithMismatches: false,
-    });
-  };
-
-  const toggleSupplierExpansion = (supplierId: string) => {
-    setExpandedSupplierIds((prev) =>
-      prev.includes(supplierId) ? prev.filter((id) => id !== supplierId) : [...prev, supplierId]
-    );
-  };
-
-  const getSupplierList = async (force = false): Promise<OmneaSupplierListItem[]> => {
-    const now = Date.now();
-    if (!force && supplierListCacheRef.current && now - supplierListCacheRef.current.ts < SUPPLIER_CACHE_TTL_MS) {
-      return supplierListCacheRef.current.data;
+    if (payload && typeof payload === "object") {
+      const nested = payload as Record<string, unknown>;
+      if (Array.isArray(nested.items)) return nested.items as OmneaSupplierListItem[];
+      if (Array.isArray(nested.results)) return nested.results as OmneaSupplierListItem[];
     }
 
-    const config = getOmneaEnvironmentConfig();
-    const supplierList = await fetchAllOmneaPages<OmneaSupplierListItem>(`${config.apiBaseUrl}/v1/suppliers`);
-    supplierListCacheRef.current = { data: supplierList, ts: Date.now() };
-    return supplierList;
+    return [];
   };
 
-  const loadSuppliers = async (force = false) => {
-    const config = getOmneaEnvironmentConfig();
-    if (!config.clientId || !config.clientSecret || !config.apiBaseUrl) {
-      setSupplierError("Omnea credentials are not configured for this environment. Add VITE_OMNEA_CLIENT_ID and VITE_OMNEA_CLIENT_SECRET in env settings.");
-      return;
+  const findSupplierFromSearchResults = (
+    suppliers: OmneaSupplierListItem[],
+    supplierName: string
+  ): OmneaSupplierListItem | null => {
+    if (!suppliers.length) return null;
+
+    const normalizedName = normalizeForMatch(supplierName);
+
+    if (normalizedName) {
+      const byExactName = suppliers.find((supplier) =>
+        normalizeForMatch(supplier.name || "") === normalizedName ||
+        normalizeForMatch(supplier.legalName || "") === normalizedName
+      );
+      if (byExactName) return byExactName;
+
+      const byPartialName = suppliers.find((supplier) => {
+        const candidateNames = [supplier.name, supplier.legalName]
+          .map((value) => normalizeForMatch(value || ""))
+          .filter(Boolean);
+        return candidateNames.some((value) => value.includes(normalizedName) || normalizedName.includes(value));
+      });
+      if (byPartialName) return byPartialName;
     }
 
-    const now = Date.now();
-    if (!force && supplierCacheRef.current && now - supplierCacheRef.current.ts < SUPPLIER_CACHE_TTL_MS) {
-      setSuppliers(supplierCacheRef.current.data);
-      return;
-    }
-
-    setLoadingSuppliers(true);
-    setSupplierError(null);
-
-    try {
-      const supplierList = await getSupplierList(force);
-
-      const detailConcurrency = 60;
-      const supplierById = new Map<string, SupplierRecord>();
-
-      for (let start = 0; start < supplierList.length; start += detailConcurrency) {
-        const batch = supplierList.slice(start, start + detailConcurrency);
-        const batchResults = await Promise.all(
-          batch.map(async (supplier) => {
-            const detailResponse = await makeOmneaRequest<Record<string, unknown>>(
-              `${config.apiBaseUrl}/v1/suppliers/${supplier.id}`,
-              { method: "GET" }
-            );
-
-            if (detailResponse.error || !detailResponse.data) {
-              return mapSupplierListItemToRecord(supplier);
-            }
-
-            const detail = ((detailResponse.data as Record<string, unknown>).data ?? detailResponse.data) as Record<string, unknown>;
-            return mapSupplierDetailToRecord(detail, supplier);
-          })
-        );
-
-        batchResults.forEach((record, index) => {
-          const supplier = batch[index];
-          supplierById.set(supplier.id, record);
-        });
-      }
-
-      const records = supplierList.map((supplier) => supplierById.get(supplier.id) ?? mapSupplierListItemToRecord(supplier));
-      supplierCacheRef.current = { data: records, ts: Date.now() };
-      setSuppliers(records);
-      setExpandedSupplierIds([]);
-      setLastLoaded(new Date());
-      toast.success(`Loaded ${records.length} suppliers`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to load suppliers";
-      setSupplierError(message);
-      toast.error(message);
-    } finally {
-      setLoadingSuppliers(false);
-    }
+    return suppliers[0] ?? null;
   };
 
   const loadSuppliersFromRequestRows = async (rows: RequestAuditRow[]): Promise<boolean> => {
@@ -685,60 +595,65 @@ export default function SupplierRecordAuditPage() {
 
     setLoadingSuppliers(true);
     setSupplierError(null);
+    setAuditFlowStep(2);
 
     try {
-      const supplierList = await getSupplierList(false);
-      const byId = new Map<string, OmneaSupplierListItem>();
-      const byPublicId = new Map<string, OmneaSupplierListItem>();
-      const byName = new Map<string, OmneaSupplierListItem>();
-
-      supplierList.forEach((supplier) => {
-        byId.set(supplier.id, supplier);
-        if (supplier.publicId) byPublicId.set(normalizeForMatch(supplier.publicId), supplier);
-        if (supplier.name) byName.set(normalizeForMatch(supplier.name), supplier);
-        if (supplier.legalName) byName.set(normalizeForMatch(supplier.legalName), supplier);
-      });
-
-      const targetIds = new Set<string>();
+      const resolvedSuppliersById = new Map<string, OmneaSupplierListItem>();
+      const searchCache = new Map<string, OmneaSupplierListItem | null>();
       let unresolvedReferenceCount = 0;
 
-      rows.forEach((row) => {
-        const supplierRef = row.supplierRef.trim();
+      for (const row of rows) {
         const supplierName = row.supplierName.trim();
 
-        if (supplierRef) {
-          const resolvedByRef = byId.get(supplierRef) || byPublicId.get(normalizeForMatch(supplierRef));
-          if (resolvedByRef) {
-            targetIds.add(resolvedByRef.id);
-          } else {
-            unresolvedReferenceCount += 1;
-          }
-          return;
+        if (!supplierName) {
+          unresolvedReferenceCount += 1;
+          continue;
         }
 
-        if (supplierName) {
-          const resolvedByName = byName.get(normalizeForMatch(supplierName));
-          if (resolvedByName) {
-            targetIds.add(resolvedByName.id);
-          } else {
-            unresolvedReferenceCount += 1;
-          }
+        const cacheKey = normalizeForMatch(supplierName);
+        if (searchCache.has(cacheKey)) {
+          const cached = searchCache.get(cacheKey);
+          if (cached) resolvedSuppliersById.set(cached.id, cached);
+          else unresolvedReferenceCount += 1;
+          continue;
         }
-      });
 
-      const targetSuppliers = Array.from(targetIds)
-        .map((id) => byId.get(id))
-        .filter((supplier): supplier is OmneaSupplierListItem => Boolean(supplier));
+        let resolvedSupplier: OmneaSupplierListItem | null = null;
+
+        const searchResponse = await makeOmneaRequest<Record<string, unknown>>(
+          `${config.apiBaseUrl}/v1/suppliers`,
+          {
+            method: "GET",
+            params: {
+              limit: "50",
+              search: supplierName,
+            },
+          }
+        );
+
+        if (!searchResponse.error && searchResponse.data) {
+          const candidates = parseSupplierSearchResponse(searchResponse.data);
+          resolvedSupplier = findSupplierFromSearchResults(candidates, supplierName);
+        }
+
+        searchCache.set(cacheKey, resolvedSupplier);
+        if (resolvedSupplier) {
+          resolvedSuppliersById.set(resolvedSupplier.id, resolvedSupplier);
+        } else {
+          unresolvedReferenceCount += 1;
+        }
+      }
+
+      const targetSuppliers = Array.from(resolvedSuppliersById.values());
 
       if (!targetSuppliers.length) {
         setSuppliers([]);
-        setExpandedSupplierIds([]);
         setLastLoaded(new Date());
-        toast.warning("No suppliers from CSV could be resolved. Use Load all suppliers as fallback.");
+        toast.warning("No suppliers from CSV could be resolved.");
         return false;
       }
 
-      const detailConcurrency = 40;
+      const detailConcurrency = 20;
       const supplierById = new Map<string, SupplierRecord>();
 
       for (let start = 0; start < targetSuppliers.length; start += detailConcurrency) {
@@ -767,8 +682,8 @@ export default function SupplierRecordAuditPage() {
 
       const records = targetSuppliers.map((supplier) => supplierById.get(supplier.id) ?? mapSupplierListItemToRecord(supplier));
       setSuppliers(records);
-      setExpandedSupplierIds([]);
       setLastLoaded(new Date());
+      setAuditFlowStep(3);
 
       if (unresolvedReferenceCount > 0) {
         toast.success(`Loaded ${records.length} suppliers from CSV (${unresolvedReferenceCount} request references unresolved)`);
@@ -786,34 +701,69 @@ export default function SupplierRecordAuditPage() {
     }
   };
 
+  const processRequestCsv = (
+    raw: string,
+    fileName: string,
+    options: { autoLoadSuppliers: boolean; onSuccess?: () => void } = { autoLoadSuppliers: true }
+  ) => {
+    setRequestUploadError(null);
+    const { headers, rows } = parseCsv(raw);
+
+    if (!headers.length || !rows.length) {
+      setRequestUploadError("CSV must include a header row and at least one data row.");
+      toast.error("CSV appears empty or malformed");
+      return;
+    }
+
+    const hasRequestId = hasHeader(headers, "request id", "request uuid");
+    const hasRequestState = hasHeader(headers, "request state", "state", "status");
+    const hasSupplier = hasHeader(headers, "supplier", "supplier name");
+    const hasServiceDescription = hasHeader(
+      headers,
+      "service description",
+      "request: please provide a description of the product(s) and/or service(s) that are being (or will be) provided to wise with a breakdown of their use cases. (baselineservicespecifictext1)",
+      "description"
+    );
+
+    if (!hasRequestId || !hasRequestState || !hasSupplier || !hasServiceDescription) {
+      setRequestUploadError("CSV must include Request ID, Request State, Supplier, and Service Description columns.");
+      toast.error("Missing required request CSV columns");
+      return;
+    }
+
+    const parsed = rows
+      .map((row, index) => mapCsvRowToRequestAuditRow(row, index))
+      .filter((row) => normalizeComparable(row.requestState) === "completed");
+
+    if (!parsed.length) {
+      setRequestUploadError("No completed requests found. Only rows with Request State = Completed are processed.");
+      toast.warning("No completed requests found in CSV");
+      return;
+    }
+
+    setFieldMappings([{ supplierField: "description", requestField: "Service Description" }]);
+    setMappingDraft(createInitialMappingDraft([{ supplierField: "description", requestField: "Service Description" }]));
+    setRequestHeaders(headers);
+    setRequestRows(parsed);
+    setRequestFileName(fileName);
+    setAuditFlowStep(2);
+    if (options.autoLoadSuppliers) {
+      void loadSuppliersFromRequestRows(parsed);
+      toast.success(`CSV uploaded (${parsed.length} requests). Loading referenced suppliers…`);
+    } else {
+      toast.success(`CSV uploaded (${parsed.length} requests). Click Next to fetch CSV-listed suppliers.`);
+    }
+    options.onSuccess?.();
+  };
+
   const handleCsvUpload = (
     file: File,
     options: { autoLoadSuppliers: boolean; onSuccess?: () => void } = { autoLoadSuppliers: true }
   ) => {
-    setRequestUploadError(null);
-
     const reader = new FileReader();
     reader.onload = (event) => {
       const raw = event.target?.result as string;
-      const { headers, rows } = parseCsv(raw);
-
-      if (!headers.length || !rows.length) {
-        setRequestUploadError("CSV must include a header row and at least one data row.");
-        toast.error("CSV appears empty or malformed");
-        return;
-      }
-
-      const parsed = rows.map((row, index) => mapCsvRowToRequestAuditRow(row, index));
-      setRequestHeaders(headers);
-      setRequestRows(parsed);
-      setRequestFileName(file.name);
-      if (options.autoLoadSuppliers) {
-        void loadSuppliersFromRequestRows(parsed);
-        toast.success(`CSV uploaded (${parsed.length} requests). Loading referenced suppliers…`);
-      } else {
-        toast.success(`CSV uploaded (${parsed.length} requests). Click Next to load suppliers.`);
-      }
-      options.onSuccess?.();
+      processRequestCsv(raw, file.name, options);
     };
 
     reader.readAsText(file);
@@ -852,33 +802,33 @@ export default function SupplierRecordAuditPage() {
   useEffect(() => {
     if (!requestRows.length || !suppliers.length) {
       setAuditResults([]);
+      if (!requestRows.length) {
+        setAuditFlowStep(1);
+      }
       return;
     }
 
+    setAuditFlowStep(3);
+    setIsComparingData(true);
+
     const supplierById = new Map<string, SupplierRecord>();
-    const supplierByPublicId = new Map<string, SupplierRecord>();
     const supplierByName = new Map<string, SupplierRecord>();
 
     suppliers.forEach((supplier) => {
       supplierById.set(supplier.id, supplier);
-      if (supplier.publicId) supplierByPublicId.set(normalizeForMatch(supplier.publicId), supplier);
       if (supplier.name) supplierByName.set(normalizeForMatch(supplier.name), supplier);
       if (supplier.legalName) supplierByName.set(normalizeForMatch(supplier.legalName), supplier);
     });
 
     const nextResults = requestRows.map((request) => {
-      const byId = request.supplierRef
-        ? supplierById.get(request.supplierRef) || supplierByPublicId.get(normalizeForMatch(request.supplierRef))
-        : undefined;
       const byName = request.supplierName ? supplierByName.get(normalizeForMatch(request.supplierName)) : undefined;
-      const matchedSupplier = byId || byName || null;
+      const matchedSupplier = byName || null;
 
       if (!matchedSupplier) {
         return {
           requestId: request.requestId,
-          supplierName: request.supplierName || request.supplierRef || "—",
-          workflow: request.workflow,
-          highlightedWorkflow: request.highlightedWorkflow,
+          supplierName: request.supplierName || "—",
+          serviceDescription: request.serviceDescription,
           matchedSupplier: null,
           checks: [],
           mismatchCount: 0,
@@ -907,8 +857,7 @@ export default function SupplierRecordAuditPage() {
       return {
         requestId: request.requestId,
         supplierName: request.supplierName || matchedSupplier.name,
-        workflow: request.workflow,
-        highlightedWorkflow: request.highlightedWorkflow,
+        serviceDescription: request.serviceDescription,
         matchedSupplier,
         checks,
         mismatchCount: checks.filter((check) => check.compared && !check.matches).length,
@@ -916,6 +865,8 @@ export default function SupplierRecordAuditPage() {
     });
 
     setAuditResults(nextResults);
+    setIsComparingData(false);
+    setAuditFlowStep(4);
   }, [requestRows, suppliers, fieldMappings, supplierFieldOptionMap]);
 
   const applyRequestValueToSupplier = async (result: AuditResultRow, check: FieldAudit) => {
@@ -983,8 +934,7 @@ export default function SupplierRecordAuditPage() {
     const headers = [
       "request_id",
       "request_supplier",
-      "request_workflow",
-      "workflow_highlighted",
+      "request_service_description",
       "matched_supplier_name",
       "matched_supplier_id",
       "mismatch_count",
@@ -1006,8 +956,7 @@ export default function SupplierRecordAuditPage() {
       return {
         request_id: result.requestId,
         request_supplier: result.supplierName,
-        request_workflow: result.workflow,
-        workflow_highlighted: result.highlightedWorkflow ? "YES" : "NO",
+        request_service_description: result.serviceDescription,
         matched_supplier_name: result.matchedSupplier?.name ?? "",
         matched_supplier_id: result.matchedSupplier?.id ?? "",
         mismatch_count: String(result.mismatchCount),
@@ -1025,33 +974,15 @@ export default function SupplierRecordAuditPage() {
     URL.revokeObjectURL(url);
   };
 
-  const filteredSuppliers = useMemo(
-    () =>
-      suppliers.filter((supplier) => {
-        if (!supplierMatchesQuickFilters(supplier)) return false;
-        if (quickFilters.matchedRequests) {
-          return auditResults.some((result) => result.matchedSupplier?.id === supplier.id);
-        }
-        if (quickFilters.requestsWithMismatches && auditResults.length > 0) {
-          return auditResults.some(
-            (r) => r.matchedSupplier?.id === supplier.id && r.mismatchCount > 0
-          );
-        }
-        return true;
-      }),
-    [suppliers, quickFilters, auditResults]
+  const matchedAuditResults = useMemo(
+    () => auditResults.filter((result) => !!result.matchedSupplier),
+    [auditResults]
   );
 
-  const auditResultsBySupplier = useMemo(() => {
-    const map = new Map<string, AuditResultRow[]>();
-    for (const result of auditResults) {
-      if (!result.matchedSupplier) continue;
-      const id = result.matchedSupplier.id;
-      if (!map.has(id)) map.set(id, []);
-      map.get(id)!.push(result);
-    }
-    return map;
-  }, [auditResults]);
+  const matchedSupplierCount = useMemo(
+    () => new Set(matchedAuditResults.map((result) => result.matchedSupplier?.id).filter(Boolean)).size,
+    [matchedAuditResults]
+  );
 
   const unmatchedAuditResults = useMemo(
     () => auditResults.filter((r) => !r.matchedSupplier),
@@ -1068,9 +999,9 @@ export default function SupplierRecordAuditPage() {
     [auditResults]
   );
 
-  const activeQuickFilterCount = useMemo(
-    () => Object.values(quickFilters).filter(Boolean).length,
-    [quickFilters]
+  const totalMismatchFieldCount = useMemo(
+    () => auditResults.reduce((total, result) => total + result.mismatchCount, 0),
+    [auditResults]
   );
 
   return (
@@ -1079,23 +1010,33 @@ export default function SupplierRecordAuditPage() {
         <div>
           <h1 className="text-2xl font-semibold">Supplier Record Audit</h1>
           <p className="text-sm text-muted-foreground mt-1">
-            Pull supplier records from API, upload request CSV, then compare request fields against supplier data.
+            Upload request CSV, fetch only listed suppliers from API, compare fields, and review mismatches.
           </p>
         </div>
         <div className="flex items-center gap-2">
           {lastLoaded && (
             <span className="text-xs text-muted-foreground">Last loaded {lastLoaded.toLocaleTimeString()}</span>
           )}
-          <Button variant="outline" size="sm" onClick={() => loadSuppliers(true)} disabled={loadingSuppliers}>
-            {loadingSuppliers ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
-            ) : (
-              <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
-            )}
-            Load all suppliers
-          </Button>
         </div>
       </div>
+
+      <Card className="p-4">
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <Badge variant={auditFlowStep === 1 ? "default" : requestRows.length > 0 ? "secondary" : "outline"}>1. Request CSV</Badge>
+          <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+          <Badge variant={auditFlowStep === 2 ? "default" : suppliers.length > 0 ? "secondary" : "outline"}>
+            2. Fetch API Data
+          </Badge>
+          {loadingSuppliers ? <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" /> : null}
+          <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+          <Badge variant={auditFlowStep === 3 ? "default" : auditFlowStep === 4 ? "secondary" : "outline"}>
+            3. Compare
+          </Badge>
+          {isComparingData ? <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" /> : null}
+          <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+          <Badge variant={auditFlowStep === 4 ? "default" : "outline"}>4. Results</Badge>
+        </div>
+      </Card>
 
       {supplierError && (
         <Card className="p-4 border-destructive/50 bg-destructive/5 flex items-start gap-3">
@@ -1111,116 +1052,61 @@ export default function SupplierRecordAuditPage() {
         </Card>
       )}
 
-      <Card className="p-4 space-y-3">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <FileText className="h-4 w-4 text-muted-foreground" />
-            <span className="text-sm font-medium">Request CSV</span>
-            {requestFileName && (
-              <Badge variant="secondary" className="text-xs gap-1">
-                {requestFileName}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setRequestFileName(null);
-                    setRequestRows([]);
-                    setRequestHeaders([]);
-                    setAuditResults([]);
-                    setRequestUploadError(null);
-                  }}
-                  className="ml-0.5 hover:text-destructive"
-                >
-                  <X className="h-3 w-3" />
-                </button>
-              </Badge>
-            )}
-          </div>
-          <div className="flex items-center gap-2">
+      <div className="space-y-3">
+        <CSVUploader
+          title="Request CSV Upload"
+          description="Upload request CSV to fetch and audit only suppliers listed in the file."
+          defaultOpen
+          showPreviewTable={false}
+          onFileLoaded={(text, name) => {
+            processRequestCsv(text, name, { autoLoadSuppliers: true });
+          }}
+        />
+        {requestFileName ? (
+          <Card className="p-3 flex items-center justify-between">
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <FileText className="h-3.5 w-3.5" />
+              <span>Loaded file: {requestFileName}</span>
+            </div>
             <Button
-              variant="outline"
+              variant="ghost"
               size="sm"
               onClick={() => {
-                setMappingWizardStep(1);
-                setSupplierFieldSearch("");
-                setRequestFieldSearch("");
-                setMappingDraft(createInitialMappingDraft(fieldMappings));
-                setIsMappingModalOpen(true);
+                setRequestFileName(null);
+                setRequestRows([]);
+                setRequestHeaders([]);
+                setSuppliers([]);
+                setAuditResults([]);
+                setRequestUploadError(null);
+                setAuditFlowStep(1);
+                setIsComparingData(false);
               }}
             >
-              Field Mapping
+              <X className="h-3.5 w-3.5 mr-1" />
+              Clear CSV
             </Button>
-          </div>
-          <input
-            ref={csvInputRef}
-            type="file"
-            accept=".csv"
-            className="hidden"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) {
-                const options = pendingCsvUploadOptionsRef.current ?? { autoLoadSuppliers: true };
-                pendingCsvUploadOptionsRef.current = null;
-                handleCsvUpload(file, options);
-              }
-              e.target.value = "";
-            }}
-          />
-        </div>
-        <p className="text-xs text-muted-foreground">
-          Uploading request CSV pulls only referenced suppliers first (ID / public ID / supplier name). Use "Load all suppliers" as fallback.
-        </p>
-      </Card>
-
-      <Card className="p-4 space-y-3">
-        <div className="flex items-center justify-between">
-          <h3 className="text-sm font-medium">Quick Filters</h3>
-          {activeQuickFilterCount > 0 && (
-            <Button variant="ghost" size="sm" onClick={clearQuickFilters}>Clear filters ({activeQuickFilterCount})</Button>
-          )}
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Button
-            size="sm"
-            variant={quickFilters.emptyDescription ? "default" : "outline"}
-            onClick={() => toggleQuickFilter("emptyDescription")}
-          >
-            Empty Description
-          </Button>
-          <Button
-            size="sm"
-            variant={quickFilters.materialityStandard ? "default" : "outline"}
-            onClick={() => toggleQuickFilter("materialityStandard")}
-          >
-            Materiality: Standard
-          </Button>
-          <Button
-            size="sm"
-            variant={quickFilters.materialityNonMaterial ? "default" : "outline"}
-            onClick={() => toggleQuickFilter("materialityNonMaterial")}
-          >
-            Materiality: Non-Material
-          </Button>
-          <Button
-            size="sm"
-            variant={quickFilters.matchedRequests ? "default" : "outline"}
-            onClick={() => toggleQuickFilter("matchedRequests")}
-          >
-            Suppliers with matched requests
-          </Button>
-          <Button
-            size="sm"
-            variant={quickFilters.requestsWithMismatches ? "default" : "outline"}
-            onClick={() => toggleQuickFilter("requestsWithMismatches")}
-          >
-            Requests with mismatches
-          </Button>
-        </div>
-        <p className="text-xs text-muted-foreground">Filters are combinable and apply together.</p>
-      </Card>
+          </Card>
+        ) : null}
+        <input
+          ref={csvInputRef}
+          type="file"
+          accept=".csv"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) {
+              const options = pendingCsvUploadOptionsRef.current ?? { autoLoadSuppliers: true };
+              pendingCsvUploadOptionsRef.current = null;
+              handleCsvUpload(file, options);
+            }
+            e.target.value = "";
+          }}
+        />
+      </div>
 
       {suppliers.length > 0 && (
         <div className="flex items-center gap-4 flex-wrap">
-          <Badge variant="secondary" className="text-xs">{filteredSuppliers.length} suppliers shown</Badge>
+          <Badge variant="secondary" className="text-xs">{matchedSupplierCount} suppliers matched</Badge>
           {requestRows.length > 0 && (
             <>
               <Badge variant="default" className="text-xs gap-1">
@@ -1230,6 +1116,10 @@ export default function SupplierRecordAuditPage() {
               <Badge variant={requestMismatchCount > 0 ? "destructive" : "outline"} className="text-xs gap-1">
                 <ShieldAlert className="h-3 w-3" />
                 {requestMismatchCount} requests with mismatches
+              </Badge>
+              <Badge variant={totalMismatchFieldCount > 0 ? "destructive" : "outline"} className="text-xs gap-1">
+                <ShieldAlert className="h-3 w-3" />
+                {totalMismatchFieldCount} mismatched fields
               </Badge>
             </>
           )}
@@ -1250,183 +1140,107 @@ export default function SupplierRecordAuditPage() {
       ) : suppliers.length > 0 ? (
         <Card className="overflow-hidden">
           <div className="overflow-x-auto">
-            {(() => {
-              const activeColumns = fieldMappings.filter((m) => m.supplierField.trim());
-              const totalColSpan = 1 + activeColumns.length;
-              return (
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead className="text-xs whitespace-nowrap">Name</TableHead>
-                  {activeColumns.map((mapping) => (
-                    <TableHead key={mapping.supplierField} className="text-xs whitespace-nowrap">
-                      {getSupplierFieldDisplayLabel(mapping.supplierField, supplierFieldOptionMap)}
-                    </TableHead>
-                  ))}
+                  <TableHead className="text-xs whitespace-nowrap">Request ID</TableHead>
+                  <TableHead className="text-xs min-w-[280px]">Service Description</TableHead>
+                  <TableHead className="text-xs whitespace-nowrap">Supplier</TableHead>
+                  <TableHead className="text-xs whitespace-nowrap">Status</TableHead>
+                  <TableHead className="text-xs min-w-[420px]">Mismatch Details (Supplier Record vs Request)</TableHead>
+                  <TableHead className="text-xs whitespace-nowrap">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {filteredSuppliers.map((supplier) => {
-                  const supplierRequests = auditResultsBySupplier.get(supplier.id) ?? [];
-                  const isExpanded = expandedSupplierIds.includes(supplier.id);
-                  const supplierMismatchCount = supplierRequests.filter((r) => r.mismatchCount > 0).length;
-                  return (
-                    <Fragment key={supplier.id}>
-                      <TableRow>
-                        <TableCell className="text-xs">
-                          <button
-                            type="button"
-                            onClick={() => toggleSupplierExpansion(supplier.id)}
-                            className="flex items-start gap-1.5 text-left w-full"
-                          >
-                            <ChevronRight
-                              className={`mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-muted-foreground transition-transform ${isExpanded ? "rotate-90" : ""}`}
-                            />
-                            <div className="space-y-0.5">
-                              <div className="font-medium">{supplier.name || "—"}</div>
-                              {auditResults.length > 0 && (
-                                <div className="text-[10px] text-muted-foreground">
-                                  {supplierRequests.length} request{supplierRequests.length === 1 ? "" : "s"}
-                                  {supplierMismatchCount > 0 && (
-                                    <span className="ml-1 text-destructive font-medium">· {supplierMismatchCount} mismatch{supplierMismatchCount === 1 ? "" : "es"}</span>
-                                  )}
-                                </div>
-                              )}
-                            </div>
-                          </button>
-                        </TableCell>
-                        {activeColumns.map((mapping) => {
-                          const option = supplierFieldOptionMap.get(mapping.supplierField);
-                          const raw = getSupplierFieldValue(supplier, option);
-                          const display = option?.isDate ? parseDateOnly(raw) : raw;
-                          const isLong = (display?.length ?? 0) > 60;
-                          return (
-                            <TableCell
-                              key={mapping.supplierField}
-                              className={`text-xs ${isLong ? "whitespace-normal break-words min-w-[180px] max-w-[320px]" : "whitespace-nowrap"}`}
-                            >
-                              {display || "—"}
-                            </TableCell>
-                          );
-                        })}
-                      </TableRow>
-                      {isExpanded && (
-                        <TableRow className="bg-secondary/30 hover:bg-secondary/40">
-                          <TableCell colSpan={totalColSpan} className="py-2 pl-8">
-                            <div className="overflow-auto">
-                              <Table>
-                                <TableHeader>
-                                  <TableRow>
-                                    <TableHead className="text-[9px] py-1 whitespace-nowrap">Request ID</TableHead>
-                                    <TableHead className="text-[9px] py-1 whitespace-nowrap">Workflow</TableHead>
-                                    <TableHead className="text-[9px] py-1 whitespace-nowrap">Request Supplier</TableHead>
-                                    <TableHead className="text-[9px] py-1 whitespace-nowrap">Status</TableHead>
-                                    <TableHead className="text-[9px] py-1 whitespace-nowrap">Mismatched Fields</TableHead>
-                                    <TableHead className="text-[9px] py-1 whitespace-nowrap">Actions</TableHead>
-                                  </TableRow>
-                                </TableHeader>
-                                <TableBody>
-                                  {supplierRequests.length === 0 ? (
-                                    <TableRow>
-                                      <TableCell colSpan={6} className="text-[10px] text-muted-foreground py-2">
-                                        No matching requests in uploaded CSV
-                                      </TableCell>
-                                    </TableRow>
-                                  ) : (
-                                    supplierRequests
-                                      .slice()
-                                      .sort((a, b) => Number(b.highlightedWorkflow) - Number(a.highlightedWorkflow))
-                                      .map((result) => {
-                                      const mismatchedChecks = result.checks.filter(
-                                        (check) => check.compared && !check.matches && check.requestValue
-                                      );
-                                      const mismatchLabels = mismatchedChecks.map(
-                                        (check) => check.label.split(" → ")[0]
-                                      );
-                                      return (
-                                        <TableRow
-                                          key={`${result.requestId}-${result.supplierName}`}
-                                          className="bg-secondary/20"
-                                        >
-                                          <TableCell className="text-[10px] font-mono py-1.5 whitespace-nowrap">
-                                            {result.requestId}
-                                          </TableCell>
-                                          <TableCell className="text-[10px] py-1.5 whitespace-nowrap">
-                                            {result.highlightedWorkflow ? (
-                                              <Badge variant="default" className="text-[9px]">
-                                                {result.workflow}
-                                              </Badge>
-                                            ) : (
-                                              <Badge variant="outline" className="text-[9px]">
-                                                {result.workflow || "—"}
-                                              </Badge>
-                                            )}
-                                          </TableCell>
-                                          <TableCell className="text-[10px] py-1.5 whitespace-nowrap">
-                                            {result.supplierName || "—"}
-                                          </TableCell>
-                                          <TableCell className="text-[10px] py-1.5">
-                                            {result.mismatchCount > 0 ? (
-                                              <Badge variant="destructive" className="text-[9px]">
-                                                {result.mismatchCount} mismatch{result.mismatchCount === 1 ? "" : "es"}
-                                              </Badge>
-                                            ) : (
-                                              <Badge variant="default" className="text-[9px]">Pass</Badge>
-                                            )}
-                                          </TableCell>
-                                          <TableCell className="text-[10px] py-1.5 whitespace-normal break-words max-w-[300px]">
-                                            {mismatchLabels.length ? mismatchLabels.join(", ") : "—"}
-                                          </TableCell>
-                                          <TableCell className="text-[10px] py-1.5">
-                                            <div className="flex flex-wrap gap-1">
-                                              {mismatchedChecks.length > 0 ? (
-                                                mismatchedChecks.map((check) => {
-                                                  const actionId = `${result.requestId}:${result.matchedSupplier?.id}:${check.key}`;
-                                                  const isApplying = applyInProgress[actionId] === true;
-                                                  return (
-                                                    <Button
-                                                      key={actionId}
-                                                      size="sm"
-                                                      variant="outline"
-                                                      className="h-6 px-2 text-[9px]"
-                                                      disabled={isApplying}
-                                                      onClick={() => void applyRequestValueToSupplier(result, check)}
-                                                    >
-                                                      {isApplying ? (
-                                                        <Loader2 className="h-3 w-3 animate-spin mr-1" />
-                                                      ) : null}
-                                                      Apply {getSupplierFieldDisplayLabel(check.key, supplierFieldOptionMap)}
-                                                    </Button>
-                                                  );
-                                                })
-                                              ) : (
-                                                <span className="text-muted-foreground">—</span>
-                                              )}
-                                            </div>
-                                          </TableCell>
-                                        </TableRow>
-                                      );
-                                      })
-                                  )}
-                                </TableBody>
-                              </Table>
-                            </div>
+                {matchedAuditResults.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={6} className="text-xs text-muted-foreground py-8 text-center">
+                      No matched requests yet. Upload a CSV with supplier references to generate audit results.
+                    </TableCell>
+                  </TableRow>
+                ) : (
+                  matchedAuditResults
+                    .slice()
+                    .sort((a, b) => a.requestId.localeCompare(b.requestId))
+                    .map((result) => {
+                      const mismatchedChecks = result.checks.filter(
+                        (check) => check.compared && !check.matches && check.requestValue
+                      );
+
+                      return (
+                        <TableRow key={`${result.requestId}-${result.matchedSupplier?.id}`}>
+                          <TableCell className="text-xs font-mono whitespace-nowrap">{result.requestId}</TableCell>
+                          <TableCell className="text-xs whitespace-normal break-words max-w-[420px]">
+                            {result.serviceDescription || "—"}
+                          </TableCell>
+                          <TableCell className="text-xs whitespace-nowrap">
+                            <div className="font-medium">{result.matchedSupplier?.name || result.supplierName || "—"}</div>
+                            <div className="text-[10px] text-muted-foreground">{result.matchedSupplier?.id || ""}</div>
+                          </TableCell>
+                          <TableCell className="text-xs whitespace-nowrap">
+                            {result.mismatchCount > 0 ? (
+                              <Badge variant="destructive" className="text-[10px]">
+                                {result.mismatchCount} mismatch{result.mismatchCount === 1 ? "" : "es"}
+                              </Badge>
+                            ) : (
+                              <Badge variant="default" className="text-[10px]">Pass</Badge>
+                            )}
+                          </TableCell>
+                          <TableCell className="text-xs align-top">
+                            {mismatchedChecks.length === 0 ? (
+                              <span className="text-muted-foreground">No differences found.</span>
+                            ) : (
+                              <div className="space-y-2">
+                                {mismatchedChecks.map((check) => {
+                                  const requestLabel = check.label.split(" → ")[0] || check.label;
+                                  return (
+                                    <div key={`${result.requestId}-${check.key}`} className="rounded-md border bg-secondary/20 px-2 py-1.5">
+                                      <p className="text-[10px] font-medium">{requestLabel}</p>
+                                      <p className="text-[10px] text-muted-foreground">Supplier Record: {check.supplierValue || "—"}</p>
+                                      <p className="text-[10px] text-muted-foreground">Request: {check.requestValue || "—"}</p>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </TableCell>
+                          <TableCell className="text-xs align-top">
+                            {mismatchedChecks.length > 0 ? (
+                              <div className="flex flex-col gap-1.5 min-w-[180px]">
+                                {mismatchedChecks.map((check) => {
+                                  const actionId = `${result.requestId}:${result.matchedSupplier?.id}:${check.key}`;
+                                  const isApplying = applyInProgress[actionId] === true;
+                                  return (
+                                    <Button
+                                      key={actionId}
+                                      size="sm"
+                                      variant="outline"
+                                      className="h-7 px-2 justify-start text-[10px]"
+                                      disabled={isApplying}
+                                      onClick={() => void applyRequestValueToSupplier(result, check)}
+                                    >
+                                      {isApplying ? <Loader2 className="h-3 w-3 animate-spin mr-1" /> : null}
+                                      Apply {getSupplierFieldDisplayLabel(check.key, supplierFieldOptionMap)}
+                                    </Button>
+                                  );
+                                })}
+                              </div>
+                            ) : (
+                              <span className="text-muted-foreground">—</span>
+                            )}
                           </TableCell>
                         </TableRow>
-                      )}
-                    </Fragment>
-                  );
-                })}
+                      );
+                    })
+                )}
               </TableBody>
             </Table>
-    );
-  })()}
           </div>
         </Card>
       ) : !supplierError ? (
         <Card className="p-12 flex flex-col items-center justify-center gap-3 text-center text-muted-foreground">
           <RefreshCw className="h-8 w-8 opacity-30" />
-          <p className="text-sm">Upload a CSV to load referenced suppliers, or click <strong>Load all suppliers</strong> for a full pull.</p>
+          <p className="text-sm">Upload a request CSV to fetch and audit only the suppliers listed in that file.</p>
         </Card>
       ) : null}
 
@@ -1473,7 +1287,7 @@ export default function SupplierRecordAuditPage() {
               </div>
               <div className="flex items-center gap-2 text-xs">
                 <Badge variant={mappingWizardStep === 2 ? "default" : suppliers.length > 0 ? "secondary" : "outline"}>Step 2</Badge>
-                <span className="font-medium">Load suppliers from API</span>
+                <span className="font-medium">Fetch CSV-listed suppliers from API</span>
                 <span className="text-muted-foreground">{suppliers.length > 0 ? "Completed" : "Pending"}</span>
               </div>
               <div className="flex items-center gap-2 text-xs">
@@ -1493,7 +1307,7 @@ export default function SupplierRecordAuditPage() {
             {mappingWizardStep === 2 && (
               <Card className="p-3 bg-secondary/30">
                 <p className="text-xs text-muted-foreground">
-                  Click Next to load suppliers from API using the uploaded request CSV references.
+                  Click Next to fetch only suppliers referenced in the uploaded CSV.
                 </p>
               </Card>
             )}
@@ -1724,7 +1538,7 @@ export default function SupplierRecordAuditPage() {
                       });
                     }}
                   >
-                    {mappingWizardStep === 1 ? "Next: Upload request CSV" : "Next: Load suppliers"}
+                    {mappingWizardStep === 1 ? "Next: Upload request CSV" : "Next: Fetch suppliers"}
                   </Button>
                 ) : (
                   <Button

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AppSidebar } from "@/components/AppSidebar";
 import { useOmneaEnvironment } from "@/components/use-omnea-environment";
 import { useLocation } from "react-router-dom";
@@ -21,6 +21,8 @@ import { Outlet } from "react-router-dom";
 export const AppLayout = () => {
   const { environment, label, setEnvironment } = useOmneaEnvironment();
   const [pendingEnvironment, setPendingEnvironment] = useState<"qa" | "production" | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarPinned, setSidebarPinned] = useState(false);
   const { pathname } = useLocation();
 
   const isProduction = environment === "production";
@@ -41,10 +43,33 @@ export const AppLayout = () => {
 
   const switchingToProduction = pendingEnvironment === "production";
 
+  useEffect(() => {
+    if (!sidebarPinned) {
+      setSidebarOpen(false);
+    }
+  }, [pathname, sidebarPinned]);
+
+  const handleSidebarOpenChange = (open: boolean) => {
+    setSidebarOpen(open);
+    if (!open) {
+      setSidebarPinned(false);
+    }
+  };
+
+  const handleSidebarPinToggle = () => {
+    setSidebarPinned((prev) => {
+      const next = !prev;
+      if (next) {
+        setSidebarOpen(true);
+      }
+      return next;
+    });
+  };
+
   return (
-    <SidebarProvider>
+    <SidebarProvider defaultOpen={false} onOpenChange={handleSidebarOpenChange} open={sidebarOpen}>
       <div className="min-h-screen flex w-full">
-        <AppSidebar />
+        <AppSidebar pinned={sidebarPinned} onTogglePinned={handleSidebarPinToggle} />
         <div className="flex-1 flex flex-col min-w-0">
           <header
             className={cn(

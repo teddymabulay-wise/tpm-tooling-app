@@ -26,6 +26,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Separator } from "@/components/ui/separator";
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { CSVUploader } from "@/components/CSVUploader";
 import { CollapsibleSection } from "@/components/CollapsibleSection";
 import { convertToCSV, downloadCSV } from "@/lib/csv-export-utils";
@@ -33,7 +34,7 @@ import { parseFlowsMetadataCSV } from "@/lib/flows-metadata-utils";
 import { fetchAllOmneaPages, makeOmneaRequest } from "@/lib/omnea-api-utils";
 import { getOmneaEnvironmentConfig } from "@/lib/omnea-environment";
 import useMaterialityAudit from "../features/audit/materiality/hooks/useMaterialityAudit";
-import type { AuditRow } from "../features/audit/materiality/types/audit.types";
+import type { ActualTagSet, AuditRow } from "../features/audit/materiality/types/audit.types";
 import {
   Loader2,
   Download,
@@ -521,6 +522,213 @@ const getRelevantTagAnalyses = (row: AuditRow) => {
 
 const getAnalysesForDiff = (row: AuditRow, category: string) =>
   sortAnalyses(row.tagAnalysis.filter((analysis) => tagAnalysisMatchesCategory(analysis.tagName, category)));
+
+const getGeneratedTagNames = (row: AuditRow) =>
+  sortAnalyses(row.tagAnalysis.filter((analysis) => analysis.result === "true")).map((analysis) => analysis.tagName);
+
+type TagDiscrepancyView = {
+  category: string;
+  expectedLabel: string;
+  expectedValue: string;
+  actualValue: string;
+};
+
+type MainAuditColumn = {
+  header: string;
+  value: (row: AuditRow) => string;
+  className?: string;
+};
+
+const toActualTagFieldRows = (tagSet: ActualTagSet | null): Array<{ category: string; value: string }> => {
+  if (!tagSet) return [];
+
+  return Object.entries(tagSet.parsed)
+    .map(([category, value]) => ({
+      category,
+      value: formatAuditComparisonValue(value),
+    }))
+    .filter((entry) => entry.value !== "-")
+    .sort((left, right) => getCategoryPriority(left.category) - getCategoryPriority(right.category));
+};
+
+const getActualTagValue = (tagSet: ActualTagSet | null, candidates: string[]): string => {
+  if (!tagSet) return "-";
+
+  for (const candidate of candidates) {
+    if (candidate in tagSet.parsed) {
+      return formatAuditComparisonValue(tagSet.parsed[candidate]);
+    }
+  }
+
+  return "-";
+};
+
+const getPreferredTagValue = (row: AuditRow, candidates: string[]): string => {
+  const apiValue = getActualTagValue(row.actualTagsFromApi, candidates);
+  if (apiValue !== "-") return apiValue;
+
+  const csvValue = getActualTagValue(row.actualTagsFromRequest, candidates);
+  if (csvValue !== "-") return csvValue;
+
+  return "-";
+};
+
+const MAIN_AUDIT_COLUMNS: MainAuditColumn[] = [
+  {
+    header: "Materiality Impact",
+    value: (row) => getPreferredTagValue(row, ["Materiality Impact"]),
+  },
+  {
+    header: "Materiality Substitutability",
+    value: (row) => getPreferredTagValue(row, ["Materiality Substitutability"]),
+  },
+  {
+    header: "CIF",
+    value: (row) => getPreferredTagValue(row, ["CIF"]),
+  },
+  {
+    header: "Third Party Supplier",
+    value: (row) => getPreferredTagValue(row, ["Third Party Supplier"]),
+  },
+  {
+    header: "SUPPORTIVE",
+    value: (row) => getPreferredTagValue(row, ["Supportive"]),
+  },
+  {
+    header: "Banking Supplier",
+    value: (row) => getPreferredTagValue(row, ["Banking Supplier"]),
+  },
+  {
+    header: "BSP Market Tier",
+    value: (row) => getPreferredTagValue(row, ["BSP Market Tier"]),
+  },
+  {
+    header: "Outsourcing",
+    value: (row) => getPreferredTagValue(row, ["Outsourcing"]),
+  },
+  {
+    header: "Customer PII processed",
+    value: (row) => getPreferredTagValue(row, ["Customer PII", "PII Processed"]),
+  },
+  {
+    header: "TAG",
+    value: (row) => row.actualTagsFromApi?.raw ?? row.actualTagsRaw ?? "-",
+    className: "max-w-[260px] whitespace-normal",
+  },
+  {
+    header: "Materiality level",
+    value: (row) => row.actualMaterialityFromApi ?? row.actualMaterialityFromRequest ?? "-",
+  },
+  {
+    header: "Expected Materiality Level (based on logic)",
+    value: (row) => row.derivedMateriality,
+  },
+];
+
+const getApiTagDiscrepancyViews = (row: AuditRow): TagDiscrepancyView[] =>
+  (row.apiTagDiffs ?? [])
+    .filter((diff) => !diff.match)
+    .sort((left, right) => getCategoryPriority(left.category) - getCategoryPriority(right.category))
+    .map((diff) => ({
+      category: diff.category,
+      expectedLabel: buildExpectedTagLabel(diff.category, diff.derived),
+      expectedValue: formatAuditComparisonValue(diff.derived),
+      actualValue: formatAuditComparisonValue(diff.actual),
+    }));
+
+const isMaterialityDriverTag = (tagName: string) => {
+  const normalized = tagName.toLowerCase();
+
+  return (
+    normalized.includes("materiality impact") ||
+    normalized.includes("materiality substitutability") ||
+    normalized.includes("criticality = tier") ||
+    normalized.includes("banking supplier") ||
+    normalized.includes("third party supplier") ||
+    normalized.includes("cif") ||
+    normalized.includes("supportive") ||
+    normalized.includes("outsourcing")
+  );
+};
+
+const getUnclassifiedQuestionEvidence = (row: AuditRow) => {
+  const evidence = row.tagAnalysis
+    .filter((analysis) => isMaterialityDriverTag(analysis.tagName))
+    .flatMap((analysis) =>
+      analysis.conditions.map((condition) => ({
+        tagName: analysis.tagName,
+        analysisResult: analysis.result,
+        questionId: condition.questionId,
+        operator: condition.operator,
+        expectedValue: condition.expectedValue,
+        actualValue: condition.actualValue,
+        match: condition.match,
+      }))
+    );
+
+  const uniqueByQuestionAndExpectation = new Map<string, (typeof evidence)[number]>();
+  evidence.forEach((item) => {
+    const key = `${item.questionId}::${item.operator}::${item.expectedValue}`;
+    if (!uniqueByQuestionAndExpectation.has(key)) {
+      uniqueByQuestionAndExpectation.set(key, item);
+    }
+  });
+
+  return Array.from(uniqueByQuestionAndExpectation.values())
+    .sort((left, right) => {
+      if (left.match !== right.match) return Number(left.match) - Number(right.match);
+      if (left.analysisResult !== right.analysisResult) {
+        const weight = (result: string) => (result === "cannot-derive" ? 0 : result === "false" ? 1 : 2);
+        return weight(left.analysisResult) - weight(right.analysisResult);
+      }
+      return left.questionId.localeCompare(right.questionId);
+    })
+    .slice(0, 12);
+};
+
+const REQUEST_AUDIT_PROGRESS_STEPS: Array<{
+  title: string;
+  description: string;
+  source: string;
+  startPhase: number;
+  completePhase: number;
+}> = [
+  {
+    title: "Parse request CSV",
+    description: "Read request-step rows and normalize answers",
+    source: "CSV",
+    startPhase: 1,
+    completePhase: 2,
+  },
+  {
+    title: "Derive tags from metadata",
+    description: "Apply tag conditions from Tags metadata",
+    source: "Derived",
+    startPhase: 2,
+    completePhase: 3,
+  },
+  {
+    title: "Load supplier records",
+    description: "Pull supplier snapshots and tags from Omnea API",
+    source: "API",
+    startPhase: 3,
+    completePhase: 4,
+  },
+  {
+    title: "Compare CSV vs Derived",
+    description: "Compare input tags/materiality against derived outputs",
+    source: "CSV + Derived",
+    startPhase: 4,
+    completePhase: 5,
+  },
+  {
+    title: "Compare API vs Derived",
+    description: "Compare supplier-record tags/materiality against derived outputs",
+    source: "API + Derived",
+    startPhase: 5,
+    completePhase: 7,
+  },
+];
 
 const formatConditionEvidenceForExport = (
   condition: AuditRow["tagAnalysis"][number]["conditions"][number],
@@ -1204,6 +1412,41 @@ export default function MaterialityAuditPage() {
     [requestStepAuditRows]
   );
 
+  const requestStepStatusSummary = useMemo(() => {
+    if (!requestStepAuditState) {
+      return {
+        total: 0,
+        loading: 0,
+        success: 0,
+        error: 0,
+        skipped: 0,
+        compared: 0,
+      };
+    }
+
+    const rows = requestStepAuditState.rows;
+
+    return {
+      total: rows.length,
+      loading: rows.filter((row) => row.enrichmentStatus === "loading").length,
+      success: rows.filter((row) => row.enrichmentStatus === "success").length,
+      error: rows.filter((row) => row.enrichmentStatus === "error").length,
+      skipped: rows.filter((row) => row.enrichmentStatus === "skipped").length,
+      compared: rows.filter((row) => row.hasAnyMismatch !== null).length,
+    };
+  }, [requestStepAuditState]);
+
+  const requestStepProgressPhase = requestStepAuditState?.phase ?? (isRequestStepAuditProcessing ? 1 : 0);
+  const requestStepProgressPercent = requestStepProgressPhase <= 0
+    ? 0
+    : Math.max(5, Math.min(100, ((requestStepProgressPhase - 1) / 6) * 100));
+
+  const activeProgressStep = REQUEST_AUDIT_PROGRESS_STEPS.find(
+    (step) =>
+      requestStepProgressPhase >= step.startPhase &&
+      requestStepProgressPhase < step.completePhase
+  ) ?? null;
+
   const exportMismatchAnalysis = () => {
     if (requestStepMismatchRows.length === 0) return;
 
@@ -1294,646 +1537,16 @@ export default function MaterialityAuditPage() {
 
   return (
     <div className="p-6 space-y-6 max-w-full">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold">Materiality Audit</h1>
-          <p className="text-sm text-muted-foreground mt-1">
-            Load supplier records and check them against configured conditions per supplier field.
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          {lastLoaded && (
-            <span className="text-xs text-muted-foreground">Last loaded {lastLoaded.toLocaleTimeString()}</span>
-          )}
-          <Button variant="outline" size="sm" onClick={openConditionModal}>
-            <Settings2 className="h-3.5 w-3.5 mr-1.5" />
-            Condition Mapping
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => void loadSuppliers(true)} disabled={isWizardLoading}>
-            {loadingSuppliers ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
-            ) : (
-              <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
-            )}
-            {loadingSuppliers ? "Loading suppliers…" : "Load all suppliers"}
-          </Button>
-        </div>
+      <div>
+        <h1 className="text-2xl font-semibold">Materiality Audit</h1>
+        <p className="text-sm text-muted-foreground mt-1">
+          Step-by-step flow: upload request CSV, enrich supplier records from API, derive tags from metadata, and highlight mismatches.
+        </p>
       </div>
-
-      <input
-        ref={requestCsvInputRef}
-        type="file"
-        accept=".csv"
-        className="hidden"
-        onChange={(e) => {
-          const file = e.target.files?.[0];
-          if (file) handleRequestCsvUpload(file);
-          e.target.value = "";
-        }}
-      />
-      <input
-        ref={supplierEnrichmentCsvInputRef}
-        type="file"
-        accept=".csv"
-        className="hidden"
-        onChange={(e) => {
-          const file = e.target.files?.[0];
-          if (file) handleSupplierEnrichmentCsvUpload(file);
-          e.target.value = "";
-        }}
-      />
-
-      {/* Error */}
-      {supplierError && (
-        <Card className="p-4 border-destructive/50 bg-destructive/5 flex items-start gap-3">
-          <AlertCircle className="h-4 w-4 text-destructive mt-0.5 shrink-0" />
-          <p className="text-sm text-destructive">{supplierError}</p>
-        </Card>
-      )}
-
-      {/* Conditions summary */}
-      {activeConditions.length > 0 && (
-        <Card className="p-3 bg-secondary/30 flex flex-wrap gap-2 items-center">
-          <span className="text-xs font-medium text-muted-foreground">Active conditions:</span>
-          {activeConditions.map((c, i) => (
-            <Badge key={i} variant="secondary" className="text-xs gap-1">
-              <span className="font-medium">{getSupplierFieldDisplayLabel(c.supplierField, supplierFieldOptionMap)}</span>
-              <span className="text-muted-foreground">=</span>
-              <span>{c.supplierValue}</span>
-              {c.requestCriteria.length > 0 && (
-                <>
-                  <span className="text-muted-foreground">&</span>
-                  <span className="text-[9px]">{c.requestCriteria.length} request criteria</span>
-                </>
-              )}
-            </Badge>
-          ))}
-          {activeConditions.length === 0 && (
-            <span className="text-xs text-muted-foreground italic">No conditions configured. Open Condition Mapping to add some.</span>
-          )}
-        </Card>
-      )}
-
-      {/* Stats + filters */}
-      {suppliers.length > 0 && (
-        <div className="flex items-center gap-3 flex-wrap">
-          <Badge variant="secondary" className="text-xs">{filteredResults.length} of {suppliers.length} suppliers shown</Badge>
-          {activeConditions.length > 0 && (
-            <>
-              <Badge
-                variant={failingCount > 0 ? "destructive" : "outline"}
-                className="text-xs gap-1 cursor-pointer select-none"
-                onClick={() => { setShowFailingOnly((v) => !v); setShowPassingOnly(false); }}
-              >
-                <XCircle className="h-3 w-3" />
-                {failingCount} failing
-              </Badge>
-              <Badge
-                variant="default"
-                className="text-xs gap-1 cursor-pointer select-none"
-                onClick={() => { setShowPassingOnly((v) => !v); setShowFailingOnly(false); }}
-              >
-                <CheckCircle2 className="h-3 w-3" />
-                {passingCount} passing
-              </Badge>
-            </>
-          )}
-          <div className="flex-1 max-w-xs ml-auto">
-            <Input
-              value={nameSearch}
-              onChange={(e) => setNameSearch(e.target.value)}
-              placeholder="Search supplier name…"
-              className="h-8 text-xs"
-            />
-          </div>
-          <Button variant="outline" size="sm" onClick={downloadResults}>
-            <Download className="h-3.5 w-3.5 mr-1.5" />
-            Download
-          </Button>
-        </div>
-      )}
-
-      {/* Main table */}
-      {loadingSuppliers && !suppliers.length ? (
-        <Card className="p-12 flex items-center justify-center gap-2 text-muted-foreground">
-          <Loader2 className="h-5 w-5 animate-spin" />
-          <span className="text-sm">Loading suppliers…</span>
-        </Card>
-      ) : suppliers.length > 0 ? (
-        <Card className="overflow-hidden">
-          <div className="overflow-x-auto">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="text-xs whitespace-nowrap sticky left-0 bg-background z-10">Supplier</TableHead>
-                  {activeConditions.map((c, i) => (
-                    <TableHead key={i} className="text-xs whitespace-nowrap">
-                      <div>{getSupplierFieldDisplayLabel(c.supplierField, supplierFieldOptionMap)}</div>
-                      {c.supplierValue && (
-                        <div className="text-[10px] font-normal text-muted-foreground">Must be: {c.supplierValue}</div>
-                      )}
-                      {c.requestCriteria.length > 0 && (
-                        <div className="text-[10px] font-normal text-muted-foreground">+ {c.requestCriteria.length} req. criteria</div>
-                      )}
-                    </TableHead>
-                  ))}
-                  {activeConditions.length === 0 && (
-                    <TableHead className="text-xs text-muted-foreground">No conditions — open Condition Mapping</TableHead>
-                  )}
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {filteredResults.map(({ supplier, checks, failCount }) => (
-                  <TableRow
-                    key={supplier.id}
-                    className={failCount > 0 ? "bg-destructive/5 hover:bg-destructive/10" : ""}
-                  >
-                    <TableCell className="text-xs sticky left-0 bg-inherit z-10">
-                      <div className="font-medium">{supplier.name || "—"}</div>
-                      {supplier.legalName && supplier.legalName !== supplier.name && (
-                        <div className="text-[10px] text-muted-foreground">{supplier.legalName}</div>
-                      )}
-                      {failCount > 0 && (
-                        <Badge variant="destructive" className="text-[9px] mt-0.5">
-                          {failCount} condition{failCount === 1 ? "" : "s"} failing
-                        </Badge>
-                      )}
-                    </TableCell>
-                    {checks.map((check, i) => (
-                      <TableCell
-                        key={i}
-                        className={`text-xs ${
-                          check.passes
-                            ? "text-green-700 dark:text-green-400"
-                            : "text-destructive font-medium"
-                        }`}
-                      >
-                        <div>{check.passes ? "✓" : "✗"}</div>
-                        {!check.passes && (
-                          <div className="text-[10px] text-destructive/70">
-                            {check.details
-                              .filter((d) => !d.passes)
-                              .map((d) => `${d.field}: ${d.expectedValue}`)
-                              .join("; ")}
-                          </div>
-                        )}
-                      </TableCell>
-                    ))}
-                  </TableRow>
-                ))}
-                {filteredResults.length === 0 && (
-                  <TableRow>
-                    <TableCell colSpan={1 + Math.max(activeConditions.length, 1)} className="text-center text-xs text-muted-foreground py-8">
-                      No suppliers match the current filters.
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-          </div>
-        </Card>
-      ) : !supplierError ? (
-        <Card className="p-12 flex flex-col items-center justify-center gap-3 text-center text-muted-foreground">
-          <RefreshCw className="h-8 w-8 opacity-30" />
-          <p className="text-sm">Click <strong>Load all suppliers</strong> to pull supplier records, then configure conditions.</p>
-        </Card>
-      ) : null}
-
-      {/* Condition Mapping Modal */}
-      <Dialog open={isConditionModalOpen} onOpenChange={setIsConditionModalOpen}>
-        <DialogContent className="max-w-3xl">
-          <DialogHeader>
-            <DialogTitle>Condition Mapping</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-4">
-            <div className="space-y-2 rounded-md border p-3">
-              <div className="flex items-center gap-2 text-xs">
-                <Badge variant={conditionWizardStep === 1 ? "default" : requestRows.length > 0 ? "secondary" : "outline"}>
-                  Step 1
-                </Badge>
-                <span className="font-medium">Load request CSV</span>
-                <span className="text-muted-foreground">{requestRows.length > 0 ? `Completed (${requestRows.length} rows)` : "Pending"}</span>
-              </div>
-              <div className="flex items-center gap-2 text-xs">
-                <Badge variant={conditionWizardStep === 2 ? "default" : suppliers.length > 0 ? "secondary" : "outline"}>
-                  Step 2
-                </Badge>
-                <span className="font-medium">Load suppliers from API</span>
-                <span className="text-muted-foreground">{suppliers.length > 0 ? `Completed (${suppliers.length} loaded)` : "Pending"}</span>
-              </div>
-              <div className="flex items-center gap-2 text-xs">
-                <Badge variant={conditionWizardStep === 3 ? "default" : supplierEnrichmentFileName ? "secondary" : "outline"}>
-                  Step 3
-                </Badge>
-                <span className="font-medium">Load supplier CSV and enrich suppliers</span>
-                <span className="text-muted-foreground">{supplierEnrichmentFileName ? `Completed (${supplierEnrichmentFileName})` : "Pending"}</span>
-              </div>
-              <div className="flex items-center gap-2 text-xs">
-                <Badge variant={conditionWizardStep === 4 ? "default" : conditions.length > 0 ? "secondary" : "outline"}>
-                  Step 4
-                </Badge>
-                <span className="font-medium">Configure conditions</span>
-                <span className="text-muted-foreground">{conditions.length > 0 ? `${conditions.length} saved` : "Pending"}</span>
-              </div>
-            </div>
-
-            {conditionWizardStep === 1 && (
-              <Card className="p-4 bg-secondary/30 space-y-3">
-                <p className="text-xs text-muted-foreground">
-                  Click Next to upload the request CSV. This keeps actions in a single consistent button position.
-                </p>
-                {requestFileName && <Badge variant="secondary" className="text-xs">{requestFileName}</Badge>}
-                {requestLoadSummary && <p className="text-xs text-muted-foreground">{requestLoadSummary}</p>}
-                {loadingRequestCsv && <p className="text-xs text-muted-foreground">Loading request CSV…</p>}
-              </Card>
-            )}
-
-            {conditionWizardStep === 2 && (
-              <Card className="p-4 bg-secondary/30 space-y-3">
-                <p className="text-xs text-muted-foreground">
-                  Load suppliers from API using supplier references/names from the request CSV.
-                </p>
-                {supplierError && <p className="text-xs text-destructive">{supplierError}</p>}
-                {suppliers.length > 0 && (
-                  <p className="text-xs text-green-700 dark:text-green-400">
-                    {suppliers.length} suppliers currently loaded.
-                  </p>
-                )}
-                {supplierApiLoadSummary && <p className="text-xs text-muted-foreground">{supplierApiLoadSummary}</p>}
-                {loadingSuppliers && <p className="text-xs text-muted-foreground">Loading suppliers from API…</p>}
-              </Card>
-            )}
-
-            {conditionWizardStep === 3 && (
-              <Card className="p-4 bg-secondary/30 space-y-3">
-                <p className="text-xs text-muted-foreground">
-                  Click Next to upload the supplier enrichment CSV. This keeps actions in a single consistent button position.
-                </p>
-                {supplierEnrichmentFileName && <Badge variant="secondary" className="text-xs">{supplierEnrichmentFileName}</Badge>}
-                {supplierEnrichmentSummary && <p className="text-xs text-muted-foreground">{supplierEnrichmentSummary}</p>}
-                {loadingSupplierEnrichmentCsv && <p className="text-xs text-muted-foreground">Loading supplier enrichment CSV…</p>}
-              </Card>
-            )}
-
-            {conditionWizardStep === 4 && (
-              <>
-                <div className="flex items-center justify-between text-xs text-muted-foreground">
-                  <span>{conditionDraft.filter((r) => r.supplierField.trim() && r.supplierValue.trim()).length} conditions configured</span>
-                  <span className="italic">Left: Supplier condition | Right: Request criteria</span>
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <Input value={supplierFieldSearch} onChange={(e) => setSupplierFieldSearch(e.target.value)} placeholder="Search supplier fields" className="h-8 text-xs" />
-                  <Input value={requestFieldSearch} onChange={(e) => setRequestFieldSearch(e.target.value)} placeholder="Search request fields" className="h-8 text-xs" />
-                </div>
-                <div className="max-h-[500px] overflow-auto rounded-md border space-y-3 p-3">
-                  {conditionDraft.map((row, index) => {
-                    const selectedInOtherRows = new Set(
-                      conditionDraft
-                        .filter((_, i) => i !== index)
-                        .map((r) => r.supplierField)
-                        .filter(Boolean)
-                    );
-                    const fieldOptions = supplierFieldOptions.filter((opt) => {
-                      const available = opt.id === row.supplierField || !selectedInOtherRows.has(opt.id);
-                      const matchesSearch = opt.label.toLowerCase().includes(supplierFieldSearch.trim().toLowerCase());
-                      return available && matchesSearch;
-                    });
-                    const requestFieldOptions = requestHeaders.filter((header) =>
-                      header.toLowerCase().includes(requestFieldSearch.trim().toLowerCase())
-                    );
-
-                    return (
-                      <Card key={index} className="p-3 space-y-2 border">
-                        <div className="grid grid-cols-3 gap-2 items-end">
-                          <div className="space-y-1">
-                            <label className="text-[10px] font-medium text-muted-foreground block">Supplier Field</label>
-                            <Select
-                              value={row.supplierField || "__none__"}
-                              onValueChange={(value) =>
-                                setConditionDraft((prev) =>
-                                  prev.map((r, i) =>
-                                    i === index ? { ...r, supplierField: value === "__none__" ? "" : value } : r
-                                  )
-                                )
-                              }
-                            >
-                              <SelectTrigger className="h-8 text-xs">
-                                <SelectValue placeholder="Select field" />
-                              </SelectTrigger>
-                              <SelectContent className="max-h-60">
-                                <SelectItem value="__none__">Select field</SelectItem>
-                                {fieldOptions.map((opt) => (
-                                  <SelectItem key={opt.id} value={opt.id}>
-                                    <span className="truncate" title={opt.label}>{opt.label}</span>
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                          </div>
-                          <div className="space-y-1">
-                            <label className="text-[10px] font-medium text-muted-foreground block">Operator</label>
-                            <Select value="equal">
-                              <SelectTrigger className="h-8 text-xs" disabled>
-                                <SelectValue placeholder="equal" />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="equal">equal</SelectItem>
-                              </SelectContent>
-                            </Select>
-                          </div>
-                          <div className="space-y-1">
-                            <label className="text-[10px] font-medium text-muted-foreground block">Value</label>
-                            <Input
-                              value={row.supplierValue}
-                              onChange={(e) =>
-                                setConditionDraft((prev) =>
-                                  prev.map((r, i) =>
-                                    i === index ? { ...r, supplierValue: e.target.value } : r
-                                  )
-                                )
-                              }
-                              placeholder="Enter expected value"
-                              className="h-8 text-xs"
-                            />
-                          </div>
-                        </div>
-
-                        {row.supplierField && row.supplierValue && (
-                          <div className="bg-secondary/20 p-2 rounded space-y-2 border border-secondary/30">
-                            <div className="flex items-center justify-between">
-                              <label className="text-[10px] font-medium text-muted-foreground">Request Criteria</label>
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                className="h-6 px-2 text-[10px]"
-                                onClick={() =>
-                                  setConditionDraft((prev) =>
-                                    prev.map((r, i) =>
-                                      i === index
-                                        ? {
-                                            ...r,
-                                            requestCriteria: [...r.requestCriteria, { field: "", operator: "equal", value: "" }],
-                                          }
-                                        : r
-                                    )
-                                  )
-                                }
-                              >
-                                + Add criterion
-                              </Button>
-                            </div>
-
-                            {row.requestCriteria.map((criterion, critIndex) => {
-                              const filteredRequestFields = requestFieldOptions;
-                              const valueOptions = criterion.field
-                                ? requestFieldValuesByHeader.get(criterion.field) ?? []
-                                : [];
-
-                              return (
-                                <div key={critIndex} className="grid grid-cols-4 gap-1 items-end bg-background p-2 rounded text-xs">
-                                  <div>
-                                    <Select
-                                      value={criterion.field || "__none__"}
-                                      onValueChange={(value) =>
-                                        setConditionDraft((prev) =>
-                                          prev.map((r, i) =>
-                                            i === index
-                                              ? {
-                                                  ...r,
-                                                  requestCriteria: r.requestCriteria.map((c, ci) =>
-                                                    ci === critIndex ? { ...c, field: value === "__none__" ? "" : value, value: "" } : c
-                                                  ),
-                                                }
-                                              : r
-                                          )
-                                        )
-                                      }
-                                    >
-                                      <SelectTrigger className="h-7 text-[11px]">
-                                        <SelectValue placeholder="Field" />
-                                      </SelectTrigger>
-                                      <SelectContent className="max-h-40">
-                                        <SelectItem value="__none__">Field</SelectItem>
-                                        {filteredRequestFields.map((header) => (
-                                          <SelectItem key={header} value={header}>
-                                            <span className="truncate">{header}</span>
-                                          </SelectItem>
-                                        ))}
-                                      </SelectContent>
-                                    </Select>
-                                  </div>
-                                  <div>
-                                    <Select
-                                      value={criterion.operator}
-                                      onValueChange={(value) =>
-                                        setConditionDraft((prev) =>
-                                          prev.map((r, i) =>
-                                            i === index
-                                              ? {
-                                                  ...r,
-                                                  requestCriteria: r.requestCriteria.map((c, ci) =>
-                                                    ci === critIndex ? { ...c, operator: value as "equal" | "contains" | "not_equal" } : c
-                                                  ),
-                                                }
-                                              : r
-                                          )
-                                        )
-                                      }
-                                    >
-                                      <SelectTrigger className="h-7 text-[11px]">
-                                        <SelectValue placeholder="Op" />
-                                      </SelectTrigger>
-                                      <SelectContent>
-                                        <SelectItem value="equal">equal</SelectItem>
-                                        <SelectItem value="contains">contains</SelectItem>
-                                        <SelectItem value="not_equal">not equal</SelectItem>
-                                      </SelectContent>
-                                    </Select>
-                                  </div>
-                                  <div>
-                                    <Select
-                                      value={criterion.value || "__none__"}
-                                      onValueChange={(value) =>
-                                        setConditionDraft((prev) =>
-                                          prev.map((r, i) =>
-                                            i === index
-                                              ? {
-                                                  ...r,
-                                                  requestCriteria: r.requestCriteria.map((c, ci) =>
-                                                    ci === critIndex ? { ...c, value: value === "__none__" ? "" : value } : c
-                                                  ),
-                                                }
-                                              : r
-                                          )
-                                        )
-                                      }
-                                      disabled={!criterion.field}
-                                    >
-                                      <SelectTrigger className="h-7 text-[11px]">
-                                        <SelectValue placeholder="Value" />
-                                      </SelectTrigger>
-                                      <SelectContent className="max-h-40">
-                                        <SelectItem value="__none__">Value</SelectItem>
-                                        {valueOptions.map((v) => (
-                                          <SelectItem key={v} value={v}>
-                                            <span className="truncate">{v}</span>
-                                          </SelectItem>
-                                        ))}
-                                      </SelectContent>
-                                    </Select>
-                                  </div>
-                                  <Button
-                                    size="sm"
-                                    variant="ghost"
-                                    className="h-7 px-1 text-[10px]"
-                                    onClick={() =>
-                                      setConditionDraft((prev) =>
-                                        prev.map((r, i) =>
-                                          i === index
-                                            ? {
-                                                ...r,
-                                                requestCriteria: r.requestCriteria.filter((_, ci) => ci !== critIndex),
-                                              }
-                                            : r
-                                        )
-                                      )
-                                    }
-                                  >
-                                    Remove
-                                  </Button>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        )}
-
-                        <div className="flex justify-end">
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            className="h-7 px-2 text-[10px] text-destructive hover:text-destructive"
-                            onClick={() =>
-                              setConditionDraft((prev) => {
-                                if (prev.length <= 1) return [{ supplierField: "", supplierOperator: "equal", supplierValue: "", requestCriteria: [] }];
-                                return prev.filter((_, i) => i !== index);
-                              })
-                            }
-                          >
-                            Delete condition
-                          </Button>
-                        </div>
-                      </Card>
-                    );
-                  })}
-                </div>
-              </>
-            )}
-
-            {/* Footer actions */}
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                {conditionWizardStep === 4 && (
-                  <>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setConditionDraft(createInitialDraft([]))}
-                    >
-                      Clear all
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setConditionDraft((prev) => [...prev, { supplierField: "", supplierOperator: "equal", supplierValue: "", requestCriteria: [] }])}
-                    >
-                      Add condition
-                    </Button>
-                  </>
-                )}
-              </div>
-              <div className="flex items-center gap-2">
-                <Button variant="outline" size="sm" onClick={() => setIsConditionModalOpen(false)}>
-                  Cancel
-                </Button>
-                {conditionWizardStep > 1 && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={isWizardLoading}
-                    onClick={() => setConditionWizardStep((prev) => (prev - 1) as 1 | 2 | 3 | 4)}
-                  >
-                    Back
-                  </Button>
-                )}
-                {conditionWizardStep < 4 ? (
-                  <Button
-                    size="sm"
-                    disabled={isWizardLoading}
-                    onClick={async () => {
-                      if (conditionWizardStep === 1) {
-                        if (!requestRows.length) {
-                          requestCsvInputRef.current?.click();
-                          return;
-                        }
-                        setConditionWizardStep(2);
-                        return;
-                      }
-                      if (conditionWizardStep === 2) {
-                        if (!requestRows.length) {
-                          toast.error("Upload request CSV first");
-                          setConditionWizardStep(1);
-                          return;
-                        }
-                        const ok = await loadSuppliersFromRequestRows(requestRows);
-                        if (ok) setConditionWizardStep(3);
-                        return;
-                      }
-                      if (conditionWizardStep === 3) {
-                        if (!supplierEnrichmentFileName) {
-                          supplierEnrichmentCsvInputRef.current?.click();
-                          return;
-                        }
-                        setConditionWizardStep(4);
-                      }
-                    }}
-                  >
-                    {isWizardLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> : null}
-                    {loadingRequestCsv
-                      ? "Loading request CSV…"
-                      : loadingSuppliers
-                        ? "Loading suppliers…"
-                        : loadingSupplierEnrichmentCsv
-                          ? "Loading supplier CSV…"
-                          : conditionWizardStep === 1
-                            ? (requestRows.length ? "Next" : "Upload request CSV")
-                            : conditionWizardStep === 2
-                              ? "Load suppliers & Next"
-                              : conditionWizardStep === 3
-                                ? (supplierEnrichmentFileName ? "Next" : "Upload supplier CSV")
-                                : "Next"}
-                  </Button>
-                ) : (
-                  <Button size="sm" onClick={saveConditions}>
-                    Save Conditions
-                  </Button>
-                )}
-              </div>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
 
       <Separator />
 
       <div className="space-y-4">
-        <div>
-          <h2 className="text-xl font-semibold text-foreground">Request Step Audit</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Upload an Omnea request-steps CSV export to derive and validate materiality tags per request.
-          </p>
-        </div>
-
         {requestStepAuditError ? (
           <Alert variant="destructive">
             <AlertCircle className="h-4 w-4" />
@@ -1950,9 +1563,20 @@ export default function MaterialityAuditPage() {
               onFileLoaded={(text) => processRequestStepAuditFile(text)}
             />
             {isRequestStepAuditProcessing ? (
-              <Card className="flex items-center gap-2 p-4 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                <span>Processing request-step audit…</span>
+              <Card className="border-blue-300 bg-blue-50/80 p-4 shadow-sm">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-sm font-semibold text-blue-900">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Processing request-step audit
+                  </div>
+                  <Badge className="bg-blue-600 text-white hover:bg-blue-600">Initializing</Badge>
+                </div>
+                <div className="mt-2 text-xs text-blue-900/80">
+                  Starting CSV parse, deriving tags, then pulling supplier records from API for comparison.
+                </div>
+                <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-blue-200">
+                  <div className="h-full w-1/3 animate-pulse rounded-full bg-blue-600" />
+                </div>
               </Card>
             ) : null}
           </div>
@@ -1976,6 +1600,106 @@ export default function MaterialityAuditPage() {
               </Badge>
             </div>
 
+            <Card className="p-4 space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-sm font-semibold text-foreground">Background Progress</div>
+                {isRequestStepAuditProcessing ? (
+                  <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    Processing
+                  </div>
+                ) : (
+                  <Badge variant="secondary" className="text-xs">Completed</Badge>
+                )}
+              </div>
+
+              {isRequestStepAuditProcessing ? (
+                <div className="rounded-md border border-blue-300 bg-blue-50/80 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-medium uppercase tracking-wide text-blue-900/80">Current Stage</div>
+                      <div className="text-sm font-semibold text-blue-900">
+                        {activeProgressStep?.title ?? "Finalizing results"}
+                      </div>
+                      <div className="text-xs text-blue-900/80">
+                        {activeProgressStep?.description ?? "Preparing final mismatch output"}
+                      </div>
+                    </div>
+                    <Badge className="bg-blue-600 text-white hover:bg-blue-600">Phase {requestStepProgressPhase}/7</Badge>
+                  </div>
+
+                  <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-blue-200">
+                    <div
+                      className="h-full rounded-full bg-blue-600 transition-all duration-300"
+                      style={{ width: `${requestStepProgressPercent}%` }}
+                    />
+                  </div>
+
+                  <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                    <div className="rounded border border-blue-200 bg-white/70 p-2">
+                      <div className="text-[11px] font-medium uppercase tracking-wide text-blue-900/70">API Pull</div>
+                      <div className="text-xs text-blue-900">
+                        {requestStepStatusSummary.success + requestStepStatusSummary.error}/{Math.max(
+                          0,
+                          requestStepStatusSummary.total - requestStepStatusSummary.skipped
+                        )} supplier records fetched
+                      </div>
+                      <div className="text-[11px] text-blue-900/80">
+                        Loading: {requestStepStatusSummary.loading} | Errors: {requestStepStatusSummary.error}
+                      </div>
+                    </div>
+                    <div className="rounded border border-blue-200 bg-white/70 p-2">
+                      <div className="text-[11px] font-medium uppercase tracking-wide text-blue-900/70">Comparison</div>
+                      <div className="text-xs text-blue-900">
+                        {requestStepStatusSummary.compared}/{requestStepStatusSummary.total} rows compared
+                      </div>
+                      <div className="text-[11px] text-blue-900/80">
+                        Mismatches found so far: {requestStepAuditState.mismatchCount}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-5">
+                {REQUEST_AUDIT_PROGRESS_STEPS.map((step, index) => {
+                  const isDone = requestStepAuditState.phase >= step.completePhase;
+                  const isActive = isRequestStepAuditProcessing && !isDone && requestStepAuditState.phase >= step.startPhase;
+
+                  return (
+                    <div
+                      key={step.title}
+                      className={`rounded-md border p-2 text-xs ${
+                        isDone
+                          ? "border-green-300 bg-green-50 dark:border-green-900/60 dark:bg-green-950/20"
+                          : isActive
+                            ? "border-blue-300 bg-blue-50 dark:border-blue-900/60 dark:bg-blue-950/20"
+                            : "bg-background"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <Badge variant={isDone ? "secondary" : isActive ? "default" : "outline"} className="h-5 min-w-5 justify-center px-1 text-[10px]">
+                          {index + 1}
+                        </Badge>
+                        <div className="font-medium text-foreground">{step.title}</div>
+                      </div>
+                      <div className="mt-1 text-[11px] text-muted-foreground">{step.description}</div>
+                      <div className="mt-1 text-[10px] text-muted-foreground">Source: {step.source}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </Card>
+
+            <Card className="p-3">
+              <div className="text-xs font-medium text-foreground">Data Source Legend</div>
+              <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                <Badge variant="outline">CSV: Request-step export inputs</Badge>
+                <Badge variant="outline">API: Live supplier records from Omnea</Badge>
+                <Badge variant="outline">Derived: Calculated from tag rules / question logic</Badge>
+              </div>
+            </Card>
+
             <Card className="overflow-hidden">
               <div className="flex items-center justify-between gap-3 border-b px-4 py-3">
                 <div>
@@ -1991,13 +1715,10 @@ export default function MaterialityAuditPage() {
                 <Table>
                   <TableHeader>
                     <TableRow>
-                      <TableHead>Request ID</TableHead>
-                      <TableHead>Supplier</TableHead>
-                      <TableHead>Type</TableHead>
-                      <TableHead>Derived Materiality</TableHead>
-                      <TableHead>Input Materiality</TableHead>
-                      <TableHead>Supplier Record</TableHead>
-                      <TableHead>Status</TableHead>
+                      <TableHead>Supplier name</TableHead>
+                      {MAIN_AUDIT_COLUMNS.map((column) => (
+                        <TableHead key={column.header}>{column.header}</TableHead>
+                      ))}
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -2011,11 +1732,30 @@ export default function MaterialityAuditPage() {
                         (left, right) => getCategoryPriority(left.category) - getCategoryPriority(right.category)
                       );
                       const relevantAnalyses = getRelevantTagAnalyses(row);
+                      const generatedTagNames = getGeneratedTagNames(row);
+                      const apiTagDiscrepancyViews = getApiTagDiscrepancyViews(row);
+                      const csvActualTagFields = toActualTagFieldRows(row.actualTagsFromRequest);
+                      const apiActualTagFields = toActualTagFieldRows(row.actualTagsFromApi);
+                      const unclassifiedQuestionEvidence =
+                        row.derivedMateriality === "Unclassified" ? getUnclassifiedQuestionEvidence(row) : [];
+                      const tagGapRows = [
+                        ...mismatchTagDiffs.map((diff) => ({
+                          source: "CSV",
+                          category: diff.category,
+                          current: formatAuditComparisonValue(diff.actual),
+                          derived: formatAuditComparisonValue(diff.derived),
+                        })),
+                        ...mismatchApiTagDiffs.map((diff) => ({
+                          source: "API",
+                          category: diff.category,
+                          current: formatAuditComparisonValue(diff.actual),
+                          derived: formatAuditComparisonValue(diff.derived),
+                        })),
+                      ];
 
                       return (
                         <Fragment key={rowId}>
                           <TableRow className="bg-red-50 dark:bg-red-950/20">
-                            <TableCell className="font-mono text-xs">{row.requestId}</TableCell>
                             <TableCell>
                               <button
                                 type="button"
@@ -2025,179 +1765,302 @@ export default function MaterialityAuditPage() {
                                 <ChevronRight className={`mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-muted-foreground transition-transform ${isExpanded ? "rotate-90" : ""}`} />
                                 <div className="space-y-0.5">
                                   <div className="font-medium text-foreground">{row.supplier || "-"}</div>
+                                  <div className="text-[10px] text-muted-foreground">Request ID: {row.requestId || "-"}</div>
+                                  <div className="text-[10px] text-muted-foreground">Type: {row.workflowType}</div>
                                   <div className="text-[10px] text-red-600 dark:text-red-400">Click to view mismatch analysis</div>
                                 </div>
                               </button>
                             </TableCell>
-                            <TableCell>
-                              <Badge
-                                variant={
-                                  row.workflowType === "banking"
-                                    ? "outline"
-                                    : row.workflowType === "third-party"
-                                      ? "secondary"
-                                      : "destructive"
-                                }
-                              >
-                                {row.workflowType}
-                              </Badge>
-                            </TableCell>
-                            <TableCell>
-                              <Badge
-                                variant={
-                                  row.derivedMateriality === "Material"
-                                    ? "destructive"
-                                    : row.derivedMateriality === "Non-Material"
-                                      ? "default"
-                                      : row.derivedMateriality === "Standard"
-                                        ? "secondary"
-                                        : "outline"
-                                }
-                              >
-                                {row.derivedMateriality}
-                              </Badge>
-                            </TableCell>
-                            <TableCell>{row.actualMaterialityFromRequest ?? "-"}</TableCell>
-                            <TableCell>{row.actualMaterialityFromApi ?? row.matchedSupplierName ?? "-"}</TableCell>
-                            <TableCell>
-                              <Badge variant={row.enrichmentStatus === "success" ? "secondary" : row.enrichmentStatus === "error" ? "destructive" : "outline"}>
-                                {row.enrichmentStatus}
-                              </Badge>
-                            </TableCell>
+                            {MAIN_AUDIT_COLUMNS.map((column) => (
+                              <TableCell key={`${rowId}-${column.header}`} className={column.className ? `text-xs ${column.className}` : "text-xs"}>
+                                {column.value(row)}
+                              </TableCell>
+                            ))}
                           </TableRow>
 
                           {isExpanded ? (
                             <TableRow className="bg-secondary/40 hover:bg-secondary/50">
-                              <TableCell colSpan={7} className="py-3">
+                              <TableCell colSpan={MAIN_AUDIT_COLUMNS.length + 1} className="py-3">
                                 <div className="grid gap-4 text-sm">
-                                  <div className="rounded-md border border-red-200 bg-red-50/80 p-3 text-red-900 dark:border-red-900/60 dark:bg-red-950/20 dark:text-red-100">
-                                    <div className="font-medium">Why this row is marked as mismatch</div>
-                                    <div className="mt-2 grid gap-1 text-xs leading-5 text-red-800 dark:text-red-200">
-                                      {row.materialityDiff?.match === false ? (
-                                        <div>
-                                          The request response was classified by the supplier as <span className="font-semibold">{row.materialityDiff.actual}</span>, but the request answers derive <span className="font-semibold">{row.materialityDiff.derived}</span> from the tag logic.
-                                        </div>
-                                      ) : null}
-                                      {row.apiMaterialityDiff?.match === false ? (
-                                        <div>
-                                          The supplier record in Omnea is marked as <span className="font-semibold">{row.apiMaterialityDiff.actual}</span>, but the request answers derive <span className="font-semibold">{row.apiMaterialityDiff.derived}</span>.
-                                        </div>
-                                      ) : null}
-                                      {mismatchTagDiffs.length > 0 ? (
-                                        <div>
-                                          {mismatchTagDiffs.length} request tag comparison{mismatchTagDiffs.length === 1 ? "" : "s"} show that the tags entered on the request do not line up with the tags generated from the answers.
-                                        </div>
-                                      ) : null}
-                                      {mismatchApiTagDiffs.length > 0 ? (
-                                        <div>
-                                          {mismatchApiTagDiffs.length} supplier record tag comparison{mismatchApiTagDiffs.length === 1 ? "" : "s"} show that the current supplier record in Omnea does not line up with the tags generated from the answers.
-                                        </div>
-                                      ) : null}
+                                  <div className="rounded-md border p-3">
+                                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                                      <span className="font-semibold text-foreground">Gap Snapshot</span>
+                                      <Badge variant={row.materialityDiff?.match === false ? "destructive" : "outline"}>CSV Materiality Gap</Badge>
+                                      <Badge variant={row.apiMaterialityDiff?.match === false ? "destructive" : "outline"}>API Materiality Gap</Badge>
+                                      <Badge variant={mismatchTagDiffs.length > 0 ? "destructive" : "outline"}>CSV Tag Gaps: {mismatchTagDiffs.length}</Badge>
+                                      <Badge variant={mismatchApiTagDiffs.length > 0 ? "destructive" : "outline"}>API Tag Gaps: {mismatchApiTagDiffs.length}</Badge>
+                                      <Badge variant="secondary">Tag Logic Source: Tags Card Metadata</Badge>
                                     </div>
                                   </div>
 
-                                  <div className="grid gap-3 md:grid-cols-2">
-                                    <div className="rounded-md border p-3">
-                                      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Derived Analysis</div>
-                                      <div className="grid gap-1 text-xs">
-                                        <div><span className="font-medium text-foreground">Workflow Type:</span> {row.workflowType}</div>
-                                        <div><span className="font-medium text-foreground">Impact:</span> {row.derivedTags.materialityImpact ?? "-"}</div>
-                                        <div><span className="font-medium text-foreground">Substitutability:</span> {row.derivedTags.materialitySubstitutability ?? "-"}</div>
-                                        <div><span className="font-medium text-foreground">Derived Materiality:</span> {row.derivedMateriality}</div>
-                                        <div><span className="font-medium text-foreground">Matched Group:</span> {row.derivedMaterialityMatchedGroup ?? "-"}</div>
-                                        <div><span className="font-medium text-foreground">Classification Rule:</span> {row.derivedMaterialityRule ?? "-"}</div>
-                                      </div>
-                                    </div>
-
-                                    <div className="rounded-md border p-3">
-                                      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Source Comparison</div>
-                                      <div className="grid gap-1 text-xs">
-                                        <div><span className="font-medium text-foreground">Input Tags:</span> {row.actualTagsRaw ?? "-"}</div>
-                                        <div><span className="font-medium text-foreground">Input Materiality:</span> {row.actualMaterialityFromRequest ?? "-"}</div>
-                                        <div><span className="font-medium text-foreground">Supplier Match:</span> {row.matchedSupplierName ?? "-"}</div>
-                                        <div><span className="font-medium text-foreground">Supplier Materiality:</span> {row.actualMaterialityFromApi ?? "-"}</div>
-                                        <div><span className="font-medium text-foreground">Supplier Tags:</span> {row.actualTagsFromApi?.raw ?? "-"}</div>
-                                      </div>
-                                    </div>
-                                  </div>
-
-                                  {mismatchTagDiffs.length > 0 ? (
-                                    <div className="rounded-md border p-3">
-                                      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Request Tag Comparison</div>
-                                      <div className="grid gap-2 text-xs">
-                                        {mismatchTagDiffs.map((diff) => (
-                                          <div key={`request-${rowId}-${diff.category}`} className="rounded border bg-background px-3 py-2">
-                                            <div className="font-medium text-foreground">{diff.category}</div>
-                                            <div className="mt-1 text-muted-foreground">
-                                              Supplier entered tag: {buildExpectedTagLabel(diff.category, diff.actual)}
-                                            </div>
-                                            <div className="mt-1 text-muted-foreground">
-                                              Tag generated from the request answers: {buildExpectedTagLabel(diff.category, diff.derived)}
-                                            </div>
-                                            <div className="mt-1 text-foreground">
-                                              Reason: the answers given in this request support {buildExpectedTagLabel(diff.category, diff.derived)}, not {buildExpectedTagLabel(diff.category, diff.actual)}.
-                                            </div>
-
-                                            {getAnalysesForDiff(row, diff.category).length > 0 ? (
-                                              <div className="mt-2 grid gap-2">
-                                                {getAnalysesForDiff(row, diff.category).map((analysis) => (
-                                                  <CollapsibleSection
-                                                    key={`${rowId}-${diff.category}-${analysis.tagName}`}
-                                                    title={analysis.tagName}
-                                                    defaultOpen={false}
-                                                    badge={
-                                                      <Badge variant={analysis.result === "true" ? "secondary" : analysis.result === "false" ? "outline" : "destructive"}>
-                                                        {analysis.result === "true" ? "generated" : analysis.result}
+                                  <div className="rounded-md border p-3">
+                                    <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">CSV vs API vs Derived Matrix</div>
+                                    <div className="overflow-x-auto">
+                                      <Table>
+                                        <TableHeader>
+                                          <TableRow>
+                                            <TableHead>Metric</TableHead>
+                                            <TableHead>CSV Input</TableHead>
+                                            <TableHead>API Record</TableHead>
+                                            <TableHead>Derived (Tag Logic)</TableHead>
+                                            <TableHead>Gap</TableHead>
+                                          </TableRow>
+                                        </TableHeader>
+                                        <TableBody>
+                                          <TableRow>
+                                            <TableCell className="text-xs font-medium">Materiality</TableCell>
+                                            <TableCell className="text-xs">
+                                              <div className="font-medium">{row.actualMaterialityFromRequest ?? "-"}</div>
+                                              <div className="mt-1 text-[11px] text-muted-foreground">Actual field: CSV materiality</div>
+                                            </TableCell>
+                                            <TableCell className="text-xs">
+                                              <div className="font-medium">{row.actualMaterialityFromApi ?? "-"}</div>
+                                              <div className="mt-1 text-[11px] text-muted-foreground">Actual field: Supplier materialityLevel</div>
+                                            </TableCell>
+                                            <TableCell className="text-xs">
+                                              {row.derivedMateriality === "Unclassified" ? (
+                                                <HoverCard>
+                                                  <HoverCardTrigger asChild>
+                                                    <Badge variant="outline" className="cursor-help">
+                                                      {row.derivedMateriality}
+                                                    </Badge>
+                                                  </HoverCardTrigger>
+                                                  <HoverCardContent className="w-[560px] p-3 text-xs">
+                                                    <div className="flex flex-wrap items-center gap-2">
+                                                      <div className="font-semibold text-foreground">Why Derived Materiality is Unclassified</div>
+                                                      <Badge variant="outline" className="text-[10px]">
+                                                        {row.derivedMaterialityRule ?? "No matching group"}
                                                       </Badge>
-                                                    }
-                                                    className="border"
-                                                  >
-                                                    <div className="text-muted-foreground">{analysis.summary}</div>
-                                                    <div className="mt-2 grid gap-2">
-                                                      {analysis.conditions.map((condition, index) => {
-                                                        const questionMetadata = getQuestionMetadata(condition.questionId, questionMetadataById);
-
-                                                        return (
-                                                          <div key={`${analysis.tagName}-${condition.questionId}-${index}`} className="rounded border px-3 py-2">
-                                                            <div className="font-medium text-foreground">{condition.questionId}</div>
-                                                            {questionMetadata?.title ? (
-                                                              <div className="mt-1 text-foreground">{questionMetadata.title}</div>
-                                                            ) : null}
-                                                            {questionMetadata?.description ? (
-                                                              <div className="mt-1 text-muted-foreground">{questionMetadata.description}</div>
-                                                            ) : null}
-                                                            <div className="mt-2"><span className="font-medium text-foreground">Expected for this tag:</span> {condition.operator} {condition.expectedValue}</div>
-                                                            <div><span className="font-medium text-foreground">Supplier answer in the request:</span> {formatAnalysisAnswerValue(condition.actualValue)}</div>
-                                                            <div><span className="font-medium text-foreground">Did this answer trigger the tag?</span> {condition.match ? "Yes" : "No"}</div>
-                                                          </div>
-                                                        );
-                                                      })}
                                                     </div>
-                                                  </CollapsibleSection>
-                                                ))}
-                                              </div>
-                                            ) : null}
-                                          </div>
-                                        ))}
-                                      </div>
-                                    </div>
-                                  ) : null}
+                                                    <p className="mt-1 leading-5 text-muted-foreground">
+                                                      Unclassified means no Material, Non-Material, or Standard rule group fully matched this request's derived tag outcomes.
+                                                    </p>
+                                                    {unclassifiedQuestionEvidence.length > 0 ? (
+                                                      <div className="mt-2 max-h-60 overflow-auto rounded border">
+                                                        <Table>
+                                                          <TableHeader>
+                                                            <TableRow>
+                                                              <TableHead>Question ID</TableHead>
+                                                              <TableHead>Expected</TableHead>
+                                                              <TableHead>Answer Found</TableHead>
+                                                              <TableHead>Impact</TableHead>
+                                                            </TableRow>
+                                                          </TableHeader>
+                                                          <TableBody>
+                                                            {unclassifiedQuestionEvidence.map((item, index) => {
+                                                              const questionMetadata = getQuestionMetadata(item.questionId, questionMetadataById);
 
-                                  {mismatchApiTagDiffs.length > 0 ? (
-                                    <div className="rounded-md border p-3">
-                                      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Supplier Record Tag Comparison</div>
-                                      <div className="grid gap-2 text-xs">
-                                        {mismatchApiTagDiffs.map((diff) => (
-                                          <div key={`api-${rowId}-${diff.category}`} className="rounded border bg-background px-3 py-2">
-                                            <div className="font-medium text-foreground">{diff.category}</div>
-                                            <div className="mt-1 text-muted-foreground">Supplier record currently shows: {buildExpectedTagLabel(diff.category, diff.actual)}</div>
-                                            <div className="mt-1 text-muted-foreground">Request answers generate: {buildExpectedTagLabel(diff.category, diff.derived)}</div>
-                                            <div className="mt-1 text-foreground">Reason: the live supplier record does not reflect what this request response would derive for the same tag category.</div>
-                                          </div>
-                                        ))}
-                                      </div>
+                                                              return (
+                                                                <TableRow key={`${rowId}-unclassified-hover-matrix-${item.questionId}-${index}`}>
+                                                                  <TableCell className="text-xs">
+                                                                    <div className="font-medium">{item.questionId}</div>
+                                                                    {questionMetadata?.title ? (
+                                                                      <div className="mt-0.5 text-[11px] text-muted-foreground">{questionMetadata.title}</div>
+                                                                    ) : null}
+                                                                  </TableCell>
+                                                                  <TableCell className="text-xs">{item.operator} {item.expectedValue}</TableCell>
+                                                                  <TableCell className="text-xs">{formatAnalysisAnswerValue(item.actualValue)}</TableCell>
+                                                                  <TableCell className="text-xs">
+                                                                    <Badge variant={item.match ? "secondary" : "destructive"}>
+                                                                      {item.match ? "Matched" : "Did not match"}
+                                                                    </Badge>
+                                                                  </TableCell>
+                                                                </TableRow>
+                                                              );
+                                                            })}
+                                                          </TableBody>
+                                                        </Table>
+                                                      </div>
+                                                    ) : (
+                                                      <div className="mt-2 text-xs text-muted-foreground">No detailed question evidence available for this row.</div>
+                                                    )}
+                                                  </HoverCardContent>
+                                                </HoverCard>
+                                              ) : (
+                                                <div>
+                                                  <div className="font-medium">{row.derivedMateriality}</div>
+                                                  <div className="mt-1 text-[11px] text-muted-foreground">
+                                                    Logic calculation: {row.derivedMaterialityRule ?? "No matching rule group"}
+                                                  </div>
+                                                </div>
+                                              )}
+                                            </TableCell>
+                                            <TableCell className="text-xs">
+                                              {(row.materialityDiff?.match === false || row.apiMaterialityDiff?.match === false) ? (
+                                                <Badge variant="destructive">Mismatch</Badge>
+                                              ) : (
+                                                <Badge variant="secondary">Match</Badge>
+                                              )}
+                                            </TableCell>
+                                          </TableRow>
+                                          <TableRow>
+                                            <TableCell className="text-xs font-medium">Tags</TableCell>
+                                            <TableCell className="max-w-[320px] text-xs whitespace-normal">
+                                              <div>{row.actualTagsRaw ?? "-"}</div>
+                                              {csvActualTagFields.length > 0 ? (
+                                                <div className="mt-2 flex flex-wrap gap-1">
+                                                  {csvActualTagFields.map((entry) => (
+                                                    <Badge key={`${rowId}-csv-field-${entry.category}`} variant="outline" className="text-[10px]">
+                                                      {entry.category}: {entry.value}
+                                                    </Badge>
+                                                  ))}
+                                                </div>
+                                              ) : null}
+                                            </TableCell>
+                                            <TableCell className="max-w-[320px] text-xs whitespace-normal">
+                                              {apiTagDiscrepancyViews.length > 0 ? (
+                                                <div className="space-y-2">
+                                                  {apiTagDiscrepancyViews.map((item) => (
+                                                    <div key={`${rowId}-api-tag-${item.category}`} className="rounded border p-2">
+                                                      <div className="font-medium text-foreground">{item.category}</div>
+                                                      <div className="mt-1 text-muted-foreground">
+                                                        <span className="font-medium text-foreground">Expected (derived):</span> {item.expectedLabel}
+                                                      </div>
+                                                      <div className="text-muted-foreground">
+                                                        <span className="font-medium text-foreground">Actual (supplier record):</span> {item.actualValue}
+                                                      </div>
+                                                    </div>
+                                                  ))}
+                                                </div>
+                                              ) : (
+                                                <div>
+                                                  <div>{row.actualTagsFromApi?.raw ?? "-"}</div>
+                                                  {apiActualTagFields.length > 0 ? (
+                                                    <div className="mt-2 flex flex-wrap gap-1">
+                                                      {apiActualTagFields.map((entry) => (
+                                                        <Badge key={`${rowId}-api-field-${entry.category}`} variant="outline" className="text-[10px]">
+                                                          {entry.category}: {entry.value}
+                                                        </Badge>
+                                                      ))}
+                                                    </div>
+                                                  ) : null}
+                                                </div>
+                                              )}
+                                            </TableCell>
+                                            <TableCell className="max-w-[360px] text-xs whitespace-normal">
+                                              {apiTagDiscrepancyViews.length > 0 ? (
+                                                <div className="space-y-2">
+                                                  {apiTagDiscrepancyViews.map((item) => (
+                                                    (() => {
+                                                      const logicCalculation = getAnalysesForDiff(row, item.category).slice(0, 2);
+                                                      return (
+                                                        <div key={`${rowId}-expected-tag-${item.category}`} className="rounded border p-2">
+                                                          <div className="font-medium text-foreground">{item.category}: {item.expectedValue}</div>
+                                                          <div className="mt-1 text-muted-foreground">
+                                                            <span className="font-medium text-foreground">Expected (derived):</span> {item.expectedLabel}
+                                                          </div>
+                                                          <div className="text-muted-foreground">
+                                                            <span className="font-medium text-foreground">Actual (supplier record):</span> {item.actualValue}
+                                                          </div>
+                                                          {logicCalculation.length > 0 ? (
+                                                            <div className="mt-2 rounded border p-2">
+                                                              <div className="font-medium text-foreground">Question checks and CSV answers</div>
+                                                              <div className="mt-1 overflow-x-auto">
+                                                                <Table>
+                                                                  <TableHeader>
+                                                                    <TableRow>
+                                                                      <TableHead className="text-[11px]">Tag</TableHead>
+                                                                      <TableHead className="text-[11px]">Question</TableHead>
+                                                                      <TableHead className="text-[11px]">Expected</TableHead>
+                                                                      <TableHead className="text-[11px]">Actual CSV Value</TableHead>
+                                                                      <TableHead className="text-[11px]">Match</TableHead>
+                                                                    </TableRow>
+                                                                  </TableHeader>
+                                                                  <TableBody>
+                                                                    {logicCalculation.flatMap((analysis) =>
+                                                                      analysis.conditions.map((condition, conditionIndex) => (
+                                                                        <TableRow key={`${rowId}-${item.category}-${analysis.tagName}-${condition.questionId}-${conditionIndex}`}>
+                                                                          <TableCell className="text-xs align-top">
+                                                                            <div className="font-medium text-foreground">{analysis.tagName}</div>
+                                                                            <div className="text-[11px] text-muted-foreground">{analysis.conditionLogic}</div>
+                                                                          </TableCell>
+                                                                          <TableCell className="text-xs align-top">{condition.questionId}</TableCell>
+                                                                          <TableCell className="text-xs align-top">{condition.operator} {condition.expectedValue}</TableCell>
+                                                                          <TableCell className="text-xs align-top">{formatAnalysisAnswerValue(condition.actualValue)}</TableCell>
+                                                                          <TableCell className="text-xs align-top">
+                                                                            <Badge variant={condition.match ? "secondary" : "destructive"}>
+                                                                              {condition.match ? "Matched" : "Did not match"}
+                                                                            </Badge>
+                                                                          </TableCell>
+                                                                        </TableRow>
+                                                                      ))
+                                                                    )}
+                                                                  </TableBody>
+                                                                </Table>
+                                                              </div>
+                                                            </div>
+                                                          ) : null}
+                                                        </div>
+                                                      );
+                                                    })()
+                                                  ))}
+                                                </div>
+                                              ) : (
+                                                <div>
+                                                  <div>{generatedTagNames.join("; ") || "-"}</div>
+                                                  <div className="mt-1 text-[11px] text-muted-foreground">
+                                                    Logic calculation shown in Priority Tag Evidence section below.
+                                                  </div>
+                                                </div>
+                                              )}
+                                            </TableCell>
+                                            <TableCell className="text-xs">
+                                              {(mismatchTagDiffs.length + mismatchApiTagDiffs.length) > 0 ? (
+                                                <div className="space-y-2">
+                                                  <Badge variant="destructive">{mismatchTagDiffs.length + mismatchApiTagDiffs.length} gaps</Badge>
+                                                  <div className="flex flex-wrap gap-1">
+                                                    {mismatchApiTagDiffs.map((diff) => (
+                                                      <Badge key={`${rowId}-api-gap-${diff.category}`} variant="destructive" className="text-[10px]">
+                                                        Missing/Incorrect on API: {diff.category}
+                                                      </Badge>
+                                                    ))}
+                                                    {mismatchTagDiffs.map((diff) => (
+                                                      <Badge key={`${rowId}-csv-gap-${diff.category}`} variant="outline" className="text-[10px] border-amber-400 text-amber-700 dark:border-amber-800 dark:text-amber-300">
+                                                        Diff from CSV input: {diff.category}
+                                                      </Badge>
+                                                    ))}
+                                                  </div>
+                                                  {tagGapRows.length > 0 ? (
+                                                    <div className="rounded border">
+                                                      <div className="border-b px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                                                        Detailed Gap Analysis
+                                                      </div>
+                                                      <div className="max-h-56 overflow-auto">
+                                                        <Table>
+                                                          <TableHeader>
+                                                            <TableRow>
+                                                              <TableHead className="text-[11px]">Source</TableHead>
+                                                              <TableHead className="text-[11px]">Category</TableHead>
+                                                              <TableHead className="text-[11px]">Current</TableHead>
+                                                              <TableHead className="text-[11px]">Expected</TableHead>
+                                                            </TableRow>
+                                                          </TableHeader>
+                                                          <TableBody>
+                                                            {tagGapRows.map((gap, index) => (
+                                                              <TableRow key={`${rowId}-matrix-gap-${gap.source}-${gap.category}-${index}`}>
+                                                                <TableCell className="text-xs">
+                                                                  <Badge variant="outline">{gap.source}</Badge>
+                                                                </TableCell>
+                                                                <TableCell className="text-xs font-medium">{gap.category}</TableCell>
+                                                                <TableCell className="text-xs">{gap.current}</TableCell>
+                                                                <TableCell className="text-xs">{gap.derived}</TableCell>
+                                                              </TableRow>
+                                                            ))}
+                                                          </TableBody>
+                                                        </Table>
+                                                      </div>
+                                                    </div>
+                                                  ) : null}
+                                                </div>
+                                              ) : (
+                                                <Badge variant="secondary">Match</Badge>
+                                              )}
+                                            </TableCell>
+                                          </TableRow>
+                                        </TableBody>
+                                      </Table>
                                     </div>
-                                  ) : null}
+                                  </div>
 
                                   {relevantAnalyses.length > 0 ? (
                                     <div className="rounded-md border p-3">
@@ -2207,7 +2070,7 @@ export default function MaterialityAuditPage() {
                                           <CollapsibleSection
                                             key={`${rowId}-${analysis.tagName}`}
                                             title={analysis.tagName}
-                                            defaultOpen={false}
+                                            defaultOpen={true}
                                             badge={
                                               <Badge variant={analysis.result === "true" ? "secondary" : analysis.result === "false" ? "outline" : "destructive"}>
                                                 {analysis.result === "true" ? "generated" : analysis.result}
@@ -2256,7 +2119,7 @@ export default function MaterialityAuditPage() {
                       );
                     }) : (
                       <TableRow>
-                        <TableCell colSpan={7} className="py-8 text-center text-sm text-muted-foreground">
+                        <TableCell colSpan={MAIN_AUDIT_COLUMNS.length + 1} className="py-8 text-center text-sm text-muted-foreground">
                           No mismatches detected in the uploaded request-step CSV.
                         </TableCell>
                       </TableRow>
@@ -2275,13 +2138,10 @@ export default function MaterialityAuditPage() {
                 <Table>
                   <TableHeader>
                     <TableRow>
-                      <TableHead>Request ID</TableHead>
-                      <TableHead>Supplier</TableHead>
-                      <TableHead>Type</TableHead>
-                      <TableHead>Derived Impact</TableHead>
-                      <TableHead>Derived Substitutability</TableHead>
-                      <TableHead>Derived Materiality</TableHead>
-                      <TableHead>Supplier Enrichment</TableHead>
+                      <TableHead>Supplier name</TableHead>
+                      {MAIN_AUDIT_COLUMNS.map((column) => (
+                        <TableHead key={`remaining-${column.header}`}>{column.header}</TableHead>
+                      ))}
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -2290,56 +2150,23 @@ export default function MaterialityAuditPage() {
 
                       return (
                         <TableRow key={rowId}>
-                          <TableCell className="font-mono text-xs">{row.requestId}</TableCell>
-                          <TableCell>{row.supplier || "-"}</TableCell>
                           <TableCell>
-                            <Badge
-                              variant={
-                                row.workflowType === "banking"
-                                  ? "outline"
-                                  : row.workflowType === "third-party"
-                                    ? "secondary"
-                                    : "destructive"
-                              }
-                            >
-                              {row.workflowType}
-                            </Badge>
+                            <div className="space-y-0.5">
+                              <div className="font-medium text-foreground">{row.supplier || "-"}</div>
+                              <div className="text-[10px] text-muted-foreground">Request ID: {row.requestId || "-"}</div>
+                              <div className="text-[10px] text-muted-foreground">Type: {row.workflowType}</div>
+                            </div>
                           </TableCell>
-                          <TableCell>
-                            {row.derivedTags.materialityImpact === "High" ? (
-                              <Badge variant="destructive">High</Badge>
-                            ) : row.derivedTags.materialityImpact === "Low" ? (
-                              <Badge variant="secondary">Low</Badge>
-                            ) : (
-                              "-"
-                            )}
-                          </TableCell>
-                          <TableCell>{row.derivedTags.materialitySubstitutability ?? "-"}</TableCell>
-                          <TableCell>
-                            <Badge
-                              variant={
-                                row.derivedMateriality === "Material"
-                                  ? "destructive"
-                                  : row.derivedMateriality === "Non-Material"
-                                    ? "default"
-                                    : row.derivedMateriality === "Standard"
-                                      ? "secondary"
-                                      : "outline"
-                              }
-                            >
-                              {row.derivedMateriality}
-                            </Badge>
-                          </TableCell>
-                          <TableCell>
-                            <Badge variant={row.enrichmentStatus === "success" ? "secondary" : "outline"}>
-                              {row.enrichmentStatus}
-                            </Badge>
-                          </TableCell>
+                          {MAIN_AUDIT_COLUMNS.map((column) => (
+                            <TableCell key={`${rowId}-remaining-${column.header}`} className={column.className ? `text-xs ${column.className}` : "text-xs"}>
+                              {column.value(row)}
+                            </TableCell>
+                          ))}
                         </TableRow>
                       );
                     }) : (
                       <TableRow>
-                        <TableCell colSpan={7} className="py-8 text-center text-sm text-muted-foreground">
+                        <TableCell colSpan={MAIN_AUDIT_COLUMNS.length + 1} className="py-8 text-center text-sm text-muted-foreground">
                           No remaining requests to display.
                         </TableCell>
                       </TableRow>

@@ -93,6 +93,15 @@ export interface FetchAllPagesOptions {
   onProgress?: (progress: PaginationProgress) => void;
 }
 
+export interface FetchIncrementalPageProgress extends PaginationProgress {
+  pageItems: number;
+}
+
+export interface FetchIncrementalPagesOptions<T = unknown> extends FetchAllPagesOptions {
+  sort?: string;
+  onPage?: (items: T[], allItems: T[], progress: FetchIncrementalPageProgress) => void;
+}
+
 /**
  * Make an authenticated request to Omnea API.
  * Pass `authEnvironment` to force a specific environment's credentials
@@ -253,87 +262,95 @@ export function resolvePathTemplate(path: string, params: Record<string, string>
     .replace(/\{\{(\w+)\}\}/g, (_, key) => params[key] || `{{${key}}}`);
 }
 
-/**
- * Fetch all pages from an Omnea cursor-paginated list endpoint.
- * Uses `limit=100` (API max) + `cursor` param as returned in each response.
- */
-export async function fetchAllOmneaPages<T>(
-  basePath: string,
-  options: FetchAllPagesOptions = {}
-): Promise<T[]> {
-  const LIMIT = 100;
-  const MAX_PAGES = 1000;
-
-  const extractItems = (raw: unknown): T[] => {
-    if (Array.isArray(raw)) return raw as T[];
-    if (raw && typeof raw === "object") {
-      const obj = raw as Record<string, unknown>;
-      if (Array.isArray(obj.data)) return obj.data as T[];
-      if (obj.data && typeof obj.data === "object") {
-        const nested = obj.data as Record<string, unknown>;
-        if (Array.isArray(nested.data)) return nested.data as T[];
-      }
-    }
-    return [];
-  };
-
-  const extractNext = (raw: unknown): { type: "cursor" | "url"; value: string } | null => {
-    if (!raw || typeof raw !== "object") return null;
+const extractOmneaPaginatedItems = <T>(raw: unknown): T[] => {
+  if (Array.isArray(raw)) return raw as T[];
+  if (raw && typeof raw === "object") {
     const obj = raw as Record<string, unknown>;
-    const nestedData = obj.data && typeof obj.data === "object"
-      ? (obj.data as Record<string, unknown>)
-      : undefined;
+    if (Array.isArray(obj.data)) return obj.data as T[];
+    if (obj.data && typeof obj.data === "object") {
+      const nested = obj.data as Record<string, unknown>;
+      if (Array.isArray(nested.data)) return nested.data as T[];
+    }
+  }
+  return [];
+};
 
-    const containers = [obj, nestedData].filter(
-      (value): value is Record<string, unknown> => Boolean(value)
-    );
+const extractOmneaPaginationNext = (raw: unknown): { type: "cursor" | "url"; value: string } | null => {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const nestedData = obj.data && typeof obj.data === "object"
+    ? (obj.data as Record<string, unknown>)
+    : undefined;
 
-    for (const container of containers) {
-      for (const fieldName of ["nextCursor", "next_cursor"]) {
-        const cursor = container[fieldName];
+  const containers = [obj, nestedData].filter(
+    (value): value is Record<string, unknown> => Boolean(value)
+  );
+
+  for (const container of containers) {
+    for (const fieldName of ["nextCursor", "next_cursor"]) {
+      const cursor = container[fieldName];
+      if (typeof cursor === "string" && cursor) return { type: "cursor", value: cursor };
+    }
+
+    const linksNext = (container.links as Record<string, unknown> | undefined)?.next;
+    if (typeof linksNext === "string" && linksNext) return { type: "url", value: linksNext };
+    if (linksNext && typeof linksNext === "object") {
+      const href = (linksNext as Record<string, unknown>).href;
+      if (typeof href === "string" && href) return { type: "url", value: href };
+    }
+
+    const meta = container.meta as Record<string, unknown> | undefined;
+    if (meta) {
+      for (const fieldName of ["nextCursor", "next_cursor", "cursor", "pageToken", "page_token", "continuationToken"]) {
+        const cursor = meta[fieldName];
         if (typeof cursor === "string" && cursor) return { type: "cursor", value: cursor };
       }
 
-      const linksNext = (container.links as Record<string, unknown> | undefined)?.next;
-      if (typeof linksNext === "string" && linksNext) return { type: "url", value: linksNext };
-      if (linksNext && typeof linksNext === "object") {
-        const href = (linksNext as Record<string, unknown>).href;
-        if (typeof href === "string" && href) return { type: "url", value: href };
-      }
-
-      const meta = container.meta as Record<string, unknown> | undefined;
-      if (meta) {
-        for (const fieldName of ["nextCursor", "next_cursor", "cursor", "pageToken", "page_token", "continuationToken"]) {
-          const cursor = meta[fieldName];
-          if (typeof cursor === "string" && cursor) return { type: "cursor", value: cursor };
-        }
-
-        const metaLinks = meta.links as Record<string, unknown> | undefined;
-        if (metaLinks) {
-          const metaNext = metaLinks.next;
-          if (typeof metaNext === "string" && metaNext) return { type: "url", value: metaNext };
-          if (metaNext && typeof metaNext === "object") {
-            const href = (metaNext as Record<string, unknown>).href;
-            if (typeof href === "string" && href) return { type: "url", value: href };
-          }
-        }
-      }
-
-      const pagination = container.pagination as Record<string, unknown> | undefined;
-      if (pagination) {
-        for (const fieldName of ["nextCursor", "next_cursor", "cursor"]) {
-          const cursor = pagination[fieldName];
-          if (typeof cursor === "string" && cursor) return { type: "cursor", value: cursor };
+      const metaLinks = meta.links as Record<string, unknown> | undefined;
+      if (metaLinks) {
+        const metaNext = metaLinks.next;
+        if (typeof metaNext === "string" && metaNext) return { type: "url", value: metaNext };
+        if (metaNext && typeof metaNext === "object") {
+          const href = (metaNext as Record<string, unknown>).href;
+          if (typeof href === "string" && href) return { type: "url", value: href };
         }
       }
     }
 
-    return null;
+    const pagination = container.pagination as Record<string, unknown> | undefined;
+    if (pagination) {
+      for (const fieldName of ["nextCursor", "next_cursor", "cursor"]) {
+        const cursor = pagination[fieldName];
+        if (typeof cursor === "string" && cursor) return { type: "cursor", value: cursor };
+      }
+    }
+  }
+
+  return null;
+};
+
+export async function fetchOmneaListIncrementally<T>(
+  basePath: string,
+  options: FetchIncrementalPagesOptions<T> = {}
+): Promise<T[]> {
+  const LIMIT = 100;
+  const MAX_PAGES = 1000;
+  const buildListUrl = (cursor?: string) => {
+    const query = new URLSearchParams();
+    query.set("limit", String(LIMIT));
+    if (options.sort) {
+      query.set("sort", options.sort);
+    }
+    if (cursor) {
+      query.set("cursor", cursor);
+    }
+
+    const sep = basePath.includes("?") ? "&" : "?";
+    return `${basePath}${sep}${query.toString()}`;
   };
 
   const allItems: T[] = [];
-  const sep = basePath.includes("?") ? "&" : "?";
-  let url: string = `${basePath}${sep}limit=${LIMIT}`;
+  let url: string = buildListUrl();
   let pageCount = 0;
   const seenUrls = new Set<string>();
   const seenCursors = new Set<string>();
@@ -347,11 +364,16 @@ export async function fetchAllOmneaPages<T>(
     const response = await makeOmneaRequest<unknown>(url, { method: "GET" });
     if (response.error || !response.data) break;
 
-    const items = extractItems(response.data);
-    allItems.push(...items);
+    const pageItems = extractOmneaPaginatedItems<T>(response.data);
+    allItems.push(...pageItems);
     options.onProgress?.({ pageCount, totalItems: allItems.length });
+    options.onPage?.(pageItems, [...allItems], {
+      pageCount,
+      totalItems: allItems.length,
+      pageItems: pageItems.length,
+    });
 
-    const next = extractNext(response.data);
+    const next = extractOmneaPaginationNext(response.data);
     if (!next) break;
 
     if (next.type === "cursor") {
@@ -359,12 +381,28 @@ export async function fetchAllOmneaPages<T>(
       seenCursors.add(next.value);
     }
 
-    url = next.type === "url"
-      ? next.value
-      : `${basePath}${sep}limit=${LIMIT}&cursor=${encodeURIComponent(next.value)}`;
+    if (next.type === "url") {
+      url = next.value;
+      continue;
+    }
+
+    url = buildListUrl(next.value);
   }
 
   return allItems;
+}
+
+/**
+ * Fetch all pages from an Omnea cursor-paginated list endpoint.
+ * Uses `limit=100` (API max) + `cursor` param as returned in each response.
+ */
+export async function fetchAllOmneaPages<T>(
+  basePath: string,
+  options: FetchAllPagesOptions = {}
+): Promise<T[]> {
+  return fetchOmneaListIncrementally<T>(basePath, {
+    onProgress: options.onProgress,
+  });
 }
 
 // ─── Environment-scoped helpers (used by ProdToQAClonePage) ──────────────────
