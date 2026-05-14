@@ -59,8 +59,19 @@ export const sisInsideEndpoints: SisInsideEndpoint[] = [
       "Get"
     ],
     "description": "Postman path: OAuth / Token / Get",
-    "authType": "basic",
-    "headers": [],
+    "authType": "noauth",
+    "headers": [
+      {
+        "key": "x-ibm-client-id",
+        "value": "{{clientId}}",
+        "disabled": false
+      },
+      {
+        "key": "x-ibm-client-secret",
+        "value": "{{clientSecret}}",
+        "disabled": false
+      }
+    ],
     "body": {
       "mode": "urlencoded",
       "urlencoded": [
@@ -79,7 +90,9 @@ export const sisInsideEndpoints: SisInsideEndpoint[] = [
       ]
     },
     "variableKeys": [
-      "url"
+      "url",
+      "clientId",
+      "clientSecret"
     ],
     "captureVariables": [],
     "testScript": "if (pm.response.code == 200) {\n    const responseJson = pm.response.json();\n    //postman.setEnvironmentVariable(\"token\", responseJson.access_token);\n    pm.collectionVariables.set(\"access-token\", responseJson.access_token);\n}"
