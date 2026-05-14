@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Loader2, Plug, ShieldCheck } from "lucide-react";
+import { Loader2, Plug, ShieldCheck, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 import { StatusPill } from "@/components/StatusPill";
 import OmneaAPIResponseSection from "@/components/OmneaAPIResponseSection";
@@ -300,63 +300,16 @@ const SisInsideAPIPage = () => {
   };
 
   return (
-    <div className="mx-auto max-w-7xl animate-fade-in p-6">
+    <div className="p-6 max-w-7xl mx-auto animate-fade-in">
       <div className="mb-6">
-        <div className="mb-1 flex items-center gap-2">
+        <div className="flex items-center gap-2 mb-1">
           <Plug className="h-5 w-5 text-primary" />
           <h2 className="text-lg font-semibold text-foreground">SIS Inside API</h2>
         </div>
         <p className="text-sm text-muted-foreground">
-          Explore the attached Postman collection in the same endpoint-by-endpoint workflow as Omnea API, with local browser config for base URL and credentials.
+          Simulate and explore all SIS Inside API endpoints. Select a collection tab, then an endpoint to view and test.
         </p>
       </div>
-
-      <Card className="mb-6 space-y-4 p-4">
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-          <div>
-            <Label className="text-xs font-medium">Environment Preset</Label>
-            <Select value={config.environment} onValueChange={handleEnvironmentChange}>
-              <SelectTrigger className="mt-1">
-                <SelectValue placeholder="Select environment" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="staging">Staging</SelectItem>
-                <SelectItem value="staging-it">Staging IT</SelectItem>
-                <SelectItem value="production">Production</SelectItem>
-                <SelectItem value="custom">Custom</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          <div>
-            <Label className="text-xs font-medium">Base URL</Label>
-            <Input
-              className="mt-1 font-mono text-xs"
-              value={config.baseUrl}
-              onChange={(event) => updateConfig((current) => ({ ...current, baseUrl: event.target.value, environment: "custom" }))}
-            />
-          </div>
-          <div>
-            <Label className="text-xs font-medium">Access Token</Label>
-            <Input
-              className="mt-1 font-mono text-xs"
-              type="password"
-              value={config.accessToken}
-              onChange={(event) => updateConfig((current) => ({ ...current, accessToken: event.target.value }))}
-            />
-          </div>
-          <div>
-            <Label className="text-xs font-medium">Control ID</Label>
-            <Input
-              className="mt-1 font-mono text-xs"
-              value={config.controlId}
-              onChange={(event) => updateConfig((current) => ({ ...current, controlId: event.target.value }))}
-            />
-          </div>
-        </div>
-        <p className="text-xs text-muted-foreground">
-          Client ID and Client Secret are configured via environment variables (VITE_SIS_ID_CLIENT_ID, VITE_SIS_ID_CLIENT_SECRET). Token responses automatically populate the stored access token, and create-control responses automatically update the stored control ID for follow-up requests.
-        </p>
-      </Card>
 
       <Tabs value={activeCollection} onValueChange={setActiveCollection} className="w-full">
         <TabsList className="mb-4">
@@ -377,19 +330,30 @@ const SisInsideAPIPage = () => {
                     .map((endpoint) => (
                       <Card
                         key={endpoint.id}
-                        className={`cursor-pointer p-3 transition-colors hover:bg-accent/50 ${selectedEndpointId === endpoint.id ? "ring-2 ring-primary" : ""}`}
+                        className={`cursor-pointer p-3 transition-colors hover:bg-accent/50 flex items-center justify-between group ${selectedEndpointId === endpoint.id ? 'ring-2 ring-primary' : ''}`}
                         onClick={() => setSelectedEndpointId(endpoint.id)}
                       >
-                        <div className="flex items-start justify-between gap-3">
+                        <div className="flex items-center gap-3 min-w-0">
+                          <StatusPill
+                            label={endpoint.method}
+                            variant={
+                              endpoint.method === "GET"
+                                ? "info"
+                                : endpoint.method === "POST"
+                                ? "success"
+                                : endpoint.method === "DELETE"
+                                ? "destructive"
+                                : "warning"
+                            }
+                          />
                           <div className="min-w-0">
-                            <div className="mb-1 flex items-center gap-2">
-                              <StatusPill label={endpoint.method} variant={getMethodVariant(endpoint.method)} />
-                              <p className="text-sm font-medium text-foreground">{endpoint.name}</p>
-                            </div>
-                            <p className="text-[10px] text-muted-foreground">{endpoint.groupPath.join(" / ") || endpoint.topLevelCollection}</p>
-                            <p className="mt-1 truncate font-mono text-[10px] text-muted-foreground">{endpoint.path}</p>
+                            <p className="text-sm font-medium text-foreground">{endpoint.name}</p>
+                            <p className="text-[10px] font-mono text-muted-foreground truncate">
+                              {endpoint.path}
+                            </p>
                           </div>
                         </div>
+                        <ChevronRight className="h-4 w-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
                       </Card>
                     ))}
                 </div>
@@ -408,14 +372,14 @@ const SisInsideAPIPage = () => {
                     }}
                   />
                 ) : (
-                  <div className="rounded-lg border bg-muted/30 p-6 text-sm text-muted-foreground">
-                    Select an endpoint to inspect and run it.
+                  <div className="text-muted-foreground text-sm p-6 border rounded-lg bg-muted/30">
+                    Select an endpoint to view details and test requests.
                   </div>
                 )}
               </div>
             </div>
 
-            {response && activeCollection === collection && (
+            {response && (
               <div className="w-full">
                 <OmneaAPIResponseSection
                   response={response}
