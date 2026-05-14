@@ -98,7 +98,7 @@ Browser (React SPA)
 | Testing | vitest + @testing-library/react | 3.2 / 16 | Unit test runner (test coverage is minimal currently) |
 
 **Notable non-standard inclusions:**
-- `lovable-tagger` — A Lovable.dev component-tagging library added by the template generator. It wraps components with data attributes in development. It has no runtime impact in production and can be removed safely.
+- `lovable-tagger` — A component-tagging library added by the original template generator. It wraps components with data attributes in development. It has no runtime impact in production and can be removed safely.
 
 ---
 
@@ -1011,7 +1011,7 @@ A complementary server-side guard will be added in Workato (Sprint 4) to reject 
 
 ### 15.9 [LOW] `lovable-tagger` Development Dependency
 
-**What:** `lovable-tagger` is a component-tagging library added by the Lovable.dev code generation tool. In production builds it is a no-op.
+**What:** `lovable-tagger` is a component-tagging library added by the original template generator. In production builds it is a no-op.
 
 **Status (2026-04-26): Resolved.** `lovable-tagger` has been removed — `npm uninstall lovable-tagger`, import removed from `vite.config.ts`, and `componentTagger()` removed from the plugins array.
 

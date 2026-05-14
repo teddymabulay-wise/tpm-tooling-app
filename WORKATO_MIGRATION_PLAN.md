@@ -966,14 +966,14 @@ add_header X-Content-Type-Options "nosniff" always;
 add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 ```
 
-### 7.2 Audit `lovable-tagger`
+### 7.2 Audit the legacy template tagging package
 
 ```bash
-# Inspect what lovable-tagger does at runtime
+# Inspect what the legacy template tagger does at runtime
 cat node_modules/lovable-tagger/dist/index.js | grep -i "fetch\|xhr\|http\|endpoint\|telemetry"
 ```
 
-If any outbound network calls to `lovable.dev` are found, remove the package:
+If any outbound network calls to the generator host are found, remove the package:
 ```bash
 npm uninstall lovable-tagger
 # Remove from vite.config.ts:
