@@ -336,23 +336,6 @@ const SisInsideAPIPage = () => {
             />
           </div>
           <div>
-            <Label className="text-xs font-medium">Client ID</Label>
-            <Input
-              className="mt-1 font-mono text-xs"
-              value={config.clientId}
-              onChange={(event) => updateConfig((current) => ({ ...current, clientId: event.target.value }))}
-            />
-          </div>
-          <div>
-            <Label className="text-xs font-medium">Client Secret</Label>
-            <Input
-              className="mt-1 font-mono text-xs"
-              type="password"
-              value={config.clientSecret}
-              onChange={(event) => updateConfig((current) => ({ ...current, clientSecret: event.target.value }))}
-            />
-          </div>
-          <div>
             <Label className="text-xs font-medium">Access Token</Label>
             <Input
               className="mt-1 font-mono text-xs"
@@ -371,7 +354,7 @@ const SisInsideAPIPage = () => {
           </div>
         </div>
         <p className="text-xs text-muted-foreground">
-          Token responses automatically populate the stored access token, and create-control responses automatically update the stored control ID for follow-up requests.
+          Client ID and Client Secret are configured via environment variables (VITE_SIS_ID_CLIENT_ID, VITE_SIS_ID_CLIENT_SECRET). Token responses automatically populate the stored access token, and create-control responses automatically update the stored control ID for follow-up requests.
         </p>
       </Card>
 

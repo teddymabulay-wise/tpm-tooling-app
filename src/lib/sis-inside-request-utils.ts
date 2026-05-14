@@ -40,8 +40,8 @@ export function getDefaultSisInsideConfig(): SisInsideApiConfig {
   return {
     environment: "staging",
     baseUrl: sisInsideEnvironmentPresets.staging.baseUrl,
-    clientId: "",
-    clientSecret: "",
+    clientId: import.meta.env.VITE_SIS_ID_CLIENT_ID || "",
+    clientSecret: import.meta.env.VITE_SIS_ID_CLIENT_SECRET || "",
     accessToken: "",
     controlId: "",
   };
@@ -64,6 +64,9 @@ export function loadSisInsideConfig(): SisInsideApiConfig {
       ...parsed,
       environment,
       baseUrl: parsed.baseUrl || preset?.baseUrl || fallback.baseUrl,
+      // Always use environment variables for sensitive credentials, fallback to stored values if not set
+      clientId: import.meta.env.VITE_SIS_ID_CLIENT_ID || parsed.clientId || fallback.clientId,
+      clientSecret: import.meta.env.VITE_SIS_ID_CLIENT_SECRET || parsed.clientSecret || fallback.clientSecret,
     };
   } catch {
     return fallback;

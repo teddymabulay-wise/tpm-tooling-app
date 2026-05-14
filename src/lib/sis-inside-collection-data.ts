@@ -35,15 +35,15 @@ export type SisInsideEndpoint = {
 export const sisInsideEnvironmentPresets: Record<Exclude<SisInsideEnvironment, "custom">, { label: string; baseUrl: string }> = {
   "staging": {
     "label": "Staging",
-    "baseUrl": "https://api.eu-west-a.apiconnect.ibmappdomain.cloud/sis-id-com/my-sis-id-staging"
+    "baseUrl": import.meta.env.VITE_SIS_ID_STAGING_BASE_URL || "https://api.eu-west-a.apiconnect.ibmappdomain.cloud/sis-id-com/my-sis-id-staging"
   },
   "staging-it": {
     "label": "Staging IT",
-    "baseUrl": "https://api.eu-west-a.apiconnect.ibmappdomain.cloud/sis-id-com/my-sis-id-staging-it"
+    "baseUrl": import.meta.env.VITE_SIS_ID_STAGING_IT_BASE_URL || "https://api.eu-west-a.apiconnect.ibmappdomain.cloud/sis-id-com/my-sis-id-staging-it"
   },
   "production": {
     "label": "Production",
-    "baseUrl": "https://api.sis-inside.com/my"
+    "baseUrl": import.meta.env.VITE_SIS_ID_PRODUCTION_BASE_URL || "https://api.sis-inside.com/my"
   }
 };
 
